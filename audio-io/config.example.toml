@@ -1,0 +1,34 @@
+# audio-io configuration. All sections are optional.
+
+[server]
+# Bind address. Defaults to loopback to avoid exposing the microphone on the LAN.
+# Change to "0.0.0.0" only if you intentionally want remote access (and add auth upstream).
+host = "127.0.0.1"
+port = 7010
+
+[audio]
+# Wire format used on /mic and /spk WebSockets.
+sample_rate = 16000   # Hz
+channels    = 1       # mono
+frame_ms    = 20      # bytes per frame = sample_rate * frame_ms / 1000 * 2
+
+[input]
+# "default" picks the OS default input device.
+# Otherwise specify the exact device name reported by /devices.
+device = "default"
+
+[output]
+device = "default"
+
+[runtime]
+# If false, capture and playback are idle until POST /start is called.
+autostart = true
+# Size of playback jitter buffer in milliseconds. Larger = more resilient
+# to network jitter, smaller = lower end-to-end latency.
+playback_buffer_ms = 200
+# Number of mic frames buffered in the broadcast channel for /mic subscribers.
+# At 20ms/frame, 64 ≈ 1.28s of tolerance. When a subscriber falls further
+# behind, older frames are **dropped** (not queued) and the connection
+# receives a single Lagged warning covering the skipped frames. Increase for
+# bursty consumers, decrease for tighter latency.
+mic_broadcast_frames = 64
