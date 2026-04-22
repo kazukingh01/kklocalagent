@@ -1,0 +1,26 @@
+# audio-io configuration. All sections are optional.
+
+[server]
+host = "0.0.0.0"
+port = 7010
+
+[audio]
+# Wire format used on /mic and /spk WebSockets.
+sample_rate = 16000   # Hz
+channels    = 1       # mono
+frame_ms    = 20      # bytes per frame = sample_rate * frame_ms / 1000 * 2
+
+[input]
+# "default" picks the OS default input device.
+# Otherwise specify the exact device name reported by /devices.
+device = "default"
+
+[output]
+device = "default"
+
+[runtime]
+# If false, capture and playback are idle until POST /start is called.
+autostart = true
+# Size of playback jitter buffer in milliseconds. Larger = more resilient
+# to network jitter, smaller = lower end-to-end latency.
+playback_buffer_ms = 200
