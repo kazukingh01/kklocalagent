@@ -20,7 +20,9 @@ struct Diag {
     window_frames: u32,
     frames: u32,
     voiced: u32,
-    sumsq_mean: u64,
+    /// Running sum of per-frame mean-square values across the current window.
+    /// Window RMS = sqrt(this / frames).
+    sum_of_frame_mean_sq: u64,
 }
 
 impl Diag {
@@ -30,7 +32,7 @@ impl Diag {
             window_frames: cfg.window_frames.max(1),
             frames: 0,
             voiced: 0,
-            sumsq_mean: 0,
+            sum_of_frame_mean_sq: 0,
         }
     }
 
@@ -47,13 +49,13 @@ impl Diag {
                 (v * v) as u64
             })
             .sum();
-        self.sumsq_mean += sumsq / samples.len() as u64;
+        self.sum_of_frame_mean_sq += sumsq / samples.len() as u64;
         self.frames += 1;
         if is_speech {
             self.voiced += 1;
         }
         if self.frames >= self.window_frames {
-            let mean_sq = self.sumsq_mean as f64 / self.frames as f64;
+            let mean_sq = self.sum_of_frame_mean_sq as f64 / self.frames as f64;
             let rms = mean_sq.sqrt() as u32;
             let ratio = self.voiced as f32 / self.frames as f32;
             info!(
@@ -64,7 +66,7 @@ impl Diag {
             );
             self.frames = 0;
             self.voiced = 0;
-            self.sumsq_mean = 0;
+            self.sum_of_frame_mean_sq = 0;
         }
     }
 }
@@ -111,6 +113,9 @@ async fn connect_and_run(cfg: Arc<Config>) -> Result<()> {
     let dry_run = cfg.sink.dry_run;
     let include_audio = cfg.sink.include_audio_in_event;
 
+    // TODO: if audio-io enables WS ping/pong keepalive, the server will drop
+    // us because tokio-tungstenite doesn't auto-respond to Pings — the write
+    // half has to echo them. Today we rely on the reconnect loop to recover.
     let (_write, mut read) = ws.split();
     // Carry-over buffer: audio-io sends 20 ms frames but the WebSocket layer
     // may merge or split them, so we re-slice at bytes_per_frame boundaries.
@@ -226,5 +231,63 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {}
         _ = terminate => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::detector::Event;
+    use serde_json::Value;
+
+    fn parse(json: &str) -> Value {
+        serde_json::from_str(json).unwrap()
+    }
+
+    fn envelope_json(event: &Event, sample_rate: u32, audio_base64: Option<String>) -> String {
+        let env = EventEnvelope {
+            event,
+            ts: 1_744_284_000.5,
+            sample_rate,
+            audio_base64,
+        };
+        serde_json::to_string(&env).unwrap()
+    }
+
+    #[test]
+    fn speech_started_wire_format() {
+        let ev = Event::SpeechStarted { frame_index: 123 };
+        let v = parse(&envelope_json(&ev, 16000, None));
+        assert_eq!(v["name"], "SpeechStarted");
+        assert_eq!(v["frame_index"], 123);
+        assert_eq!(v["sample_rate"], 16000);
+        assert!(v["ts"].is_number());
+        assert!(v.get("audio_base64").is_none(), "audio_base64 must be omitted when None");
+    }
+
+    #[test]
+    fn speech_ended_wire_format_without_audio() {
+        let ev = Event::SpeechEnded {
+            frame_index: 167,
+            duration_frames: 45,
+            audio_len_bytes: 28_800,
+        };
+        let v = parse(&envelope_json(&ev, 16000, None));
+        assert_eq!(v["name"], "SpeechEnded");
+        assert_eq!(v["frame_index"], 167);
+        assert_eq!(v["duration_frames"], 45);
+        assert_eq!(v["audio_len_bytes"], 28_800);
+        assert!(v.get("audio_base64").is_none());
+    }
+
+    #[test]
+    fn speech_ended_includes_audio_base64_when_set() {
+        let ev = Event::SpeechEnded {
+            frame_index: 10,
+            duration_frames: 5,
+            audio_len_bytes: 4,
+        };
+        let v = parse(&envelope_json(&ev, 16000, Some("AAAA".into())));
+        assert_eq!(v["audio_base64"], "AAAA");
     }
 }

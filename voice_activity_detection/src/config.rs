@@ -49,8 +49,9 @@ pub struct DetectorConfig {
     pub sample_rate: u32,
     /// Must match audio-io wire format; webrtc-vad accepts 10/20/30 ms only.
     pub frame_ms: u32,
-    /// Number of consecutive voiced frames before SpeechStarted fires.
-    /// Prevents single-frame blips from triggering spurious utterances.
+    /// Number of consecutive voiced frames before SpeechStarted fires. Any
+    /// silent frame resets the run to 0, so single-frame blips can't trigger
+    /// spurious utterances.
     pub start_frames: u32,
     /// Number of consecutive silent frames before SpeechEnded fires.
     /// Covers natural breath pauses mid-utterance.
