@@ -35,3 +35,11 @@ orchestrator_url = "http://127.0.0.1:7000/events"
 # Include the utterance PCM (base64 s16le) in each SpeechEnded event.
 # Off by default because audio payloads bloat log output quickly.
 include_audio_in_event = false
+
+[diag]
+# Emit per-window RMS and speech_ratio summary under the `vad::diag` log
+# target. On by default so false-trigger causes (noisy mic vs code bug) are
+# visible without an extra flag. Set to false to silence.
+enabled = true
+# Window size in frames. 50 frames @ 20 ms = 1-second summary.
+window_frames = 50

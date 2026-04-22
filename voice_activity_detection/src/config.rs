@@ -24,7 +24,7 @@ pub struct DiagConfig {
 impl Default for DiagConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             window_frames: 50,
         }
     }
