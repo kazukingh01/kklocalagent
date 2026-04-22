@@ -9,8 +9,65 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{info, warn};
 use webrtc_vad::{SampleRate, Vad, VadMode};
 
-use crate::config::Config;
+use crate::config::{Config, DiagConfig};
 use crate::detector::{Event, SpeechFsm};
+
+/// Accumulates RMS energy and speech_ratio over a window of frames and logs
+/// a summary line each time the window fills. Enabled only in debug mode so
+/// normal operation is quiet.
+struct Diag {
+    enabled: bool,
+    window_frames: u32,
+    frames: u32,
+    voiced: u32,
+    sumsq_mean: u64,
+}
+
+impl Diag {
+    fn new(cfg: &DiagConfig) -> Self {
+        Self {
+            enabled: cfg.enabled,
+            window_frames: cfg.window_frames.max(1),
+            frames: 0,
+            voiced: 0,
+            sumsq_mean: 0,
+        }
+    }
+
+    fn record(&mut self, samples: &[i16], is_speech: bool) {
+        if !self.enabled {
+            return;
+        }
+        // Mean square of this frame — summing squares of i16 into u64 is safe
+        // for any reasonable frame length (320 * 32768^2 ≈ 3.4e11 ≪ u64 max).
+        let sumsq: u64 = samples
+            .iter()
+            .map(|s| {
+                let v = *s as i64;
+                (v * v) as u64
+            })
+            .sum();
+        self.sumsq_mean += sumsq / samples.len() as u64;
+        self.frames += 1;
+        if is_speech {
+            self.voiced += 1;
+        }
+        if self.frames >= self.window_frames {
+            let mean_sq = self.sumsq_mean as f64 / self.frames as f64;
+            let rms = mean_sq.sqrt() as u32;
+            let ratio = self.voiced as f32 / self.frames as f32;
+            info!(
+                target: "vad::diag",
+                "[diag] rms={rms} speech_ratio={ratio:.2} ({}/{} voiced)",
+                self.voiced,
+                self.frames,
+            );
+            self.frames = 0;
+            self.voiced = 0;
+            self.sumsq_mean = 0;
+        }
+    }
+}
 
 pub async fn run(config: Config) -> Result<()> {
     let cfg = Arc::new(config);
@@ -46,6 +103,7 @@ async fn connect_and_run(cfg: Arc<Config>) -> Result<()> {
         cfg.detector.hang_frames,
         cfg.detector.max_utterance_frames,
     );
+    let mut diag = Diag::new(&cfg.diag);
 
     let bytes_per_frame = cfg.detector.bytes_per_frame();
     let samples_per_frame = cfg.detector.samples_per_frame();
@@ -81,6 +139,7 @@ async fn connect_and_run(cfg: Arc<Config>) -> Result<()> {
             let is_speech = vad
                 .is_voice_segment(&samples)
                 .map_err(|e| anyhow!("vad classify: {e:?}"))?;
+            diag.record(&samples, is_speech);
             if let Some(event) = fsm.push_frame(&frame, is_speech) {
                 emit_event(&event, &fsm, sr, dry_run, include_audio);
             }

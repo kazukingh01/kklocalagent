@@ -8,6 +8,26 @@ pub struct Config {
     pub source: SourceConfig,
     pub detector: DetectorConfig,
     pub sink: SinkConfig,
+    pub diag: DiagConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct DiagConfig {
+    /// When true, emit per-window RMS + speech_ratio stats under the
+    /// `vad::diag` target. Useful for debugging false triggers.
+    pub enabled: bool,
+    /// Window size in frames. Default 50 = 1 second at 20 ms/frame.
+    pub window_frames: u32,
+}
+
+impl Default for DiagConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            window_frames: 50,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -117,6 +137,9 @@ impl Config {
         }
         if self.detector.max_utterance_frames == 0 {
             anyhow::bail!("detector.max_utterance_frames must be >= 1");
+        }
+        if self.diag.window_frames == 0 {
+            anyhow::bail!("diag.window_frames must be >= 1");
         }
         Ok(())
     }

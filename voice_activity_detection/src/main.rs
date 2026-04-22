@@ -24,6 +24,12 @@ struct Args {
     /// implemented — passing --live currently drops events with a warning.
     #[arg(long)]
     live: bool,
+
+    /// Enable per-second diagnostic output: RMS energy and speech-frame
+    /// ratio under the `vad::diag` log target. Useful when the detector
+    /// seems to be firing on silence.
+    #[arg(long)]
+    debug: bool,
 }
 
 #[tokio::main]
@@ -46,6 +52,9 @@ async fn main() -> Result<()> {
     // `voice-activity-detection` with no flags is safe to run.
     if args.live {
         config.sink.dry_run = false;
+    }
+    if args.debug {
+        config.diag.enabled = true;
     }
 
     voice_activity_detection::run(config).await
