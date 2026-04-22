@@ -1,0 +1,16 @@
+[project]
+name = "voice-activity-detection"
+version = "0.1.0"
+description = "Voice activity detection service for kklocalagent (webrtcvad)"
+requires-python = ">=3.11"
+dependencies = [
+    "webrtcvad>=2.0.10",
+    # webrtcvad 2.0.10 does `import pkg_resources` at module top. Python 3.12+
+    # venvs no longer ship setuptools by default, and setuptools 81 removed
+    # pkg_resources entirely — so pin to <81 until webrtcvad upstream migrates
+    # to importlib.metadata (or we vendor a patched fork).
+    "setuptools<81",
+]
+
+[tool.uv]
+package = false
