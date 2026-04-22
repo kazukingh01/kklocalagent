@@ -21,6 +21,7 @@ use crate::config::Config;
 use crate::state::{AppState, FlushSignals, ServiceHandles};
 
 pub async fn run(config: Config) -> Result<()> {
+    config.validate().context("invalid config")?;
     let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port)
         .parse()
         .context("parsing bind address")?;
@@ -43,7 +44,7 @@ pub async fn run(config: Config) -> Result<()> {
 }
 
 pub fn build_state(config: Config) -> AppState {
-    let (mic_tx, _) = broadcast::channel(64);
+    let (mic_tx, _) = broadcast::channel(config.runtime.mic_broadcast_frames.max(1) as usize);
     AppState {
         config: Arc::new(config),
         mic_tx,

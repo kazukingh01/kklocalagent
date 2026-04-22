@@ -2,6 +2,7 @@ use anyhow::Result;
 use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
+use tracing::error;
 
 fn make_resampler(input_rate: u32, output_rate: u32, chunk_size: usize) -> Result<SincFixedIn<f32>> {
     let params = SincInterpolationParameters {
@@ -22,7 +23,7 @@ fn make_resampler(input_rate: u32, output_rate: u32, chunk_size: usize) -> Resul
 
 fn resample_chunk_for(rate: u32) -> usize {
     // ~10ms of input; rubato requires a fixed chunk per call.
-    ((rate as usize + 99) / 100).max(160)
+    (rate as usize).div_ceil(100).max(160)
 }
 
 /// Converts native-format interleaved mic samples into s16le mono frames
@@ -88,10 +89,10 @@ impl CaptureFramer {
             while self.mono_buf.len() >= self.resample_chunk {
                 let input_chunk: Vec<f32> =
                     self.mono_buf.drain(..self.resample_chunk).collect();
-                let output = resampler
-                    .process(&[input_chunk], None)
-                    .expect("resampler process");
-                self.resampled_buf.extend_from_slice(&output[0]);
+                match resampler.process(&[input_chunk], None) {
+                    Ok(output) => self.resampled_buf.extend_from_slice(&output[0]),
+                    Err(e) => error!("capture resampler error (chunk dropped): {e}"),
+                }
             }
         } else {
             self.resampled_buf.append(&mut self.mono_buf);
@@ -138,6 +139,8 @@ impl PlaybackFramer {
     }
 
     /// Accept s16le bytes and return interleaved native-format f32 samples.
+    /// Callers must pass even-length byte slices; odd-length input is rejected
+    /// upstream to avoid silent stream desync.
     pub fn push_s16le(&mut self, bytes: &[u8]) -> Vec<f32> {
         for pair in bytes.chunks_exact(2) {
             let v = i16::from_le_bytes([pair[0], pair[1]]);
@@ -147,10 +150,10 @@ impl PlaybackFramer {
             while self.mono_buf.len() >= self.resample_chunk {
                 let input_chunk: Vec<f32> =
                     self.mono_buf.drain(..self.resample_chunk).collect();
-                let output = resampler
-                    .process(&[input_chunk], None)
-                    .expect("resampler process");
-                self.resampled_buf.extend_from_slice(&output[0]);
+                match resampler.process(&[input_chunk], None) {
+                    Ok(output) => self.resampled_buf.extend_from_slice(&output[0]),
+                    Err(e) => error!("playback resampler error (chunk dropped): {e}"),
+                }
             }
         } else {
             self.resampled_buf.append(&mut self.mono_buf);

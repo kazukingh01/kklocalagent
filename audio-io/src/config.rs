@@ -38,6 +38,7 @@ pub struct DeviceConfig {
 pub struct RuntimeConfig {
     pub autostart: bool,
     pub playback_buffer_ms: u32,
+    pub mic_broadcast_frames: u32,
 }
 
 impl Default for Config {
@@ -55,7 +56,7 @@ impl Default for Config {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            host: "0.0.0.0".into(),
+            host: "127.0.0.1".into(),
             port: 7010,
         }
     }
@@ -84,6 +85,7 @@ impl Default for RuntimeConfig {
         Self {
             autostart: true,
             playback_buffer_ms: 200,
+            mic_broadcast_frames: 64,
         }
     }
 }
@@ -118,6 +120,9 @@ impl Config {
         }
         if (self.audio.sample_rate as usize * self.audio.frame_ms as usize) % 1000 != 0 {
             anyhow::bail!("sample_rate * frame_ms must be divisible by 1000");
+        }
+        if self.runtime.mic_broadcast_frames == 0 {
+            anyhow::bail!("runtime.mic_broadcast_frames must be >= 1");
         }
         Ok(())
     }

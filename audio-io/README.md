@@ -4,40 +4,35 @@ Microphone capture & speaker playback service for kklocalagent.
 
 ## Build
 
-### Ubuntu / WSL2 (Ubuntu)
+### Install Rust (any platform)
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
 ```
 
-```bash
-# one-time setup
-sudo apt-get install -y mingw-w64
-rustup target add x86_64-pc-windows-gnu
-
-# build
-cd audio-io
-
-## For Windows
-cargo build --release --target x86_64-pc-windows-gnu
-## for Ubuntu
-cargo build --release
-```
-
-### Linux / WSL2 (Ubuntu, Debian)
+### Linux / WSL2 — native build
 
 ALSA development headers are required to build `cpal`:
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y libasound2-dev pkg-config build-essential
+pkg-config --modversion alsa   # verify: → 1.2.x
+
+cd audio-io
+cargo build --release
 ```
 
-Verify:
+### WSL2 → Windows — cross-compile
 
 ```bash
-pkg-config --modversion alsa   # → 1.2.x
+# one-time setup
+sudo apt-get install -y mingw-w64
+rustup target add x86_64-pc-windows-gnu
+
+cd audio-io
+cargo build --release --target x86_64-pc-windows-gnu
 ```
 
 ### Windows (native)
@@ -82,9 +77,21 @@ Open shell ( ubuntu )
 ```bash
 sudo apt update && sudo apt install -y ffmpeg
 cargo install websocat # Install websocket program
+
+# WIN_HOST = the address the audio-io server is reachable at.
+# - If audio-io runs on the same box as this shell → WIN_HOST=127.0.0.1
+# - From WSL2 connecting to Windows host → WIN_HOST=$(ip route | awk '/default/ {print $3}')
+# - Over LAN → the server's LAN IP (also requires host = "0.0.0.0" in config)
+WIN_HOST=127.0.0.1
+
 websocat -b "ws://${WIN_HOST}:7010/mic" | head -c 96000 > mic.raw
 ffmpeg -f s16le -ar 16000 -ac 1 -i mic.raw mic.wav -y
 ```
+
+> **Note:** the server binds to `127.0.0.1` by default. To reach it from
+> another machine (or from WSL2 → Windows host), set `[server].host = "0.0.0.0"`
+> in the config — and front it with authentication, since `/mic` exposes
+> live microphone audio without any access control.
 
 ## HTTP API
 

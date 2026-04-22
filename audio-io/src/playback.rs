@@ -9,7 +9,7 @@ use cpal::{SampleFormat, StreamConfig};
 use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::config::AudioConfig;
 use crate::framer::PlaybackFramer;
@@ -203,8 +203,7 @@ fn run_playback(
                     }
                     for sample in data.iter_mut() {
                         let v = consumer.try_pop().unwrap_or(0.0);
-                        let signed = (v.clamp(-1.0, 1.0) * 32767.0) as i32;
-                        *sample = (signed + 32768) as u16;
+                        *sample = ((v.clamp(-1.0, 1.0) + 1.0) * 32767.5) as u16;
                     }
                 },
                 err_fn,
@@ -236,17 +235,36 @@ async fn playback_producer_task(
             return;
         }
     };
+    let mut total_dropped: u64 = 0;
+    let mut drops_since_log: u32 = 0;
     while let Some(bytes) = spk_rx.recv().await {
         if flush.producer.swap(false, Ordering::Relaxed) {
             while spk_rx.try_recv().is_ok() {}
             continue;
         }
         let samples = framer.push_s16le(&bytes);
+        let mut overflow = false;
+        let mut dropped_this_batch: usize = 0;
         for s in samples {
+            if overflow {
+                dropped_this_batch += 1;
+                continue;
+            }
             if producer.try_push(s).is_err() {
-                // Ring buffer full: drop the rest of this batch.
-                // Consumer is draining slower than producer; upstream should throttle.
-                break;
+                overflow = true;
+                dropped_this_batch += 1;
+            }
+        }
+        if dropped_this_batch > 0 {
+            total_dropped = total_dropped.saturating_add(dropped_this_batch as u64);
+            drops_since_log += 1;
+            // Rate-limit: roughly once per ~1s at 20ms/frame.
+            if drops_since_log >= 50 {
+                warn!(
+                    total_dropped,
+                    "playback ring buffer full; dropping samples (consumer slower than producer)"
+                );
+                drops_since_log = 0;
             }
         }
     }

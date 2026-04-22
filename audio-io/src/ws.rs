@@ -61,6 +61,14 @@ async fn handle_spk(mut socket: WebSocket, state: AppState) {
     while let Some(msg) = socket.recv().await {
         match msg {
             Ok(Message::Binary(data)) => {
+                if data.len() % 2 != 0 {
+                    warn!(
+                        len = data.len(),
+                        "spk ws: rejecting odd-length frame (s16le requires even bytes)"
+                    );
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
                 if spk_tx.send(Bytes::from(data)).await.is_err() {
                     warn!("spk ws: playback task gone; closing");
                     break;

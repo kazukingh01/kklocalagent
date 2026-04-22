@@ -1,7 +1,9 @@
 # audio-io configuration. All sections are optional.
 
 [server]
-host = "0.0.0.0"
+# Bind address. Defaults to loopback to avoid exposing the microphone on the LAN.
+# Change to "0.0.0.0" only if you intentionally want remote access (and add auth upstream).
+host = "127.0.0.1"
 port = 7010
 
 [audio]
@@ -24,3 +26,7 @@ autostart = true
 # Size of playback jitter buffer in milliseconds. Larger = more resilient
 # to network jitter, smaller = lower end-to-end latency.
 playback_buffer_ms = 200
+# Number of mic frames buffered in the broadcast channel for /mic subscribers.
+# At 20ms/frame, 64 ≈ 1.28s of tolerance before a slow subscriber starts
+# dropping frames. Increase for bursty consumers, decrease for tighter latency.
+mic_broadcast_frames = 64

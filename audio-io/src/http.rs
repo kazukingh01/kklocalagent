@@ -60,14 +60,24 @@ pub async fn start(State(state): State<AppState>) -> impl IntoResponse {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "status": "started" }))).into_response(),
         Err(e) => {
             error!("start: {e:?}");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            let status = if e.to_string().contains("already in progress") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, e.to_string()).into_response()
         }
     }
 }
 
 pub async fn stop(State(state): State<AppState>) -> impl IntoResponse {
-    service::stop_services(&state).await;
-    Json(serde_json::json!({ "status": "stopped" }))
+    match service::stop_services(&state).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "status": "stopped" }))).into_response(),
+        Err(e) => {
+            error!("stop: {e:?}");
+            (StatusCode::CONFLICT, e.to_string()).into_response()
+        }
+    }
 }
 
 pub async fn spk_stop(State(state): State<AppState>) -> impl IntoResponse {
