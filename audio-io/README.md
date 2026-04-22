@@ -23,16 +23,71 @@ WSL2 cannot access Windows audio devices directly, so `audio-io` runs on
 the Windows host and other services in WSL2 connect to it over TCP
 (`ws://<windows-host-ip>:7010/mic` etc.).
 
-## Build
+## Prerequisites
+
+### Rust toolchain (all platforms)
 
 ```bash
-# Linux / macOS native
-cargo build --release
-
-# Windows (cross from Linux requires mingw / cross toolchain;
-# easier to build natively on Windows)
-cargo build --release --target x86_64-pc-windows-msvc
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
 ```
+
+### Linux / WSL2 (Ubuntu, Debian)
+
+ALSA development headers are required to build `cpal`:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libasound2-dev pkg-config build-essential
+```
+
+Verify:
+
+```bash
+pkg-config --modversion alsa   # → 1.2.x
+```
+
+### Windows (native)
+
+Install the MSVC C++ build tools (via Visual Studio Installer or the
+standalone "Build Tools for Visual Studio"). No extra audio SDK needed —
+cpal uses WASAPI which ships with Windows.
+
+### macOS
+
+No extra packages needed; cpal uses CoreAudio from the SDK bundled with
+Xcode Command Line Tools (`xcode-select --install`).
+
+## Build
+
+### Native
+
+```bash
+# Linux / macOS / Windows (native)
+cargo build --release
+```
+
+### Cross-compile to Windows from WSL2 / Ubuntu
+
+Use the MinGW-w64 toolchain to produce a Windows `.exe` without needing a
+Windows machine.
+
+```bash
+# one-time setup
+sudo apt-get install -y mingw-w64
+rustup target add x86_64-pc-windows-gnu
+
+# build
+cd audio-io
+cargo build --release --target x86_64-pc-windows-gnu
+```
+
+Output: `target/x86_64-pc-windows-gnu/release/audio-io.exe`.
+
+Note: the MinGW build may need `libgcc_s_seh-1.dll` and
+`libwinpthread-1.dll` (from `/usr/x86_64-w64-mingw32/lib/`) next to the
+`.exe` on the Windows host. If you want a single-file binary, pass
+`-C target-feature=+crt-static` via `RUSTFLAGS` or add a `.cargo/config.toml`.
 
 ## Run
 
