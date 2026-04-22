@@ -1,0 +1,37 @@
+# voice_activity_detection configuration. All sections are optional.
+
+[source]
+# audio-io /mic WebSocket URL.
+#   - Same host: ws://127.0.0.1:7010/mic
+#   - WSL2 -> Windows host: ws://<windows-ip>:7010/mic
+mic_url = "ws://127.0.0.1:7010/mic"
+# Backoff before reconnecting after a dropped WebSocket.
+reconnect_ms = 1000
+
+[detector]
+# webrtc-vad aggressiveness: 0=Quality, 1=LowBitrate, 2=Aggressive, 3=VeryAggressive
+aggressiveness = 2
+# Must match audio-io's wire format. webrtc-vad accepts 8k / 16k / 32k / 48k only.
+sample_rate = 16000
+# Must match audio-io's wire format. webrtc-vad accepts 10 / 20 / 30 ms only.
+frame_ms    = 20
+# Voiced frames needed before SpeechStarted fires. 3 frames @ 20 ms = 60 ms,
+# which filters single-frame pops without adding noticeable latency.
+start_frames = 3
+# Silent frames needed before SpeechEnded fires. 20 frames @ 20 ms = 400 ms,
+# wide enough to cover natural breath pauses mid-utterance.
+hang_frames = 20
+# Hard cap on a single utterance. 1500 frames @ 20 ms = 30 s.
+max_utterance_frames = 1500
+
+[sink]
+# dry_run = true : log events only (the "test" mode — pretend to send to the
+#                   orchestrator but just print JSON). This is the only sink
+#                   implemented in v0.1.
+# dry_run = false: POST events to orchestrator_url (not yet implemented —
+#                   events are dropped with a warning).
+dry_run = true
+orchestrator_url = "http://127.0.0.1:7000/events"
+# Include the utterance PCM (base64 s16le) in each SpeechEnded event.
+# Off by default because audio payloads bloat log output quickly.
+include_audio_in_event = false
