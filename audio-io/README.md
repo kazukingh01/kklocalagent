@@ -84,6 +84,7 @@ cargo install websocat # Install websocket program
 # - Over LAN → the server's LAN IP (also requires host = "0.0.0.0" in config)
 WIN_HOST=127.0.0.1
 
+# 96000 bytes ≈ 3 s of audio (16000 Hz × 1 ch × 2 B = 32000 B/s).
 websocat -b "ws://${WIN_HOST}:7010/mic" | head -c 96000 > mic.raw
 ffmpeg -f s16le -ar 16000 -ac 1 -i mic.raw mic.wav -y
 ```

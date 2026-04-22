@@ -40,16 +40,27 @@ fn list_devices() -> anyhow::Result<Devices> {
     let default_in = host.default_input_device().and_then(|d| d.name().ok());
     let default_out = host.default_output_device().and_then(|d| d.name().ok());
 
+    // cpal does not expose stable device IDs, so we match on name. When two
+    // devices share a name (e.g. multiple identical USB mics on Windows) only
+    // the first is flagged as default — there is exactly one default device.
     let mut inputs = Vec::new();
+    let mut default_in_used = false;
     for dev in host.input_devices()? {
         let name = dev.name().unwrap_or_default();
-        let default = Some(&name) == default_in.as_ref();
+        let default = !default_in_used && Some(&name) == default_in.as_ref();
+        if default {
+            default_in_used = true;
+        }
         inputs.push(DeviceInfo { name, default });
     }
     let mut outputs = Vec::new();
+    let mut default_out_used = false;
     for dev in host.output_devices()? {
         let name = dev.name().unwrap_or_default();
-        let default = Some(&name) == default_out.as_ref();
+        let default = !default_out_used && Some(&name) == default_out.as_ref();
+        if default {
+            default_out_used = true;
+        }
         outputs.push(DeviceInfo { name, default });
     }
     Ok(Devices { inputs, outputs })
@@ -60,8 +71,13 @@ pub async fn start(State(state): State<AppState>) -> impl IntoResponse {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "status": "started" }))).into_response(),
         Err(e) => {
             error!("start: {e:?}");
-            let status = if e.to_string().contains("already in progress") {
+            // anyhow carries the root cause in the chain. Walk it so a
+            // nested device-lookup error still maps to 404, not 500.
+            let msg = format!("{e:#}");
+            let status = if msg.contains("already in progress") {
                 StatusCode::CONFLICT
+            } else if msg.contains("not found") || msg.contains("no default") {
+                StatusCode::NOT_FOUND
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };

@@ -27,6 +27,8 @@ autostart = true
 # to network jitter, smaller = lower end-to-end latency.
 playback_buffer_ms = 200
 # Number of mic frames buffered in the broadcast channel for /mic subscribers.
-# At 20ms/frame, 64 ≈ 1.28s of tolerance before a slow subscriber starts
-# dropping frames. Increase for bursty consumers, decrease for tighter latency.
+# At 20ms/frame, 64 ≈ 1.28s of tolerance. When a subscriber falls further
+# behind, older frames are **dropped** (not queued) and the connection
+# receives a single Lagged warning covering the skipped frames. Increase for
+# bursty consumers, decrease for tighter latency.
 mic_broadcast_frames = 64

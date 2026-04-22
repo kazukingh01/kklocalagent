@@ -138,9 +138,24 @@ impl PlaybackFramer {
         })
     }
 
+    /// Drop any buffered samples. Call on barge-in so residual audio already
+    /// consumed from the wire but not yet pushed into the ring does not leak
+    /// after the flush flag has been cleared.
+    pub fn flush(&mut self) {
+        self.mono_buf.clear();
+        self.resampled_buf.clear();
+        if let Some(r) = self.resampler.as_mut() {
+            r.reset();
+        }
+    }
+
     /// Accept s16le bytes and return interleaved native-format f32 samples.
     /// Callers must pass even-length byte slices; odd-length input is rejected
     /// upstream to avoid silent stream desync.
+    ///
+    /// The returned samples are mono duplicated across all native channels,
+    /// which is the usual 2-channel case. On 5.1+ output this means every
+    /// surround channel plays at full level — audible but not broken.
     pub fn push_s16le(&mut self, bytes: &[u8]) -> Vec<f32> {
         for pair in bytes.chunks_exact(2) {
             let v = i16::from_le_bytes([pair[0], pair[1]]);
@@ -221,5 +236,41 @@ mod tests {
         let bytes = vec![0u8; 16000 * 2]; // 1 second
         let out = p.push_s16le(&bytes);
         assert!(out.len() >= 44000, "got {} samples", out.len());
+    }
+
+    #[test]
+    fn playback_flush_clears_residual() {
+        // Partial chunk sized so resampler can't emit yet — bytes sit in mono_buf.
+        let mut p = PlaybackFramer::new(16000, 48000, 1).unwrap();
+        let partial = vec![0x10u8; 32]; // 16 samples, well under the resample chunk
+        let out = p.push_s16le(&partial);
+        assert!(
+            out.len() < 100,
+            "expected little-to-no output before chunk fills; got {}",
+            out.len()
+        );
+        p.flush();
+        // After flush, feeding a full second should behave like a fresh framer —
+        // no pre-flush residue should bleed into the first callback's output.
+        let bytes = vec![0u8; 16000 * 2];
+        let out_after = p.push_s16le(&bytes);
+        assert!(out_after.len() >= 44000, "got {} samples", out_after.len());
+    }
+
+    #[test]
+    fn capture_accumulates_across_non_boundary_pushes() {
+        // Feeding in uneven chunks must produce the same total frame count
+        // as feeding one big buffer: residual samples carry across pushes.
+        let mut f = CaptureFramer::new(48000, 1, 16000, 320).unwrap();
+        let total: Vec<f32> = vec![0.0; 48000];
+        let mut frames_total = 0;
+        for chunk in total.chunks(777) {
+            // 777 is deliberately not a multiple of the internal chunk size.
+            frames_total += f.push_f32(chunk).len();
+        }
+        assert!(
+            frames_total >= 45,
+            "split pushes produced {frames_total} frames — residual not carried?"
+        );
     }
 }

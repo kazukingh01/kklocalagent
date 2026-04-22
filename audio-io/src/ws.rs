@@ -1,4 +1,6 @@
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use std::borrow::Cow;
+
+use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::IntoResponse;
 use bytes::Bytes;
@@ -52,7 +54,12 @@ async fn handle_spk(mut socket: WebSocket, state: AppState) {
             Some(tx) => tx.clone(),
             None => {
                 warn!("spk ws: playback not running; closing");
-                let _ = socket.send(Message::Close(None)).await;
+                let _ = socket
+                    .send(Message::Close(Some(CloseFrame {
+                        code: close_code::POLICY,
+                        reason: Cow::Borrowed("playback not running"),
+                    })))
+                    .await;
                 return;
             }
         }
@@ -66,7 +73,12 @@ async fn handle_spk(mut socket: WebSocket, state: AppState) {
                         len = data.len(),
                         "spk ws: rejecting odd-length frame (s16le requires even bytes)"
                     );
-                    let _ = socket.send(Message::Close(None)).await;
+                    let _ = socket
+                        .send(Message::Close(Some(CloseFrame {
+                            code: close_code::INVALID,
+                            reason: Cow::Borrowed("odd-length frame (s16le requires even bytes)"),
+                        })))
+                        .await;
                     break;
                 }
                 if spk_tx.send(Bytes::from(data)).await.is_err() {

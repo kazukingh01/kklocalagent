@@ -80,7 +80,10 @@ pub fn start_playback(
         }
     };
 
-    let (spk_tx, spk_rx) = mpsc::channel::<Bytes>(256);
+    // 32 frames ≈ 640 ms at 20 ms/frame — a small multiple of the
+    // playback ring so backpressure hits the WebSocket well before a
+    // multi-second backlog can accumulate (important for barge-in).
+    let (spk_tx, spk_rx) = mpsc::channel::<Bytes>(32);
     let task = tokio::spawn(playback_producer_task(
         spk_rx,
         ready.producer,
@@ -203,7 +206,8 @@ fn run_playback(
                     }
                     for sample in data.iter_mut() {
                         let v = consumer.try_pop().unwrap_or(0.0);
-                        *sample = ((v.clamp(-1.0, 1.0) + 1.0) * 32767.5) as u16;
+                        let scaled = (v.clamp(-1.0, 1.0) * 32767.0) as i32 + 32768;
+                        *sample = scaled.clamp(0, u16::MAX as i32) as u16;
                     }
                 },
                 err_fn,
@@ -240,6 +244,7 @@ async fn playback_producer_task(
     while let Some(bytes) = spk_rx.recv().await {
         if flush.producer.swap(false, Ordering::Relaxed) {
             while spk_rx.try_recv().is_ok() {}
+            framer.flush();
             continue;
         }
         let samples = framer.push_s16le(&bytes);

@@ -16,8 +16,25 @@ async fn spawn_test_server() -> SocketAddr {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    // Give the runtime a tick to fully register the server.
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Wait for the server to start accepting connections instead of a fixed
+    // sleep — prevents CI flake on slow runners.
+    let client = reqwest::Client::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if client
+            .get(format!("http://{addr}/health"))
+            .timeout(Duration::from_millis(200))
+            .send()
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("test server did not become ready within 2s");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     addr
 }
 
