@@ -22,6 +22,9 @@ services:
     environment:
       SAMPLE_PATH: /samples/jfk.wav
       LOOP_DELAY_MS: "2000"
+      # Replay the wav LOOP_COUNT times then idle with silence. Set to 0
+      # for the original infinite-loop behaviour (continuous demo mode).
+      LOOP_COUNT: "1"
 
   voice-activity-detection:
     build:

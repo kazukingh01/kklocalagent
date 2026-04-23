@@ -41,16 +41,25 @@ in a multi-stage build (a few minutes). Subsequent runs are cached.
 
 ## What you should see
 
-Within ~15 s of boot, the `vad` logs print one transcription per loop:
+Within ~15 s of boot, the `vad` logs print one transcription per
+utterance (the JFK clip naturally splits into ~3 segments because of
+the pauses between phrases):
 
 ```text
 kklocalagent-test-vad  | INFO vad::sink: [event] {"name":"SpeechStarted",...}
 kklocalagent-test-vad  | INFO vad::sink: [event] {"name":"SpeechEnded",...}
-kklocalagent-test-vad  | INFO vad::asr:  [asr <-] transcription: "And so my fellow Americans, ..."
+kklocalagent-test-vad  | INFO vad::asr:  [asr <-] transcription: "And so my fellow Americans, ask not!"
+kklocalagent-test-vad  | INFO vad::asr:  [asr <-] transcription: "ask what you can do for your country."
+...
+kklocalagent-test-mic-stub | mic-stub: completed 1 loop(s); now idling with silence ...
 ```
 
-The mic-stub loops the sample with 2 s of silence between iterations, so
-the VAD hangs up and re-fires SpeechEnded each loop.
+By default `LOOP_COUNT=1` — the wav plays once, then mic-stub keeps the
+WS open while streaming silence so the VAD doesn't reconnect-spam. Tear
+down with `docker compose down` when you're satisfied.
+
+For a continuous demo (transcriptions every ~13 s forever) set
+`LOOP_COUNT=0` in `compose.yaml`.
 
 ## Tear down
 
@@ -65,7 +74,7 @@ docker compose down
 | `model file not found: /models/ggml-tiny.bin` in `asr` logs | model not downloaded | run `../fetch-models.sh` |
 | `mic-stub: ... expected mono` etc. | wrong sample format | re-run `./fetch-sample.sh` (the JFK clip is already 16 kHz mono) |
 | VAD never fires SpeechEnded | sample is pure silence, or `LOOP_DELAY_MS` < `hang_frames * 20 ms` | use a real speech sample; default 2000 ms gap is comfortably above the 400 ms default hang |
-| `ASR call failed: error sending request` | ASR not yet ready when first event arrives | benign on first boot — events keep firing on each loop, the next one will land |
+| `ASR call failed: error sending request` | ASR still loading the model when the first SpeechEnded fired | rare on tiny model (loads in ~3 s); if you see it consistently, set `LOOP_COUNT=2` so the second pass catches the missed transcription |
 | Want to swap models | `WHISPER_MODEL` env in `compose.yaml` | `./fetch-models.sh ggml-base.bin` then set `WHISPER_MODEL: ggml-base.bin` |
 
 ## Probing ASR directly

@@ -7,9 +7,13 @@ Wire format (must match audio-io): s16le, 16 kHz, mono, 640 bytes/frame.
 
 Behaviour:
 - Accepts WS clients on any path (VAD connects to /mic).
-- On connect, replays SAMPLE_PATH in real time, then injects
-  LOOP_DELAY_MS of digital silence so the VAD's hang_frames trigger a
-  SpeechEnded event between loops, then repeats.
+- On connect, replays SAMPLE_PATH in real time LOOP_COUNT times. Each
+  loop is followed by LOOP_DELAY_MS of digital silence so the VAD's
+  hang_frames trigger a SpeechEnded between iterations.
+- After LOOP_COUNT iterations, keeps the WS open and streams pure
+  silence forever. This stops new transcriptions while preventing the
+  VAD from reconnect-spamming. Tear down with `docker compose down`.
+- LOOP_COUNT=0 means infinite — the original "play and never stop" mode.
 - Disconnects don't crash the server; it waits for the next client.
 """
 
@@ -24,6 +28,7 @@ HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "7010"))
 SAMPLE_PATH = os.environ.get("SAMPLE_PATH", "/samples/jfk.wav")
 LOOP_DELAY_MS = int(os.environ.get("LOOP_DELAY_MS", "2000"))
+LOOP_COUNT = int(os.environ.get("LOOP_COUNT", "1"))  # 0 = infinite
 
 SAMPLE_RATE = 16000
 FRAME_MS = 20
@@ -47,13 +52,27 @@ async def stream(ws, pcm: bytes) -> None:
     silent_frame = b"\x00" * BYTES_PER_FRAME
     silence_frames = max(1, LOOP_DELAY_MS // FRAME_MS)
     frame_period = FRAME_MS / 1000.0
-    while True:
+
+    loops_done = 0
+    while LOOP_COUNT == 0 or loops_done < LOOP_COUNT:
         for i in range(0, len(pcm) - BYTES_PER_FRAME + 1, BYTES_PER_FRAME):
             await ws.send(pcm[i : i + BYTES_PER_FRAME])
             await asyncio.sleep(frame_period)
+        loops_done += 1
+        # Trailing silence — gives the VAD's hang_frames a chance to fire
+        # SpeechEnded for the last utterance of this loop.
         for _ in range(silence_frames):
             await ws.send(silent_frame)
             await asyncio.sleep(frame_period)
+
+    print(
+        f"mic-stub: completed {loops_done} loop(s); now idling with silence "
+        "(stop with `docker compose down`)",
+        flush=True,
+    )
+    while True:
+        await ws.send(silent_frame)
+        await asyncio.sleep(frame_period)
 
 
 async def handler(ws) -> None:
