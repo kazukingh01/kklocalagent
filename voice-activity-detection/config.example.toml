@@ -25,15 +25,21 @@ hang_frames = 20
 max_utterance_frames = 1500
 
 [sink]
-# dry_run = true : log events only (the "test" mode — pretend to send to the
-#                   orchestrator but just print JSON). This is the only sink
-#                   implemented in v0.1.
-# dry_run = false: POST events to orchestrator_url (not yet implemented —
-#                   events are dropped with a warning).
-dry_run = true
+# Where SpeechStarted/SpeechEnded events go.
+#
+#   "dry-run"      : log JSON only (default; safe to run with no peer).
+#   "asr-direct"   : log + on SpeechEnded POST the utterance audio (WAV)
+#                    to whisper.cpp /inference at asr_url. Used for the
+#                    audio-io→vad→asr smoke test before the orchestrator
+#                    exists.
+#   "orchestrator" : POST events to orchestrator_url. Not yet implemented
+#                    — events are dropped with a warning.
+mode = "dry-run"
 orchestrator_url = "http://127.0.0.1:7000/events"
+asr_url = "http://127.0.0.1:7040/inference"
 # Include the utterance PCM (base64 s16le) in each SpeechEnded event.
 # Off by default because audio payloads bloat log output quickly.
+# Cosmetic in dry-run; the asr-direct mode always sends audio regardless.
 include_audio_in_event = false
 
 [diag]

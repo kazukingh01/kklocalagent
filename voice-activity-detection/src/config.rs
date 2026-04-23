@@ -1,6 +1,26 @@
 use std::path::Path;
 
+use clap::ValueEnum;
 use serde::Deserialize;
+
+/// Where SpeechStarted/SpeechEnded events go.
+///
+/// - `DryRun` (default, safe to run without any peer): log each event as
+///   JSON.
+/// - `AsrDirect`: still log the event, and on `SpeechEnded` POST the
+///   utterance audio (wrapped as a WAV) to whisper.cpp's `/inference`
+///   endpoint at `sink.asr_url`. Used for the audio-io→vad→asr smoke
+///   test before the orchestrator exists.
+/// - `Orchestrator`: forward events to `sink.orchestrator_url`. Not yet
+///   implemented — events are dropped with a warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+#[clap(rename_all = "kebab-case")]
+pub enum SinkMode {
+    DryRun,
+    AsrDirect,
+    Orchestrator,
+}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -63,11 +83,15 @@ pub struct DetectorConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct SinkConfig {
-    /// dry_run=true: log events only. false: (future) POST to orchestrator.
-    pub dry_run: bool,
-    /// Orchestrator events endpoint — unused while dry_run is true.
+    /// See [`SinkMode`].
+    pub mode: SinkMode,
+    /// Orchestrator events endpoint — used only when `mode = "orchestrator"`.
     pub orchestrator_url: String,
+    /// whisper.cpp `/inference` endpoint — used only when `mode = "asr-direct"`.
+    pub asr_url: String,
     /// Include base64-encoded utterance audio in SpeechEnded events.
+    /// Cosmetic in dry-run mode; the asr-direct mode always sends audio
+    /// regardless of this flag.
     pub include_audio_in_event: bool,
 }
 
@@ -96,8 +120,9 @@ impl Default for DetectorConfig {
 impl Default for SinkConfig {
     fn default() -> Self {
         Self {
-            dry_run: true,
+            mode: SinkMode::DryRun,
             orchestrator_url: "http://127.0.0.1:7000/events".into(),
+            asr_url: "http://127.0.0.1:7040/inference".into(),
             include_audio_in_event: false,
         }
     }

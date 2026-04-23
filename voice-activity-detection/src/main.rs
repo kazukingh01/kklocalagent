@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::{fmt, EnvFilter};
 
-use voice_activity_detection::config::Config;
+use voice_activity_detection::config::{Config, SinkMode};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -19,10 +19,18 @@ struct Args {
     #[arg(long, env = "VAD_MIC_URL")]
     mic_url: Option<String>,
 
-    /// Enable live mode (POST events to orchestrator). Default is the test /
-    /// dry-run mode that logs events instead. Live mode is not yet
-    /// implemented — passing --live currently drops events with a warning.
-    #[arg(long)]
+    /// Override the sink mode from config.
+    /// Values: dry-run | asr-direct | orchestrator (orchestrator is TODO).
+    #[arg(long, value_enum, env = "VAD_SINK_MODE")]
+    sink_mode: Option<SinkMode>,
+
+    /// Override the ASR /inference URL — used in `asr-direct` mode.
+    #[arg(long, env = "VAD_ASR_URL")]
+    asr_url: Option<String>,
+
+    /// Shortcut for `--sink-mode asr-direct`. Kept for back-compat with
+    /// the early dry-run/live split.
+    #[arg(long, conflicts_with = "sink_mode")]
     live: bool,
 }
 
@@ -42,10 +50,15 @@ async fn main() -> Result<()> {
     if let Some(url) = args.mic_url {
         config.source.mic_url = url;
     }
-    // CLI --live takes precedence over config file; default is dry-run so
-    // `voice-activity-detection` with no flags is safe to run.
-    if args.live {
-        config.sink.dry_run = false;
+    if let Some(url) = args.asr_url {
+        config.sink.asr_url = url;
+    }
+    if let Some(mode) = args.sink_mode {
+        config.sink.mode = mode;
+    } else if args.live {
+        // --live predates the multi-mode sink and meant "anything but
+        // dry-run". The only live mode wired up today is asr-direct.
+        config.sink.mode = SinkMode::AsrDirect;
     }
 
     voice_activity_detection::run(config).await
