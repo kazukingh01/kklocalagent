@@ -1,0 +1,50 @@
+# End-to-end smoke test: mic-stub → voice-activity-detection → ASR.
+#
+#   mic-stub        — fakes the Windows-native audio-io by replaying
+#                     samples/jfk.wav as 20 ms PCM frames over WS.
+#   vad             — webrtc-vad segmenter with sink.mode=asr-direct,
+#                     POSTs each utterance WAV to whisper.cpp /inference.
+#   asr             — whisper.cpp server with ggml-tiny.bin.
+#
+# Run from this directory:
+#   ./fetch-sample.sh
+#   ../fetch-models.sh
+#   docker compose up --build
+#
+# Watch the `vad` logs for `[asr <-] transcription: "..."`.
+
+services:
+  mic-stub:
+    build: ./mic-stub
+    container_name: kklocalagent-test-mic-stub
+    volumes:
+      - ./samples:/samples:ro
+    environment:
+      SAMPLE_PATH: /samples/jfk.wav
+      LOOP_DELAY_MS: "2000"
+
+  voice-activity-detection:
+    build:
+      context: ../../voice-activity-detection
+    container_name: kklocalagent-test-vad
+    environment:
+      RUST_LOG: info,vad=info,voice_activity_detection=info
+    volumes:
+      - ./vad-config.toml:/etc/vad/config.toml:ro
+    command: ["--config", "/etc/vad/config.toml"]
+    depends_on:
+      - mic-stub
+      - automatic-speech-recognition
+
+  automatic-speech-recognition:
+    build:
+      context: ..
+    container_name: kklocalagent-test-asr
+    volumes:
+      - ../models:/models:ro
+    environment:
+      WHISPER_MODEL: ggml-tiny.bin
+    ports:
+      # Exposed on the host for ad-hoc curl probing; VAD reaches it via
+      # the compose network as automatic-speech-recognition:8080.
+      - "7040:8080"
