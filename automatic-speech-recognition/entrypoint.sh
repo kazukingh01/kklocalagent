@@ -13,16 +13,16 @@ if [ ! -f "$MODEL_PATH" ]; then
     exit 1
 fi
 
-# Locate the server binary. Upstream's server image puts it at
-# /app/server; PATH lookups are a fallback for layout changes.
-if [ -x /app/server ]; then
-    SERVER=/app/server
+# Locate the server binary. Upstream's image bundles all binaries under
+# /app/build/bin; PATH lookups are a fallback for layout changes.
+if [ -x /app/build/bin/whisper-server ]; then
+    SERVER=/app/build/bin/whisper-server
 else
-    SERVER=$(command -v whisper-server || command -v server || true)
+    SERVER=$(command -v whisper-server || true)
 fi
 
 if [ -z "$SERVER" ]; then
-    echo "whisper-server binary not found at /app/server or in PATH" >&2
+    echo "whisper-server binary not found at /app/build/bin/whisper-server or in PATH" >&2
     exit 1
 fi
 

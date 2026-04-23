@@ -1,8 +1,10 @@
 # automatic-speech-recognition
 
 Whisper.cpp server packaged for kklocalagent. Wraps the upstream
-`ghcr.io/ggml-org/whisper.cpp:server` (or `server-cuda`) image and
-exposes the HTTP `/inference` endpoint on port 8080.
+`ghcr.io/ggml-org/whisper.cpp:main` (or `main-cuda` / `main-intel` /
+`main-musa`) image and exposes the HTTP `/inference` endpoint on port
+8080. The upstream image bundles all binaries — our entrypoint just
+points at `/app/build/bin/whisper-server`.
 
 ## Build
 
@@ -11,7 +13,7 @@ exposes the HTTP `/inference` endpoint on port 8080.
 docker build -t kklocalagent/asr automatic-speech-recognition
 
 # CUDA — requires NVIDIA Container Toolkit at run time
-docker build --build-arg WHISPER_VARIANT=server-cuda \
+docker build --build-arg WHISPER_VARIANT=main-cuda \
     -t kklocalagent/asr:cuda automatic-speech-recognition
 ```
 

@@ -36,7 +36,7 @@ cd automatic-speech-recognition/test
 docker compose up --build
 ```
 
-First boot pulls `ghcr.io/ggml-org/whisper.cpp:server` and compiles VAD
+First boot pulls `ghcr.io/ggml-org/whisper.cpp:main` and compiles VAD
 in a multi-stage build (a few minutes). Subsequent runs are cached.
 
 ## What you should see
