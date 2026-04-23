@@ -88,7 +88,14 @@ pub async fn run(config: Config) -> Result<()> {
                 }
             }
         }
-        tokio::time::sleep(Duration::from_millis(cfg.source.reconnect_ms)).await;
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                info!("shutdown signal received");
+                return Ok(());
+            }
+            _ = tokio::time::sleep(Duration::from_millis(cfg.source.reconnect_ms)) => {}
+        }
     }
 }
 
@@ -143,7 +150,7 @@ async fn connect_and_run(cfg: Arc<Config>) -> Result<()> {
             );
             let is_speech = vad
                 .is_voice_segment(&samples)
-                .map_err(|e| anyhow!("vad classify: {e:?}"))?;
+                .map_err(|_| anyhow!("vad classify: frame length mismatch"))?;
             diag.record(&samples, is_speech);
             if let Some(event) = fsm.push_frame(&frame, is_speech) {
                 emit_event(&event, &fsm, sr, dry_run, include_audio);
