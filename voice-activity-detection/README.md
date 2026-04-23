@@ -1,4 +1,4 @@
-# voice_activity_detection
+# voice-activity-detection
 
 Voice activity detection service for kklocalagent. Subscribes to
 `audio-io`'s `/mic` WebSocket, runs each 20 ms PCM frame through
@@ -12,7 +12,7 @@ this side — only the WebSocket client).
 
 ```bash
 # Linux / WSL2
-cd voice_activity_detection
+cd voice-activity-detection
 cargo build --release
 
 # WSL2 -> Windows cross-compile (matching audio-io README)

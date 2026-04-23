@@ -1,4 +1,4 @@
-# voice_activity_detection configuration. All sections are optional.
+# voice-activity-detection configuration. All sections are optional.
 
 [source]
 # audio-io /mic WebSocket URL.
