@@ -1,0 +1,44 @@
+# Offline TTS smoke test: VOICEVOX engine → tts-client → out/zundamon.wav.
+#
+#   text-to-speech  — voicevox/voicevox_engine wrapped image, port 7060.
+#   tts-client      — runs synthesize.py --mode save once and exits.
+#                     Output WAV (24 kHz s16 mono, VOICEVOX default) is
+#                     written to ./out via a bind mount.
+#
+# Run from this directory:
+#   docker compose -f compose.offline.yaml up --build
+#
+# Then play locally:
+#   ffplay -autoexit -nodisp out/zundamon.wav     # or any WAV player
+#
+# Re-run with a different phrase / speaker:
+#   TEXT='今日はいい天気なのだ' VOICEVOX_SPEAKER=1 \
+#       docker compose -f compose.offline.yaml up --build
+
+services:
+  text-to-speech:
+    build:
+      context: ..
+    container_name: kklocalagent-test-tts
+    ports:
+      # Exposed on the host so you can curl /audio_query / /synthesis
+      # directly during interactive debugging. tts-client reaches the
+      # engine via the compose network as text-to-speech:50021.
+      - "7060:50021"
+
+  tts-client:
+    build: ./tts-client
+    container_name: kklocalagent-test-tts-client
+    volumes:
+      - ./out:/out
+    environment:
+      VOICEVOX_URL: http://text-to-speech:50021
+      VOICEVOX_SPEAKER: "3"
+      TEXT: "ぼくはずんだもんなのだ。今日はとてもいい天気なのだ。"
+    command: ["--mode", "save", "--out", "/out/zundamon.wav"]
+    depends_on:
+      text-to-speech:
+        # Wait for the engine's /version probe (Dockerfile HEALTHCHECK)
+        # before firing the synthesis request. Otherwise the first POST
+        # races the model lazy-mmap and can hang several seconds.
+        condition: service_healthy
