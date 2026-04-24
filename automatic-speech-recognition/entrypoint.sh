@@ -26,9 +26,12 @@ if [ -z "$SERVER" ]; then
     exit 1
 fi
 
+THREADS="${WHISPER_THREADS:-$(nproc)}"
+
 exec "$SERVER" \
     --model "$MODEL_PATH" \
     --language "${WHISPER_LANGUAGE:-auto}" \
+    --threads "$THREADS" \
     --host 0.0.0.0 \
     --port 8080 \
     "$@"

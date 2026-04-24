@@ -45,6 +45,7 @@ Env vars consumed by `entrypoint.sh`:
 |---|---|---|
 | `WHISPER_MODEL` | `ggml-tiny.bin` | file name under `/models` |
 | `WHISPER_LANGUAGE` | `auto` | `whisper-server --language` value (e.g. `ja`, `en`, `auto`) |
+| `WHISPER_THREADS` | `nproc` (all container cores) | `whisper-server --threads`. Set lower to leave CPU headroom for other services. |
 
 ## HTTP API
 

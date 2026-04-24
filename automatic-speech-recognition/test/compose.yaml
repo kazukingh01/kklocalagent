@@ -53,6 +53,10 @@ services:
       # detection. Switch to "auto" for mixed-language input or "en"
       # if you want to run the JFK English smoke test instead.
       WHISPER_LANGUAGE: ja
+      # CPU threads. Unset → entrypoint defaults to all container cores
+      # (recommended). Override here if you need to leave headroom for
+      # other services (e.g. WHISPER_THREADS: "8" on a 16-core box).
+      # WHISPER_THREADS: "14"
     ports:
       # Exposed on the host for ad-hoc curl probing; VAD reaches it via
       # the compose network as automatic-speech-recognition:8080.
