@@ -1,0 +1,58 @@
+# CPU-only LLM smoke test.
+#
+#   llm   — FROM ollama/ollama, overridden to pull `gemma3:1b` (~815 MB)
+#           so the stack runs on a CPU-only machine. First boot pulls
+#           the model into the `ollama-data` volume; subsequent boots
+#           start in seconds.
+#   probe — curlimages/curl sidecar. Once `llm` is healthy (model
+#           pulled), POSTs a fixed prompt to /api/chat with
+#           stream=false and prints the JSON response, then exits.
+#
+# Run from this directory:
+#   docker compose up --build
+#
+# Tear down (keep model cache):
+#   docker compose down
+# Tear down and wipe the cache:
+#   docker compose down -v
+
+services:
+  llm:
+    build:
+      context: ..
+    container_name: kklocalagent-test-llm
+    environment:
+      # Small CPU-friendly model from the same family as the production
+      # default (gemma3:4b). The probe below hardcodes the same name —
+      # both sides must agree.
+      LLM_MODEL: gemma3:1b
+    ports:
+      # Published so interactive debugging (`curl 127.0.0.1:7050/api/tags`
+      # from the host) mirrors what the probe does internally via the
+      # compose network (llm:11434).
+      - "7050:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+
+  probe:
+    image: curlimages/curl:latest
+    container_name: kklocalagent-test-llm-probe
+    depends_on:
+      llm:
+        # Gated on /api/show returning 200 for LLM_MODEL (see the
+        # HEALTHCHECK in ../Dockerfile) so this fires only after the
+        # pull completes.
+        condition: service_healthy
+    command:
+      - sh
+      - -eu
+      - -c
+      - |
+        echo "[probe] POST /api/chat model=gemma3:1b"
+        curl -sS -X POST http://llm:11434/api/chat \
+          -H 'Content-Type: application/json' \
+          --data-raw '{"model":"gemma3:1b","messages":[{"role":"user","content":"日本の首都はどこですか？一言で答えてください。"}],"stream":false}'
+        echo
+
+volumes:
+  ollama-data:
