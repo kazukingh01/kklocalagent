@@ -1,0 +1,49 @@
+# Online TTS smoke test: VOICEVOX engine → tts-client → audio-io /spk
+# (Windows native) for live playback through the host speakers.
+#
+#   text-to-speech — VOICEVOX engine, port 7060.
+#   tts-client     — synthesizes a fixed phrase, resamples to 16 kHz
+#                    s16le mono via ffmpeg, then streams 640-byte (20 ms)
+#                    frames to ws://${WINDOWS_HOST}:7010/spk.
+#
+# Prerequisites:
+#   1. audio-io.exe running on Windows with `[server] host = "0.0.0.0"`.
+#   2. WINDOWS_HOST resolvable from the WSL2 docker network (default
+#      `host.docker.internal` works on Docker Desktop / WSL2 backend;
+#      override in test/.env for plain Linux docker).
+#
+# Run from this directory:
+#   docker compose -f compose.online.yaml up --build
+#
+# You should hear ずんだもん speak through the Windows default output.
+# Re-run with a different phrase via:
+#   TEXT='ぼくはずんだもんなのだ' \
+#       docker compose -f compose.online.yaml up --build
+
+services:
+  text-to-speech:
+    build:
+      context: ..
+    container_name: kklocalagent-test-tts-online
+    ports:
+      - "7060:50021"
+
+  tts-client:
+    build: ./tts-client
+    container_name: kklocalagent-test-tts-client-online
+    environment:
+      VOICEVOX_URL: http://text-to-speech:50021
+      VOICEVOX_SPEAKER: "3"
+      TEXT: "ぼくはずんだもんなのだ。今日はとてもいい天気なのだ。"
+      SPK_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/spk
+      AUDIO_IO_BASE: http://${WINDOWS_HOST:-host.docker.internal}:7010
+    command: ["--mode", "stream"]
+    # Plain Linux docker (non-Docker-Desktop, non-WSL2) doesn't resolve
+    # `host.docker.internal` by default. host-gateway makes it point at
+    # the docker bridge gateway = the host. Harmless on Docker Desktop /
+    # WSL2 where the resolver already exists.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      text-to-speech:
+        condition: service_healthy
