@@ -33,8 +33,18 @@ services:
     volumes:
       - ./vad-config.toml:/etc/vad/config.toml:ro
     command: ["--config", "/etc/vad/config.toml"]
+    # Plain Linux docker (non-Docker-Desktop, non-WSL2) doesn't resolve
+    # `host.docker.internal` by default. host-gateway makes it point at
+    # the docker bridge gateway = the host. Harmless on Docker Desktop /
+    # WSL2 where the resolver already exists.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
-      - automatic-speech-recognition
+      automatic-speech-recognition:
+        # Wait until whisper-server has loaded the model and is listening
+        # (via the Dockerfile HEALTHCHECK). Otherwise the first utterance
+        # races startup and the POST hangs.
+        condition: service_healthy
 
   automatic-speech-recognition:
     build:

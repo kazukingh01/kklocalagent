@@ -62,7 +62,9 @@ See `config.example.toml` for all tunables. The ones you'll reach for most:
 | `detector.max_utterance_frames` | 1500 (30 s) | Force-ends runaway utterances. |
 | `sink.mode` | `"dry-run"` | `"dry-run"` (log only), `"asr-direct"` (POST WAV to whisper.cpp `/inference`), `"orchestrator"` (TODO). |
 | `sink.asr_url` | `http://127.0.0.1:7040/inference` | Used in `asr-direct` mode. |
-| `sink.include_audio_in_event` | false | Include base64 PCM in `SpeechEnded` log lines. The `asr-direct` mode always sends audio regardless. |
+| `sink.asr_timeout_ms` | 30000 | HTTP timeout for `asr-direct` POSTs. Bump if you move to a heavier whisper model. |
+| `sink.asr_max_inflight` | 1 | Cap on concurrent `asr-direct` POSTs. Excess utterances are dropped with a warning rather than queued. |
+| `sink.log_audio_in_event` | false | Include base64 PCM in `SpeechEnded` *log* lines. Independent of `asr-direct`, which always uploads regardless. |
 
 ## Event wire format
 
@@ -73,7 +75,7 @@ Flat JSON, one event per log line / POST body:
 {"name":"SpeechEnded","frame_index":167,"duration_frames":45,"audio_len_bytes":28800,"ts":1744284000.99,"sample_rate":16000,"audio_base64":"..."}
 ```
 
-`audio_base64` is only present when `sink.include_audio_in_event = true`.
+`audio_base64` is only present when `sink.log_audio_in_event = true`.
 
 ## Tests
 

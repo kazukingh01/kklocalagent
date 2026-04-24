@@ -20,7 +20,12 @@ max_utterance_frames = 1500
 mode = "asr-direct"
 asr_url = "http://automatic-speech-recognition:8080/inference"
 orchestrator_url = "http://orchestrator:7000/events"
-include_audio_in_event = false
+# 30 s default fits ggml-small-q8_0; raise for larger models.
+asr_timeout_ms = 30000
+# 1 = serial. whisper-server itself is single-request, so concurrency >1
+# only helps if you front it with multiple replicas.
+asr_max_inflight = 1
+log_audio_in_event = false
 
 [diag]
 enabled = true

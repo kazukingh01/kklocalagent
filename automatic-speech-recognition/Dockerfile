@@ -21,5 +21,20 @@ ENV WHISPER_LANGUAGE=auto
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
+# curl is for the HEALTHCHECK probe — the upstream image is slim and
+# ships no HTTP client. whisper-server only starts listening *after* the
+# model is fully loaded, so a successful TCP/HTTP response is a reliable
+# "ready to accept inference" signal. We don't pass -f because any HTTP
+# response (even 404 on `/`) means the server is up; only network errors
+# return non-zero from `curl -s`.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# start-period is generous because the larger ggml models can take 30+ s
+# to mmap and warm up on first start. retries*interval = ~5 min total.
+HEALTHCHECK --interval=5s --timeout=3s --start-period=120s --retries=60 \
+    CMD curl -s --connect-timeout 2 -o /dev/null http://localhost:8080/ || exit 1
+
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

@@ -89,10 +89,19 @@ pub struct SinkConfig {
     pub orchestrator_url: String,
     /// whisper.cpp `/inference` endpoint — used only when `mode = "asr-direct"`.
     pub asr_url: String,
-    /// Include base64-encoded utterance audio in SpeechEnded events.
-    /// Cosmetic in dry-run mode; the asr-direct mode always sends audio
-    /// regardless of this flag.
-    pub include_audio_in_event: bool,
+    /// HTTP timeout for `asr-direct` POSTs, in milliseconds. Larger whisper
+    /// models take longer per utterance — `large-v3-turbo` on a 30 s
+    /// utterance can approach the default 30 s ceiling.
+    pub asr_timeout_ms: u64,
+    /// Maximum simultaneous in-flight `asr-direct` POSTs. Excess utterances
+    /// are dropped with a warning rather than queued, so backpressure is
+    /// observable instead of presenting as silent timeouts. 1 = strictly
+    /// serial (matches whisper-server's own single-request behaviour).
+    pub asr_max_inflight: u32,
+    /// Include base64-encoded utterance audio in the *log* JSON for each
+    /// SpeechEnded event. Independent of asr-direct, which always uploads
+    /// the audio regardless of this flag.
+    pub log_audio_in_event: bool,
 }
 
 impl Default for SourceConfig {
@@ -123,7 +132,9 @@ impl Default for SinkConfig {
             mode: SinkMode::DryRun,
             orchestrator_url: "http://127.0.0.1:7000/events".into(),
             asr_url: "http://127.0.0.1:7040/inference".into(),
-            include_audio_in_event: false,
+            asr_timeout_ms: 30_000,
+            asr_max_inflight: 1,
+            log_audio_in_event: false,
         }
     }
 }
@@ -166,6 +177,12 @@ impl Config {
         }
         if self.diag.window_frames == 0 {
             anyhow::bail!("diag.window_frames must be >= 1");
+        }
+        if self.sink.asr_timeout_ms == 0 {
+            anyhow::bail!("sink.asr_timeout_ms must be >= 1");
+        }
+        if self.sink.asr_max_inflight == 0 {
+            anyhow::bail!("sink.asr_max_inflight must be >= 1");
         }
         Ok(())
     }

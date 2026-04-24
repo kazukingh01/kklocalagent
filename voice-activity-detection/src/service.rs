@@ -5,6 +5,7 @@ use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use futures_util::StreamExt;
 use serde::Serialize;
+use tokio::sync::Semaphore;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{info, warn};
 use webrtc_vad::{SampleRate, Vad, VadMode};
@@ -75,10 +76,15 @@ pub async fn run(config: Config) -> Result<()> {
     let cfg = Arc::new(config);
     let http = Arc::new(
         reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_millis(cfg.sink.asr_timeout_ms))
             .build()
             .context("build reqwest client")?,
     );
+    // Bounds the number of in-flight asr-direct POSTs. Excess utterances
+    // are dropped with a warning rather than queued so backpressure is
+    // visible in logs instead of presenting as silent timeouts. Survives
+    // WS reconnects so we don't lose backpressure state on a flap.
+    let asr_inflight = Arc::new(Semaphore::new(cfg.sink.asr_max_inflight as usize));
     let mut shutdown = Box::pin(shutdown_signal());
     loop {
         tokio::select! {
@@ -87,7 +93,7 @@ pub async fn run(config: Config) -> Result<()> {
                 info!("shutdown signal received");
                 return Ok(());
             }
-            result = connect_and_run(cfg.clone(), http.clone()) => {
+            result = connect_and_run(cfg.clone(), http.clone(), asr_inflight.clone()) => {
                 match result {
                     Ok(()) => info!("WS session ended cleanly; reconnecting"),
                     Err(e) => warn!(error = %e, "WS session error; reconnecting"),
@@ -105,7 +111,11 @@ pub async fn run(config: Config) -> Result<()> {
     }
 }
 
-async fn connect_and_run(cfg: Arc<Config>, http: Arc<reqwest::Client>) -> Result<()> {
+async fn connect_and_run(
+    cfg: Arc<Config>,
+    http: Arc<reqwest::Client>,
+    asr_inflight: Arc<Semaphore>,
+) -> Result<()> {
     info!(url = %cfg.source.mic_url, "connecting to audio-io /mic");
     let (ws, _) = tokio_tungstenite::connect_async(&cfg.source.mic_url)
         .await
@@ -124,7 +134,7 @@ async fn connect_and_run(cfg: Arc<Config>, http: Arc<reqwest::Client>) -> Result
     let samples_per_frame = cfg.detector.samples_per_frame();
     let sr = cfg.detector.sample_rate;
     let mode = cfg.sink.mode;
-    let include_audio = cfg.sink.include_audio_in_event;
+    let log_audio = cfg.sink.log_audio_in_event;
     let asr_url = cfg.sink.asr_url.clone();
 
     // TODO: if audio-io enables WS ping/pong keepalive, the server will drop
@@ -165,9 +175,10 @@ async fn connect_and_run(cfg: Arc<Config>, http: Arc<reqwest::Client>) -> Result
                     fsm.utterance_buffer(),
                     sr,
                     mode,
-                    include_audio,
+                    log_audio,
                     &http,
                     &asr_url,
+                    &asr_inflight,
                 );
             }
         }
@@ -208,15 +219,16 @@ fn handle_event(
     utterance: &[u8],
     sample_rate: u32,
     mode: SinkMode,
-    include_audio: bool,
+    log_audio: bool,
     http: &Arc<reqwest::Client>,
     asr_url: &str,
+    asr_inflight: &Arc<Semaphore>,
 ) {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
-    let audio_base64 = if include_audio && matches!(event, Event::SpeechEnded { .. }) {
+    let audio_base64 = if log_audio && matches!(event, Event::SpeechEnded { .. }) {
         Some(base64::engine::general_purpose::STANDARD.encode(utterance))
     } else {
         None
@@ -242,10 +254,25 @@ fn handle_event(
         SinkMode::AsrDirect => {
             info!(target: "vad::sink", "[event] {json}");
             if let Event::SpeechEnded { .. } = event {
+                // try_acquire_owned returns Err iff every permit is held —
+                // i.e. asr_max_inflight POSTs are already in flight. Drop
+                // this utterance with a warning rather than queuing so the
+                // operator sees backpressure instead of silent timeouts.
+                let permit = match asr_inflight.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        warn!(
+                            target: "vad::asr",
+                            "ASR busy (asr_max_inflight reached); dropping utterance",
+                        );
+                        return;
+                    }
+                };
                 let wav = wav_from_pcm_s16le_mono(utterance, sample_rate);
                 let client = http.clone();
                 let url = asr_url.to_string();
                 tokio::spawn(async move {
+                    let _permit = permit; // released on drop after the POST
                     match post_wav_to_asr(&client, &url, wav).await {
                         Ok(text) => info!(
                             target: "vad::asr",
@@ -263,8 +290,8 @@ fn handle_event(
 /// whisper.cpp's `/inference` endpoint accepts WAV uploads via multipart.
 fn wav_from_pcm_s16le_mono(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
     let data_len = pcm.len() as u32;
-    let chunk_size = 36u32.saturating_add(data_len);
-    let byte_rate = sample_rate.saturating_mul(2); // mono * 2 bytes
+    let chunk_size = 36 + data_len;
+    let byte_rate = sample_rate * 2; // mono * 2 bytes
     let block_align: u16 = 2;
     let bits_per_sample: u16 = 16;
 

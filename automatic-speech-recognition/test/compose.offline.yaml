@@ -36,8 +36,14 @@ services:
       - ./vad-config.toml:/etc/vad/config.toml:ro
     command: ["--config", "/etc/vad/config.toml"]
     depends_on:
-      - mic-stub
-      - automatic-speech-recognition
+      mic-stub:
+        condition: service_started
+      automatic-speech-recognition:
+        # Wait until the ASR healthcheck (Dockerfile HEALTHCHECK) reports
+        # healthy — i.e. whisper-server has finished loading the model and
+        # is accepting connections. Without this the first SpeechEnded
+        # races the model load and the POST hangs / times out.
+        condition: service_healthy
 
   automatic-speech-recognition:
     build:

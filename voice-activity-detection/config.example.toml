@@ -37,10 +37,19 @@ max_utterance_frames = 1500
 mode = "dry-run"
 orchestrator_url = "http://127.0.0.1:7000/events"
 asr_url = "http://127.0.0.1:7040/inference"
-# Include the utterance PCM (base64 s16le) in each SpeechEnded event.
-# Off by default because audio payloads bloat log output quickly.
-# Cosmetic in dry-run; the asr-direct mode always sends audio regardless.
-include_audio_in_event = false
+# HTTP timeout (ms) for asr-direct POSTs. 30 s is fine for `small`, but
+# `large-v3-turbo` on a near-30 s utterance can approach this ceiling —
+# bump to 60_000+ if you switch to a heavier model.
+asr_timeout_ms = 30000
+# Maximum simultaneous in-flight asr-direct POSTs. Excess utterances are
+# dropped with a warning instead of queued, so backpressure is observable
+# in logs. 1 = strictly serial (matches whisper-server's single-request
+# behaviour). Raise only if your ASR backend can actually parallelize.
+asr_max_inflight = 1
+# Include the utterance PCM (base64 s16le) in the *log* JSON for each
+# SpeechEnded event. Independent of asr-direct, which always uploads the
+# audio regardless. Off by default because base64 audio bloats log output.
+log_audio_in_event = false
 
 [diag]
 # Emit per-window RMS and speech_ratio summary under the `vad::diag` log
