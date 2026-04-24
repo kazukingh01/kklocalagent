@@ -9,6 +9,10 @@ ARG WHISPER_VARIANT=main
 FROM ghcr.io/ggml-org/whisper.cpp:${WHISPER_VARIANT}
 
 ENV WHISPER_MODEL=ggml-tiny.bin
+# Language code for whisper-server (`-l`). `auto` = detect; pin to a
+# code (e.g. `ja`, `en`) when the deployment is single-language and you
+# want lower latency / less misdetection.
+ENV WHISPER_LANGUAGE=auto
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

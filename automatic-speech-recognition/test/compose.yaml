@@ -20,7 +20,7 @@ services:
     volumes:
       - ./samples:/samples:ro
     environment:
-      SAMPLE_PATH: /samples/jfk.wav
+      SAMPLE_PATH: /samples/test-ja.wav
       LOOP_DELAY_MS: "2000"
       # Replay the wav LOOP_COUNT times then idle with silence. Set to 0
       # for the original infinite-loop behaviour (continuous demo mode).
@@ -46,7 +46,13 @@ services:
     volumes:
       - ../models:/models:ro
     environment:
-      WHISPER_MODEL: ggml-tiny.bin
+      # large-v3-turbo q8_0: 0.83 GB on disk, ~1.5 GB RAM at runtime,
+      # near-medium quality at 8x speed. Sensible default for Japanese.
+      WHISPER_MODEL: ggml-large-v3-turbo-q8_0.bin
+      # Pin to ja so whisper-server doesn't burn cycles on language
+      # detection. Switch to "auto" for mixed-language input or "en"
+      # if you want to run the JFK English smoke test instead.
+      WHISPER_LANGUAGE: ja
     ports:
       # Exposed on the host for ad-hoc curl probing; VAD reaches it via
       # the compose network as automatic-speech-recognition:8080.

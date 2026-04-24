@@ -35,8 +35,16 @@ cd automatic-speech-recognition
 docker run --rm -p 7040:8080 \
     -v "$(pwd)/automatic-speech-recognition/models:/models:ro" \
     -e WHISPER_MODEL=ggml-tiny.bin \
+    -e WHISPER_LANGUAGE=auto \
     kklocalagent/asr
 ```
+
+Env vars consumed by `entrypoint.sh`:
+
+| name | default | purpose |
+|---|---|---|
+| `WHISPER_MODEL` | `ggml-tiny.bin` | file name under `/models` |
+| `WHISPER_LANGUAGE` | `auto` | `whisper-server --language` value (e.g. `ja`, `en`, `auto`) |
 
 ## HTTP API
 

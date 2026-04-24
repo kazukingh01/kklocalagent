@@ -28,6 +28,7 @@ fi
 
 exec "$SERVER" \
     --model "$MODEL_PATH" \
+    --language "${WHISPER_LANGUAGE:-auto}" \
     --host 0.0.0.0 \
     --port 8080 \
     "$@"
