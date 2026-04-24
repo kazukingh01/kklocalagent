@@ -13,9 +13,10 @@ ENV WHISPER_MODEL=ggml-tiny.bin
 # code (e.g. `ja`, `en`) when the deployment is single-language and you
 # want lower latency / less misdetection.
 ENV WHISPER_LANGUAGE=auto
-# CPU threads used by whisper-server (`-t`). Unset → entrypoint.sh
-# defaults to `nproc` (all container cores). whisper-server's own
-# default is only 4, which leaves modern CPUs idle on heavy models.
+# CPU threads used by whisper-server (`-t`). Default = 4 (matches
+# whisper-server's own default). Bumping past the host's *physical*
+# core count usually hurts whisper.cpp due to cache contention from
+# Hyperthreading — pick a value with that in mind, not blindly nproc.
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
