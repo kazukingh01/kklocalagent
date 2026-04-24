@@ -1,4 +1,4 @@
-# voice_activity_detection
+# voice-activity-detection
 
 Voice activity detection service for kklocalagent. Subscribes to
 `audio-io`'s `/mic` WebSocket, runs each 20 ms PCM frame through
@@ -12,7 +12,7 @@ this side — only the WebSocket client).
 
 ```bash
 # Linux / WSL2
-cd voice_activity_detection
+cd voice-activity-detection
 cargo build --release
 
 # WSL2 -> Windows cross-compile (matching audio-io README)
@@ -42,9 +42,13 @@ INFO vad::sink: [orchestrator-stub <-] {"name":"SpeechStarted","frame_index":123
 INFO vad::sink: [orchestrator-stub <-] {"name":"SpeechEnded","frame_index":167,"duration_frames":45,"audio_len_bytes":28800,"ts":1744284000.99,"sample_rate":16000}
 ```
 
-`--live` switches to "live" mode (POST to orchestrator). The orchestrator
-isn't implemented yet, so `--live` currently drops events with a warning
-— it exists so the CLI shape doesn't change when the orchestrator lands.
+`--sink-mode asr-direct` (or its shorthand `--live`) switches to "live"
+mode where each `SpeechEnded` is also POSTed as a WAV upload to a
+whisper.cpp `/inference` endpoint at `--asr-url` / `sink.asr_url`. This
+lets the audio-io→vad→asr smoke test run without the orchestrator.
+
+`--sink-mode orchestrator` is reserved for the not-yet-built orchestrator
+and currently drops events with a warning.
 
 ## Configuration
 
@@ -56,8 +60,11 @@ See `config.example.toml` for all tunables. The ones you'll reach for most:
 | `detector.start_frames` | 3 | Voiced frames required before `SpeechStarted`. Higher = fewer false triggers, more latency. |
 | `detector.hang_frames` | 20 | Silent frames required before `SpeechEnded`. Higher = tolerates longer pauses mid-utterance, but longer wait before ASR can start. |
 | `detector.max_utterance_frames` | 1500 (30 s) | Force-ends runaway utterances. |
-| `sink.dry_run` | true | Log events (test mode). `false` = live orchestrator POST (TODO). |
-| `sink.include_audio_in_event` | false | Include base64 PCM in `SpeechEnded`. Useful once the orchestrator relays audio to ASR. |
+| `sink.mode` | `"dry-run"` | `"dry-run"` (log only), `"asr-direct"` (POST WAV to whisper.cpp `/inference`), `"orchestrator"` (TODO). |
+| `sink.asr_url` | `http://127.0.0.1:7040/inference` | Used in `asr-direct` mode. |
+| `sink.asr_timeout_ms` | 30000 | HTTP timeout for `asr-direct` POSTs. Bump if you move to a heavier whisper model. |
+| `sink.asr_max_inflight` | 1 | Cap on concurrent `asr-direct` POSTs. Excess utterances are dropped with a warning rather than queued. |
+| `sink.log_audio_in_event` | false | Include base64 PCM in `SpeechEnded` *log* lines. Independent of `asr-direct`, which always uploads regardless. |
 
 ## Event wire format
 
@@ -68,7 +75,7 @@ Flat JSON, one event per log line / POST body:
 {"name":"SpeechEnded","frame_index":167,"duration_frames":45,"audio_len_bytes":28800,"ts":1744284000.99,"sample_rate":16000,"audio_base64":"..."}
 ```
 
-`audio_base64` is only present when `sink.include_audio_in_event = true`.
+`audio_base64` is only present when `sink.log_audio_in_event = true`.
 
 ## Tests
 

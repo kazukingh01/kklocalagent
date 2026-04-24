@@ -1,0 +1,32 @@
+# VAD config used by the audio-io→vad→asr smoke test. Mounted into the
+# voice-activity-detection container at /etc/vad/config.toml.
+
+[source]
+# `mic-stub` is the compose service that fakes audio-io.
+mic_url = "ws://mic-stub:7010/mic"
+reconnect_ms = 1000
+
+[detector]
+aggressiveness = 2
+sample_rate = 16000
+frame_ms = 20
+start_frames = 3
+hang_frames = 20
+max_utterance_frames = 1500
+
+[sink]
+# Bypass the orchestrator (which doesn't exist yet) and POST utterance
+# WAVs straight to whisper.cpp's /inference endpoint.
+mode = "asr-direct"
+asr_url = "http://automatic-speech-recognition:8080/inference"
+orchestrator_url = "http://orchestrator:7000/events"
+# 30 s default fits ggml-small-q8_0; raise for larger models.
+asr_timeout_ms = 30000
+# 1 = serial. whisper-server itself is single-request, so concurrency >1
+# only helps if you front it with multiple replicas.
+asr_max_inflight = 1
+log_audio_in_event = false
+
+[diag]
+enabled = true
+window_frames = 50

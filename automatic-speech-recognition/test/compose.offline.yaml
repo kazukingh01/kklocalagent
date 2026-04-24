@@ -1,0 +1,73 @@
+# End-to-end smoke test: mic-stub → voice-activity-detection → ASR.
+#
+#   mic-stub        — fakes the Windows-native audio-io by replaying
+#                     samples/jfk.wav as 20 ms PCM frames over WS.
+#   vad             — webrtc-vad segmenter with sink.mode=asr-direct,
+#                     POSTs each utterance WAV to whisper.cpp /inference.
+#   asr             — whisper.cpp server with ggml-tiny.bin.
+#
+# Run from this directory:
+#   ./fetch-sample.sh
+#   ../fetch-models.sh
+#   docker compose up --build
+#
+# Watch the `vad` logs for `[asr <-] transcription: "..."`.
+
+services:
+  mic-stub:
+    build: ./mic-stub
+    container_name: kklocalagent-test-mic-stub
+    volumes:
+      - ./samples:/samples:ro
+    environment:
+      SAMPLE_PATH: /samples/test-ja.wav
+      LOOP_DELAY_MS: "2000"
+      # Replay the wav LOOP_COUNT times then idle with silence. Set to 0
+      # for the original infinite-loop behaviour (continuous demo mode).
+      LOOP_COUNT: "1"
+
+  voice-activity-detection:
+    build:
+      context: ../../voice-activity-detection
+    container_name: kklocalagent-test-vad
+    environment:
+      RUST_LOG: info,vad=info,voice_activity_detection=info
+    volumes:
+      - ./vad-config.toml:/etc/vad/config.toml:ro
+    command: ["--config", "/etc/vad/config.toml"]
+    depends_on:
+      mic-stub:
+        condition: service_started
+      automatic-speech-recognition:
+        # Wait until the ASR healthcheck (Dockerfile HEALTHCHECK) reports
+        # healthy — i.e. whisper-server has finished loading the model and
+        # is accepting connections. Without this the first SpeechEnded
+        # races the model load and the POST hangs / times out.
+        condition: service_healthy
+
+  automatic-speech-recognition:
+    build:
+      context: ..
+    container_name: kklocalagent-test-asr
+    volumes:
+      - ../models:/models:ro
+    environment:
+      # small q8_0: 252 MB on disk, ~0.5 GB RAM, ~3–5 s of inference
+      # for an 8 s utterance on CPU (vs ~14 s for turbo-q8_0). Quality
+      # is one tier below turbo for Japanese — fine for clean TTS-style
+      # input, weaker on fast/colloquial speech and proper nouns. Move
+      # back up to large-v3-turbo-{q5_0,q8_0,*}.bin for higher accuracy.
+      WHISPER_MODEL: ggml-small-q8_0.bin
+      # Pin to ja so whisper-server doesn't burn cycles on language
+      # detection. Switch to "auto" for mixed-language input or "en"
+      # if you want to run the JFK English smoke test instead.
+      WHISPER_LANGUAGE: ja
+      # CPU threads. Default 4 matches whisper-server's own default.
+      # Bumping helps for heavy models, but past the *physical* core
+      # count it usually hurts (cache contention from Hyperthreading).
+      # Rule of thumb: physical cores, capped at ~8.
+      # WHISPER_THREADS: "8"
+    ports:
+      # Exposed on the host for ad-hoc curl probing; VAD reaches it via
+      # the compose network as automatic-speech-recognition:8080.
+      - "7040:8080"

@@ -5,11 +5,12 @@ use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use futures_util::StreamExt;
 use serde::Serialize;
+use tokio::sync::Semaphore;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{info, warn};
 use webrtc_vad::{SampleRate, Vad, VadMode};
 
-use crate::config::{Config, DiagConfig};
+use crate::config::{Config, DiagConfig, SinkMode};
 use crate::detector::{Event, SpeechFsm};
 
 /// Accumulates RMS energy and speech_ratio over a window of frames and logs
@@ -73,6 +74,17 @@ impl Diag {
 
 pub async fn run(config: Config) -> Result<()> {
     let cfg = Arc::new(config);
+    let http = Arc::new(
+        reqwest::Client::builder()
+            .timeout(Duration::from_millis(cfg.sink.asr_timeout_ms))
+            .build()
+            .context("build reqwest client")?,
+    );
+    // Bounds the number of in-flight asr-direct POSTs. Excess utterances
+    // are dropped with a warning rather than queued so backpressure is
+    // visible in logs instead of presenting as silent timeouts. Survives
+    // WS reconnects so we don't lose backpressure state on a flap.
+    let asr_inflight = Arc::new(Semaphore::new(cfg.sink.asr_max_inflight as usize));
     let mut shutdown = Box::pin(shutdown_signal());
     loop {
         tokio::select! {
@@ -81,7 +93,7 @@ pub async fn run(config: Config) -> Result<()> {
                 info!("shutdown signal received");
                 return Ok(());
             }
-            result = connect_and_run(cfg.clone()) => {
+            result = connect_and_run(cfg.clone(), http.clone(), asr_inflight.clone()) => {
                 match result {
                     Ok(()) => info!("WS session ended cleanly; reconnecting"),
                     Err(e) => warn!(error = %e, "WS session error; reconnecting"),
@@ -99,7 +111,11 @@ pub async fn run(config: Config) -> Result<()> {
     }
 }
 
-async fn connect_and_run(cfg: Arc<Config>) -> Result<()> {
+async fn connect_and_run(
+    cfg: Arc<Config>,
+    http: Arc<reqwest::Client>,
+    asr_inflight: Arc<Semaphore>,
+) -> Result<()> {
     info!(url = %cfg.source.mic_url, "connecting to audio-io /mic");
     let (ws, _) = tokio_tungstenite::connect_async(&cfg.source.mic_url)
         .await
@@ -117,8 +133,9 @@ async fn connect_and_run(cfg: Arc<Config>) -> Result<()> {
     let bytes_per_frame = cfg.detector.bytes_per_frame();
     let samples_per_frame = cfg.detector.samples_per_frame();
     let sr = cfg.detector.sample_rate;
-    let dry_run = cfg.sink.dry_run;
-    let include_audio = cfg.sink.include_audio_in_event;
+    let mode = cfg.sink.mode;
+    let log_audio = cfg.sink.log_audio_in_event;
+    let asr_url = cfg.sink.asr_url.clone();
 
     // TODO: if audio-io enables WS ping/pong keepalive, the server will drop
     // us because tokio-tungstenite doesn't auto-respond to Pings — the write
@@ -153,7 +170,16 @@ async fn connect_and_run(cfg: Arc<Config>) -> Result<()> {
                 .map_err(|_| anyhow!("vad classify: frame length mismatch"))?;
             diag.record(&samples, is_speech);
             if let Some(event) = fsm.push_frame(&frame, is_speech) {
-                emit_event(&event, &fsm, sr, dry_run, include_audio);
+                handle_event(
+                    &event,
+                    fsm.utterance_buffer(),
+                    sr,
+                    mode,
+                    log_audio,
+                    &http,
+                    &asr_url,
+                    &asr_inflight,
+                );
             }
         }
     }
@@ -188,19 +214,22 @@ struct EventEnvelope<'a> {
     audio_base64: Option<String>,
 }
 
-fn emit_event(
+fn handle_event(
     event: &Event,
-    fsm: &SpeechFsm,
+    utterance: &[u8],
     sample_rate: u32,
-    dry_run: bool,
-    include_audio: bool,
+    mode: SinkMode,
+    log_audio: bool,
+    http: &Arc<reqwest::Client>,
+    asr_url: &str,
+    asr_inflight: &Arc<Semaphore>,
 ) {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
-    let audio_base64 = if include_audio && matches!(event, Event::SpeechEnded { .. }) {
-        Some(base64::engine::general_purpose::STANDARD.encode(fsm.utterance_buffer()))
+    let audio_base64 = if log_audio && matches!(event, Event::SpeechEnded { .. }) {
+        Some(base64::engine::general_purpose::STANDARD.encode(utterance))
     } else {
         None
     };
@@ -211,15 +240,111 @@ fn emit_event(
         audio_base64,
     };
     let json = serde_json::to_string(&env).unwrap_or_else(|_| "<serialize error>".into());
-    if dry_run {
-        // Dry-run sink: pretend to POST to the orchestrator and just log. This
-        // is the only sink implemented in v0.1.
-        info!(target: "vad::sink", "[orchestrator-stub <-] {json}");
-    } else {
-        // TODO: real HTTP POST to cfg.sink.orchestrator_url once the
-        // orchestrator crate exists.
-        warn!(target: "vad::sink", "live sink not yet implemented; event dropped: {json}");
+
+    match mode {
+        SinkMode::DryRun => {
+            // Dry-run sink: pretend to POST to the orchestrator and just log.
+            info!(target: "vad::sink", "[orchestrator-stub <-] {json}");
+        }
+        SinkMode::Orchestrator => {
+            // TODO: real HTTP POST to cfg.sink.orchestrator_url once the
+            // orchestrator crate exists.
+            warn!(target: "vad::sink", "orchestrator sink not yet implemented; event dropped: {json}");
+        }
+        SinkMode::AsrDirect => {
+            info!(target: "vad::sink", "[event] {json}");
+            if let Event::SpeechEnded { .. } = event {
+                // try_acquire_owned returns Err iff every permit is held —
+                // i.e. asr_max_inflight POSTs are already in flight. Drop
+                // this utterance with a warning rather than queuing so the
+                // operator sees backpressure instead of silent timeouts.
+                let permit = match asr_inflight.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        warn!(
+                            target: "vad::asr",
+                            "ASR busy (asr_max_inflight reached); dropping utterance",
+                        );
+                        return;
+                    }
+                };
+                let wav = wav_from_pcm_s16le_mono(utterance, sample_rate);
+                let client = http.clone();
+                let url = asr_url.to_string();
+                tokio::spawn(async move {
+                    let _permit = permit; // released on drop after the POST
+                    match post_wav_to_asr(&client, &url, wav).await {
+                        Ok(text) => info!(
+                            target: "vad::asr",
+                            "[asr <-] transcription: {text:?}"
+                        ),
+                        Err(e) => warn!(target: "vad::asr", "ASR call failed: {e:#}"),
+                    }
+                });
+            }
+        }
     }
+}
+
+/// Wrap a raw little-endian 16-bit mono PCM buffer in a 44-byte WAV header.
+/// whisper.cpp's `/inference` endpoint accepts WAV uploads via multipart.
+fn wav_from_pcm_s16le_mono(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
+    let data_len = pcm.len() as u32;
+    let chunk_size = 36 + data_len;
+    let byte_rate = sample_rate * 2; // mono * 2 bytes
+    let block_align: u16 = 2;
+    let bits_per_sample: u16 = 16;
+
+    let mut wav = Vec::with_capacity(44 + pcm.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&chunk_size.to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM format
+    wav.extend_from_slice(&1u16.to_le_bytes()); // channels
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&block_align.to_le_bytes());
+    wav.extend_from_slice(&bits_per_sample.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.extend_from_slice(pcm);
+    wav
+}
+
+async fn post_wav_to_asr(
+    client: &reqwest::Client,
+    url: &str,
+    wav: Vec<u8>,
+) -> Result<String> {
+    let part = reqwest::multipart::Part::bytes(wav)
+        .file_name("utterance.wav")
+        .mime_str("audio/wav")
+        .context("set wav mime")?;
+    let form = reqwest::multipart::Form::new()
+        .part("file", part)
+        .text("response_format", "json")
+        .text("temperature", "0");
+    let resp = client
+        .post(url)
+        .multipart(form)
+        .send()
+        .await
+        .context("POST /inference")?;
+    let status = resp.status();
+    let body = resp.text().await.context("read /inference body")?;
+    if !status.is_success() {
+        anyhow::bail!("ASR responded {status}: {body}");
+    }
+    // whisper-server with response_format=json returns {"text": "..."}.
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+    let text = parsed
+        .get("text")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| body.trim().to_string());
+    Ok(text)
 }
 
 async fn shutdown_signal() {
@@ -296,5 +421,34 @@ mod tests {
         };
         let v = parse(&envelope_json(&ev, 16000, Some("AAAA".into())));
         assert_eq!(v["audio_base64"], "AAAA");
+    }
+
+    #[test]
+    fn wav_header_layout() {
+        let pcm = vec![0u8; 6400]; // 200 ms @ 16 kHz s16 mono
+        let wav = wav_from_pcm_s16le_mono(&pcm, 16000);
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[12..16], b"fmt ");
+        // fmt chunk size = 16
+        assert_eq!(u32::from_le_bytes(wav[16..20].try_into().unwrap()), 16);
+        // PCM format
+        assert_eq!(u16::from_le_bytes(wav[20..22].try_into().unwrap()), 1);
+        // mono
+        assert_eq!(u16::from_le_bytes(wav[22..24].try_into().unwrap()), 1);
+        // sample rate
+        assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 16_000);
+        // byte rate = sample_rate * channels * bytes_per_sample
+        assert_eq!(u32::from_le_bytes(wav[28..32].try_into().unwrap()), 32_000);
+        // block align
+        assert_eq!(u16::from_le_bytes(wav[32..34].try_into().unwrap()), 2);
+        // bits per sample
+        assert_eq!(u16::from_le_bytes(wav[34..36].try_into().unwrap()), 16);
+        assert_eq!(&wav[36..40], b"data");
+        assert_eq!(
+            u32::from_le_bytes(wav[40..44].try_into().unwrap()),
+            pcm.len() as u32
+        );
+        assert_eq!(wav.len(), 44 + pcm.len());
     }
 }

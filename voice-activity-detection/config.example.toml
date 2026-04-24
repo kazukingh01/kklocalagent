@@ -1,0 +1,60 @@
+# voice-activity-detection configuration. All sections are optional.
+
+[source]
+# audio-io /mic WebSocket URL.
+#   - Same host: ws://127.0.0.1:7010/mic
+#   - WSL2 -> Windows host: ws://<windows-ip>:7010/mic
+mic_url = "ws://127.0.0.1:7010/mic"
+# Backoff before reconnecting after a dropped WebSocket.
+reconnect_ms = 1000
+
+[detector]
+# webrtc-vad aggressiveness: 0=Quality, 1=LowBitrate, 2=Aggressive, 3=VeryAggressive
+aggressiveness = 2
+# Must match audio-io's wire format. webrtc-vad accepts 8k / 16k / 32k / 48k only.
+sample_rate = 16000
+# Must match audio-io's wire format. webrtc-vad accepts 10 / 20 / 30 ms only.
+frame_ms    = 20
+# Voiced frames needed before SpeechStarted fires. 3 frames @ 20 ms = 60 ms,
+# which filters single-frame pops without adding noticeable latency.
+start_frames = 3
+# Silent frames needed before SpeechEnded fires. 20 frames @ 20 ms = 400 ms,
+# wide enough to cover natural breath pauses mid-utterance.
+hang_frames = 20
+# Hard cap on a single utterance. 1500 frames @ 20 ms = 30 s.
+max_utterance_frames = 1500
+
+[sink]
+# Where SpeechStarted/SpeechEnded events go.
+#
+#   "dry-run"      : log JSON only (default; safe to run with no peer).
+#   "asr-direct"   : log + on SpeechEnded POST the utterance audio (WAV)
+#                    to whisper.cpp /inference at asr_url. Used for the
+#                    audio-io→vad→asr smoke test before the orchestrator
+#                    exists.
+#   "orchestrator" : POST events to orchestrator_url. Not yet implemented
+#                    — events are dropped with a warning.
+mode = "dry-run"
+orchestrator_url = "http://127.0.0.1:7000/events"
+asr_url = "http://127.0.0.1:7040/inference"
+# HTTP timeout (ms) for asr-direct POSTs. 30 s is fine for `small`, but
+# `large-v3-turbo` on a near-30 s utterance can approach this ceiling —
+# bump to 60_000+ if you switch to a heavier model.
+asr_timeout_ms = 30000
+# Maximum simultaneous in-flight asr-direct POSTs. Excess utterances are
+# dropped with a warning instead of queued, so backpressure is observable
+# in logs. 1 = strictly serial (matches whisper-server's single-request
+# behaviour). Raise only if your ASR backend can actually parallelize.
+asr_max_inflight = 1
+# Include the utterance PCM (base64 s16le) in the *log* JSON for each
+# SpeechEnded event. Independent of asr-direct, which always uploads the
+# audio regardless. Off by default because base64 audio bloats log output.
+log_audio_in_event = false
+
+[diag]
+# Emit per-window RMS and speech_ratio summary under the `vad::diag` log
+# target. On by default so false-trigger causes (noisy mic vs code bug) are
+# visible without an extra flag. Set to false to silence.
+enabled = true
+# Window size in frames. 50 frames @ 20 ms = 1-second summary.
+window_frames = 50

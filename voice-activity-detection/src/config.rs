@@ -1,6 +1,26 @@
 use std::path::Path;
 
+use clap::ValueEnum;
 use serde::Deserialize;
+
+/// Where SpeechStarted/SpeechEnded events go.
+///
+/// - `DryRun` (default, safe to run without any peer): log each event as
+///   JSON.
+/// - `AsrDirect`: still log the event, and on `SpeechEnded` POST the
+///   utterance audio (wrapped as a WAV) to whisper.cpp's `/inference`
+///   endpoint at `sink.asr_url`. Used for the audio-io→vad→asr smoke
+///   test before the orchestrator exists.
+/// - `Orchestrator`: forward events to `sink.orchestrator_url`. Not yet
+///   implemented — events are dropped with a warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+#[clap(rename_all = "kebab-case")]
+pub enum SinkMode {
+    DryRun,
+    AsrDirect,
+    Orchestrator,
+}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -63,12 +83,25 @@ pub struct DetectorConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct SinkConfig {
-    /// dry_run=true: log events only. false: (future) POST to orchestrator.
-    pub dry_run: bool,
-    /// Orchestrator events endpoint — unused while dry_run is true.
+    /// See [`SinkMode`].
+    pub mode: SinkMode,
+    /// Orchestrator events endpoint — used only when `mode = "orchestrator"`.
     pub orchestrator_url: String,
-    /// Include base64-encoded utterance audio in SpeechEnded events.
-    pub include_audio_in_event: bool,
+    /// whisper.cpp `/inference` endpoint — used only when `mode = "asr-direct"`.
+    pub asr_url: String,
+    /// HTTP timeout for `asr-direct` POSTs, in milliseconds. Larger whisper
+    /// models take longer per utterance — `large-v3-turbo` on a 30 s
+    /// utterance can approach the default 30 s ceiling.
+    pub asr_timeout_ms: u64,
+    /// Maximum simultaneous in-flight `asr-direct` POSTs. Excess utterances
+    /// are dropped with a warning rather than queued, so backpressure is
+    /// observable instead of presenting as silent timeouts. 1 = strictly
+    /// serial (matches whisper-server's own single-request behaviour).
+    pub asr_max_inflight: u32,
+    /// Include base64-encoded utterance audio in the *log* JSON for each
+    /// SpeechEnded event. Independent of asr-direct, which always uploads
+    /// the audio regardless of this flag.
+    pub log_audio_in_event: bool,
 }
 
 impl Default for SourceConfig {
@@ -96,9 +129,12 @@ impl Default for DetectorConfig {
 impl Default for SinkConfig {
     fn default() -> Self {
         Self {
-            dry_run: true,
+            mode: SinkMode::DryRun,
             orchestrator_url: "http://127.0.0.1:7000/events".into(),
-            include_audio_in_event: false,
+            asr_url: "http://127.0.0.1:7040/inference".into(),
+            asr_timeout_ms: 30_000,
+            asr_max_inflight: 1,
+            log_audio_in_event: false,
         }
     }
 }
@@ -141,6 +177,12 @@ impl Config {
         }
         if self.diag.window_frames == 0 {
             anyhow::bail!("diag.window_frames must be >= 1");
+        }
+        if self.sink.asr_timeout_ms == 0 {
+            anyhow::bail!("sink.asr_timeout_ms must be >= 1");
+        }
+        if self.sink.asr_max_inflight == 0 {
+            anyhow::bail!("sink.asr_max_inflight must be >= 1");
         }
         Ok(())
     }
