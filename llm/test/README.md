@@ -58,13 +58,12 @@ curl -N -sS -X POST http://127.0.0.1:7050/api/chat \
 
 ## Changing the model
 
-Both the `llm` service's `LLM_MODEL` env **and** the probe's hardcoded
-JSON body must agree on the model name (otherwise the probe's request
-404s against a model that wasn't pulled). To switch:
+The model name is defined once at the top of `compose.yaml` as a YAML
+anchor (`x-model: &model "gemma3:1b"`) and referenced by both the `llm`
+service's `LLM_MODEL` env and the probe's `MODEL` env. To switch:
 
-1. Edit `LLM_MODEL` in `compose.yaml`'s `llm` service.
-2. Edit the `"model":"..."` field in the `probe` command.
-3. `docker compose up --build`.
+1. Edit the `x-model` value in `compose.yaml`.
+2. `docker compose up --build`.
 
 ## Troubleshooting
 
