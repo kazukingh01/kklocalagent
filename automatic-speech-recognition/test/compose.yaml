@@ -46,11 +46,12 @@ services:
     volumes:
       - ../models:/models:ro
     environment:
-      # large-v3-turbo q5_0: 0.55 GB on disk, ~1.0 GB RAM at runtime,
-      # ~10–20% faster than q8_0 on CPU with no perceptible quality
-      # drop. Bump to q8_0 (834 MB) or unquantised (1.55 GB) if you
-      # want max accuracy and have the RAM to spare.
-      WHISPER_MODEL: ggml-large-v3-turbo-q5_0.bin
+      # small q8_0: 252 MB on disk, ~0.5 GB RAM, ~3–5 s of inference
+      # for an 8 s utterance on CPU (vs ~14 s for turbo-q8_0). Quality
+      # is one tier below turbo for Japanese — fine for clean TTS-style
+      # input, weaker on fast/colloquial speech and proper nouns. Move
+      # back up to large-v3-turbo-{q5_0,q8_0,*}.bin for higher accuracy.
+      WHISPER_MODEL: ggml-small-q8_0.bin
       # Pin to ja so whisper-server doesn't burn cycles on language
       # detection. Switch to "auto" for mixed-language input or "en"
       # if you want to run the JFK English smoke test instead.

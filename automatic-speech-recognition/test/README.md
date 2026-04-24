@@ -19,14 +19,17 @@ not-yet-built orchestrator.
 
 ## One-time setup
 
-The default test runs Japanese ASR with whisper large-v3-turbo q5_0
-(~550 MB on disk, ~1.0 GB RAM at runtime).
+The default test runs Japanese ASR with whisper small q8_0
+(~250 MB on disk, ~0.5 GB RAM at runtime, ~3–5 s inference per
+8 s utterance on CPU). Bump to `ggml-large-v3-turbo-q5_0.bin` /
+`ggml-large-v3-turbo-q8_0.bin` if you want higher accuracy and can
+afford the latency.
 
 ```bash
 cd automatic-speech-recognition
 
-# Download the model into ./models (~550 MB)
-./fetch-models.sh ggml-large-v3-turbo-q5_0.bin
+# Download the model into ./models (~250 MB)
+./fetch-models.sh ggml-small-q8_0.bin
 
 # Synthesize a Japanese test wav into test/samples (~270 KB).
 # Uses gTTS in a one-shot docker container; needs internet.
@@ -48,7 +51,7 @@ in a multi-stage build (a few minutes). Subsequent runs are cached.
 
 ## What you should see
 
-First boot loads the model (~7 s for large-v3-turbo q5_0 on CPU).
+First boot loads the model (~3 s for small q8_0 on CPU).
 Once the wav starts playing, the `vad` logs print one transcription
 per utterance (the JP test wav naturally splits into 1–3 segments
 depending on pause length):
@@ -86,7 +89,7 @@ mic-stub:
     SAMPLE_PATH: /samples/jfk.wav     # was test-ja.wav
 automatic-speech-recognition:
   environment:
-    WHISPER_MODEL: ggml-tiny.bin                    # was large-v3-turbo q5_0
+    WHISPER_MODEL: ggml-tiny.bin                    # was small-q8_0
     WHISPER_LANGUAGE: en                            # was ja
 ```
 
