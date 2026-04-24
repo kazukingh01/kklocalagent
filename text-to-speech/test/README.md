@@ -11,6 +11,12 @@ Both stacks share the same `text-to-speech` (VOICEVOX engine) image and
 the same `tts-client` synth-and-send Python helper; only the
 `tts-client` command and target differ.
 
+> **Note:** both compose files publish the engine on host port **7060**
+> (`7060:50021`). Only one stack can run at a time — starting the second
+> while the first is up fails with `bind: address already in use`. Run
+> `docker compose -f compose.offline.yaml down` before bringing
+> `compose.online.yaml` up (and vice versa).
+
 ```text
 [offline]
 tts-client  ── POST /audio_query, /synthesis ──►  text-to-speech

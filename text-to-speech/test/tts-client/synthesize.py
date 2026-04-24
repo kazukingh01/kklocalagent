@@ -27,8 +27,6 @@ import httpx
 import websockets
 
 VOICEVOX_URL = os.environ.get("VOICEVOX_URL", "http://text-to-speech:50021")
-SPEAKER = int(os.environ.get("VOICEVOX_SPEAKER", "3"))  # 3 = ずんだもん (ノーマル)
-TEXT = os.environ.get("TEXT", "ぼくはずんだもんなのだ。")
 
 # audio-io wire format (must match audio-io README): s16le, 16 kHz, mono.
 SAMPLE_RATE = 16000
@@ -52,31 +50,43 @@ def synthesize(text: str, speaker: int) -> bytes:
 
 def to_pcm_16k_mono(wav_bytes: bytes) -> bytes:
     """Decode arbitrary WAV → raw s16le 16 kHz mono via ffmpeg pipes."""
-    p = subprocess.run(
-        [
-            "ffmpeg", "-loglevel", "error", "-y",
-            "-i", "pipe:0",
-            "-ar", str(SAMPLE_RATE), "-ac", "1", "-sample_fmt", "s16",
-            "-f", "s16le", "pipe:1",
-        ],
-        input=wav_bytes,
-        capture_output=True,
-        check=True,
-    )
+    try:
+        p = subprocess.run(
+            [
+                "ffmpeg", "-loglevel", "error", "-y",
+                "-i", "pipe:0",
+                "-ar", str(SAMPLE_RATE), "-ac", "1", "-sample_fmt", "s16",
+                "-f", "s16le", "pipe:1",
+            ],
+            input=wav_bytes,
+            capture_output=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        # Surface ffmpeg's own diagnostics — the common failure here is
+        # the engine returning an error JSON body (e.g. unknown speaker
+        # id) instead of WAV, which shows up as "Invalid data found
+        # when processing input" on stderr.
+        sys.stderr.write(
+            f"ffmpeg failed (rc={e.returncode}):\n{e.stderr.decode(errors='replace')}"
+        )
+        raise
     return p.stdout
 
 
-def save(out_path: Path) -> None:
-    print(f"synthesizing speaker={SPEAKER} text={TEXT!r}", flush=True)
-    wav = synthesize(TEXT, SPEAKER)
+def save(out_path: Path, text: str, speaker: int) -> None:
+    print(f"synthesizing speaker={speaker} text={text!r}", flush=True)
+    wav = synthesize(text, speaker)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(wav)
     print(f"wrote {out_path} ({len(wav)} bytes)", flush=True)
 
 
-async def stream(spk_url: str, audio_io_base: str | None) -> None:
-    print(f"synthesizing speaker={SPEAKER} text={TEXT!r}", flush=True)
-    wav = synthesize(TEXT, SPEAKER)
+async def stream(
+    spk_url: str, audio_io_base: str | None, text: str, speaker: int
+) -> None:
+    print(f"synthesizing speaker={speaker} text={text!r}", flush=True)
+    wav = synthesize(text, speaker)
     pcm = to_pcm_16k_mono(wav)
     print(
         f"resampled wav={len(wav)}B → pcm={len(pcm)}B "
@@ -89,8 +99,8 @@ async def stream(spk_url: str, audio_io_base: str | None) -> None:
     # doesn't expose it (older builds).
     if audio_io_base:
         try:
-            with httpx.Client(timeout=5.0) as c:
-                c.post(f"{audio_io_base}/start")
+            async with httpx.AsyncClient(timeout=5.0) as c:
+                await c.post(f"{audio_io_base}/start")
             print(f"POST {audio_io_base}/start ok", flush=True)
         except Exception as e:
             print(f"warn: POST /start failed ({e}); continuing", flush=True)
@@ -132,12 +142,24 @@ def main() -> None:
     )
     args = ap.parse_args()
 
+    # Parse env-driven inputs here (not at import) so a bad
+    # VOICEVOX_SPEAKER surfaces as a friendly exit, not an import-time
+    # stack trace.
+    raw_speaker = os.environ.get("VOICEVOX_SPEAKER", "3")
+    try:
+        speaker = int(raw_speaker)
+    except ValueError:
+        sys.exit(f"invalid VOICEVOX_SPEAKER={raw_speaker!r} (must be int)")
+    text = os.environ.get("TEXT", "ぼくはずんだもんなのだ。")
+
     if args.mode == "save":
-        save(Path(args.out))
+        save(Path(args.out), text, speaker)
     else:
         if not args.spk_url:
             sys.exit("--spk-url or SPK_URL is required for stream mode")
-        asyncio.run(stream(args.spk_url, args.audio_io_base or None))
+        asyncio.run(
+            stream(args.spk_url, args.audio_io_base or None, text, speaker)
+        )
 
 
 if __name__ == "__main__":
