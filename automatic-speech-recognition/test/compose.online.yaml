@@ -1,0 +1,50 @@
+# Real-time test stack: audio-io (Windows native, OUTSIDE compose)
+#                         → voice-activity-detection
+#                         → automatic-speech-recognition
+#
+# Unlike compose.offline.yaml (mic-stub plays a wav), this stack
+# subscribes to the audio-io binary running on the Windows host so the
+# user's actual microphone drives the pipeline live.
+#
+# Prerequisites:
+#   1. audio-io.exe running on Windows with `[server] host = "0.0.0.0"`
+#      and the default port 7010. See ../../audio-io/README.md.
+#   2. WINDOWS_HOST set so the WSL2 docker network can reach the host
+#      (default `host.docker.internal` works on Docker Desktop and on
+#      docker-ce with the WSL2 backend). Override in test/.env if not.
+#
+# Run from this directory:
+#   ../fetch-models.sh ggml-small-q8_0.bin
+#   docker compose -f compose.online.yaml up --build
+#
+# Speak into the Windows mic; transcriptions appear in the vad logs as
+# `[asr <-] transcription: "..."`.
+
+services:
+  voice-activity-detection:
+    build:
+      context: ../../voice-activity-detection
+    container_name: kklocalagent-test-vad-online
+    environment:
+      RUST_LOG: info,vad=info,voice_activity_detection=info
+      # Override the mic_url from vad-config.toml so the same config
+      # file works for both offline (mic-stub) and online (audio-io).
+      VAD_MIC_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/mic
+    volumes:
+      - ./vad-config.toml:/etc/vad/config.toml:ro
+    command: ["--config", "/etc/vad/config.toml"]
+    depends_on:
+      - automatic-speech-recognition
+
+  automatic-speech-recognition:
+    build:
+      context: ..
+    container_name: kklocalagent-test-asr-online
+    volumes:
+      - ../models:/models:ro
+    environment:
+      WHISPER_MODEL: ggml-small-q8_0.bin
+      WHISPER_LANGUAGE: ja
+      # WHISPER_THREADS: "8"   # see compose.offline.yaml for tuning notes
+    ports:
+      - "7040:8080"
