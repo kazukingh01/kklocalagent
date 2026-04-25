@@ -11,8 +11,11 @@ use serde::Deserialize;
 ///   utterance audio (wrapped as a WAV) to whisper.cpp's `/inference`
 ///   endpoint at `sink.asr_url`. Used for the audio-io→vad→asr smoke
 ///   test before the orchestrator exists.
-/// - `Orchestrator`: forward events to `sink.orchestrator_url`. Not yet
-///   implemented — events are dropped with a warning.
+/// - `Orchestrator`: POST the serialized event envelope to
+///   `sink.orchestrator_url`. The orchestrator handles ASR + LLM
+///   downstream. Set `log_audio_in_event = true` to include utterance
+///   PCM in `SpeechEnded` envelopes — required for orchestrator-side
+///   ASR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 #[clap(rename_all = "kebab-case")]
@@ -98,9 +101,18 @@ pub struct SinkConfig {
     /// observable instead of presenting as silent timeouts. 1 = strictly
     /// serial (matches whisper-server's own single-request behaviour).
     pub asr_max_inflight: u32,
+    /// HTTP timeout for `orchestrator` POSTs, in milliseconds. The
+    /// orchestrator is just routing — it should respond fast — so 5 s
+    /// is a generous default.
+    pub orchestrator_timeout_ms: u64,
+    /// Maximum simultaneous in-flight `orchestrator` POSTs. Higher than
+    /// `asr_max_inflight` because the orchestrator does not bottleneck
+    /// on a single backend the way whisper-server does.
+    pub orchestrator_max_inflight: u32,
     /// Include base64-encoded utterance audio in the *log* JSON for each
-    /// SpeechEnded event. Independent of asr-direct, which always uploads
-    /// the audio regardless of this flag.
+    /// SpeechEnded event. Also controls whether audio is included in the
+    /// envelope POSTed to the orchestrator — required there because
+    /// without audio the orchestrator can't run ASR.
     pub log_audio_in_event: bool,
 }
 
@@ -134,6 +146,8 @@ impl Default for SinkConfig {
             asr_url: "http://127.0.0.1:7040/inference".into(),
             asr_timeout_ms: 30_000,
             asr_max_inflight: 1,
+            orchestrator_timeout_ms: 5_000,
+            orchestrator_max_inflight: 4,
             log_audio_in_event: false,
         }
     }
@@ -183,6 +197,12 @@ impl Config {
         }
         if self.sink.asr_max_inflight == 0 {
             anyhow::bail!("sink.asr_max_inflight must be >= 1");
+        }
+        if self.sink.orchestrator_timeout_ms == 0 {
+            anyhow::bail!("sink.orchestrator_timeout_ms must be >= 1");
+        }
+        if self.sink.orchestrator_max_inflight == 0 {
+            anyhow::bail!("sink.orchestrator_max_inflight must be >= 1");
         }
         Ok(())
     }

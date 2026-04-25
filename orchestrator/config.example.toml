@@ -1,0 +1,38 @@
+# Example orchestrator config. All fields are optional — unset values
+# fall back to Config::default() in src/config.rs.
+
+[server]
+# host:port to bind. Compose exposes this at 7000 per #4 §3.
+listen = "0.0.0.0:7000"
+
+[asr]
+# whisper.cpp /inference endpoint. Inside compose, the service name
+# "automatic-speech-recognition" resolves to the container; outside
+# compose, point at 127.0.0.1:7040 (the published host port per #4 §3).
+url = "http://automatic-speech-recognition:8080/inference"
+# Per-request budget. large-v3-turbo on a 30 s utterance can approach
+# 60 s on CPU; adjust for your model/hardware.
+timeout_ms = 60000
+# whisper-server handles one request at a time — queueing is pointless.
+max_inflight = 1
+
+[llm]
+# ollama /api/chat endpoint. Inside compose, service name "llm"
+# resolves; outside compose, 127.0.0.1:7050.
+url = "http://llm:11434/api/chat"
+# Must match a model pulled by the llm module (see llm/init.sh).
+model = "gemma3:4b"
+# gemma3:4b on CPU can take a while on long prompts; 120 s is generous.
+timeout_ms = 120000
+max_inflight = 1
+
+# Optional outbound forwarder for handled events. When url is empty
+# (the default) no forwarding happens — the orchestrator runs
+# log-only. Currently emits:
+#   - WakeWordDetected (forwarded as-is)
+#   - TurnCompleted    (synthetic, on successful ASR→LLM completion)
+# Used by the integration smoke to assert pipeline outcomes; in
+# production this is the §10 "central event log" hook.
+[result_sink]
+# url = "http://test-driver:9300/sink"
+# timeout_ms = 5000

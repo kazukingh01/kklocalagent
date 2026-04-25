@@ -32,8 +32,9 @@ max_utterance_frames = 1500
 #                    to whisper.cpp /inference at asr_url. Used for the
 #                    audio-io→vad→asr smoke test before the orchestrator
 #                    exists.
-#   "orchestrator" : POST events to orchestrator_url. Not yet implemented
-#                    — events are dropped with a warning.
+#   "orchestrator" : POST events to orchestrator_url. Set
+#                    log_audio_in_event = true to include utterance PCM
+#                    so the orchestrator can run ASR.
 mode = "dry-run"
 orchestrator_url = "http://127.0.0.1:7000/events"
 asr_url = "http://127.0.0.1:7040/inference"
@@ -46,9 +47,18 @@ asr_timeout_ms = 30000
 # in logs. 1 = strictly serial (matches whisper-server's single-request
 # behaviour). Raise only if your ASR backend can actually parallelize.
 asr_max_inflight = 1
+# HTTP timeout (ms) for orchestrator POSTs. The orchestrator is just
+# routing — it should respond fast — so 5 s is generous.
+orchestrator_timeout_ms = 5000
+# Maximum simultaneous in-flight orchestrator POSTs. Higher than
+# asr_max_inflight because the orchestrator does not bottleneck on a
+# single backend the way whisper-server does.
+orchestrator_max_inflight = 4
 # Include the utterance PCM (base64 s16le) in the *log* JSON for each
-# SpeechEnded event. Independent of asr-direct, which always uploads the
-# audio regardless. Off by default because base64 audio bloats log output.
+# SpeechEnded event. Also controls whether audio is included in
+# orchestrator-mode envelopes — required there since without audio the
+# orchestrator can't run ASR. Off by default because base64 audio bloats
+# log output in dry-run/asr-direct mode.
 log_audio_in_event = false
 
 [diag]

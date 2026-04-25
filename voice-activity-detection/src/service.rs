@@ -75,8 +75,10 @@ impl Diag {
 pub async fn run(config: Config) -> Result<()> {
     let cfg = Arc::new(config);
     let http = Arc::new(
+        // Per-request timeouts (asr_timeout_ms / orchestrator_timeout_ms)
+        // are applied at each POST builder so the two stages have
+        // independent budgets.
         reqwest::Client::builder()
-            .timeout(Duration::from_millis(cfg.sink.asr_timeout_ms))
             .build()
             .context("build reqwest client")?,
     );
@@ -85,6 +87,8 @@ pub async fn run(config: Config) -> Result<()> {
     // visible in logs instead of presenting as silent timeouts. Survives
     // WS reconnects so we don't lose backpressure state on a flap.
     let asr_inflight = Arc::new(Semaphore::new(cfg.sink.asr_max_inflight as usize));
+    let orchestrator_inflight =
+        Arc::new(Semaphore::new(cfg.sink.orchestrator_max_inflight as usize));
     let mut shutdown = Box::pin(shutdown_signal());
     loop {
         tokio::select! {
@@ -93,7 +97,12 @@ pub async fn run(config: Config) -> Result<()> {
                 info!("shutdown signal received");
                 return Ok(());
             }
-            result = connect_and_run(cfg.clone(), http.clone(), asr_inflight.clone()) => {
+            result = connect_and_run(
+                cfg.clone(),
+                http.clone(),
+                asr_inflight.clone(),
+                orchestrator_inflight.clone(),
+            ) => {
                 match result {
                     Ok(()) => info!("WS session ended cleanly; reconnecting"),
                     Err(e) => warn!(error = %e, "WS session error; reconnecting"),
@@ -115,6 +124,7 @@ async fn connect_and_run(
     cfg: Arc<Config>,
     http: Arc<reqwest::Client>,
     asr_inflight: Arc<Semaphore>,
+    orchestrator_inflight: Arc<Semaphore>,
 ) -> Result<()> {
     info!(url = %cfg.source.mic_url, "connecting to audio-io /mic");
     let (ws, _) = tokio_tungstenite::connect_async(&cfg.source.mic_url)
@@ -136,6 +146,9 @@ async fn connect_and_run(
     let mode = cfg.sink.mode;
     let log_audio = cfg.sink.log_audio_in_event;
     let asr_url = cfg.sink.asr_url.clone();
+    let asr_timeout_ms = cfg.sink.asr_timeout_ms;
+    let orchestrator_url = cfg.sink.orchestrator_url.clone();
+    let orchestrator_timeout_ms = cfg.sink.orchestrator_timeout_ms;
 
     // TODO: if audio-io enables WS ping/pong keepalive, the server will drop
     // us because tokio-tungstenite doesn't auto-respond to Pings — the write
@@ -178,7 +191,11 @@ async fn connect_and_run(
                     log_audio,
                     &http,
                     &asr_url,
+                    asr_timeout_ms,
                     &asr_inflight,
+                    &orchestrator_url,
+                    orchestrator_timeout_ms,
+                    &orchestrator_inflight,
                 );
             }
         }
@@ -214,6 +231,7 @@ struct EventEnvelope<'a> {
     audio_base64: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_event(
     event: &Event,
     utterance: &[u8],
@@ -222,7 +240,11 @@ fn handle_event(
     log_audio: bool,
     http: &Arc<reqwest::Client>,
     asr_url: &str,
+    asr_timeout_ms: u64,
     asr_inflight: &Arc<Semaphore>,
+    orchestrator_url: &str,
+    orchestrator_timeout_ms: u64,
+    orchestrator_inflight: &Arc<Semaphore>,
 ) {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -247,9 +269,33 @@ fn handle_event(
             info!(target: "vad::sink", "[orchestrator-stub <-] {json}");
         }
         SinkMode::Orchestrator => {
-            // TODO: real HTTP POST to cfg.sink.orchestrator_url once the
-            // orchestrator crate exists.
-            warn!(target: "vad::sink", "orchestrator sink not yet implemented; event dropped: {json}");
+            info!(target: "vad::sink", "[orchestrator <-] {} bytes",
+                  json.len());
+            // try_acquire_owned drops events when orchestrator_max_inflight
+            // POSTs are already in flight — same backpressure pattern as
+            // asr-direct, scoped to a separate semaphore so a slow ASR
+            // doesn't starve VAD-event delivery.
+            let permit = match orchestrator_inflight.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    warn!(
+                        target: "vad::sink",
+                        "orchestrator busy (orchestrator_max_inflight reached); dropping event",
+                    );
+                    return;
+                }
+            };
+            let client = http.clone();
+            let url = orchestrator_url.to_string();
+            let body = json.clone();
+            let timeout_ms = orchestrator_timeout_ms;
+            tokio::spawn(async move {
+                let _permit = permit;
+                match post_json_to_orchestrator(&client, &url, body, timeout_ms).await {
+                    Ok(()) => {}
+                    Err(e) => warn!(target: "vad::sink", "orchestrator POST failed: {e:#}"),
+                }
+            });
         }
         SinkMode::AsrDirect => {
             info!(target: "vad::sink", "[event] {json}");
@@ -271,9 +317,10 @@ fn handle_event(
                 let wav = wav_from_pcm_s16le_mono(utterance, sample_rate);
                 let client = http.clone();
                 let url = asr_url.to_string();
+                let timeout_ms = asr_timeout_ms;
                 tokio::spawn(async move {
                     let _permit = permit; // released on drop after the POST
-                    match post_wav_to_asr(&client, &url, wav).await {
+                    match post_wav_to_asr(&client, &url, wav, timeout_ms).await {
                         Ok(text) => info!(
                             target: "vad::asr",
                             "[asr <-] transcription: {text:?}"
@@ -317,6 +364,7 @@ async fn post_wav_to_asr(
     client: &reqwest::Client,
     url: &str,
     wav: Vec<u8>,
+    timeout_ms: u64,
 ) -> Result<String> {
     let part = reqwest::multipart::Part::bytes(wav)
         .file_name("utterance.wav")
@@ -329,6 +377,7 @@ async fn post_wav_to_asr(
     let resp = client
         .post(url)
         .multipart(form)
+        .timeout(Duration::from_millis(timeout_ms))
         .send()
         .await
         .context("POST /inference")?;
@@ -345,6 +394,31 @@ async fn post_wav_to_asr(
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| body.trim().to_string());
     Ok(text)
+}
+
+async fn post_json_to_orchestrator(
+    client: &reqwest::Client,
+    url: &str,
+    body: String,
+    timeout_ms: u64,
+) -> Result<()> {
+    let resp = client
+        .post(url)
+        .header("content-type", "application/json")
+        .body(body)
+        .timeout(Duration::from_millis(timeout_ms))
+        .send()
+        .await
+        .context("POST /events")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "orchestrator responded {status}: {}",
+            text.chars().take(200).collect::<String>()
+        );
+    }
+    Ok(())
 }
 
 async fn shutdown_signal() {
