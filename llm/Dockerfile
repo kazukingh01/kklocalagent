@@ -34,7 +34,7 @@ RUN chmod +x /usr/local/bin/init.sh
 # start_period is generous because cold-pulling gemma3:4b (~3.3 GB) can
 # take 10+ minutes on a slow link; retries*interval = ~10 min extra
 # grace if the pull stalls.
-HEALTHCHECK --interval=15s --timeout=5s --start-period=1200s --retries=40 \
+HEALTHCHECK --interval=15s --timeout=5s --start-period=12000s --retries=40 \
     CMD curl -sfS --connect-timeout 2 -o /dev/null -X POST \
         -H 'Content-Type: application/json' \
         -d "{\"name\":\"${LLM_MODEL}\"}" \

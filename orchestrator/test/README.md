@@ -24,8 +24,7 @@ rather than firing them in parallel.
 ## Run
 
 ```bash
-cd orchestrator/test
-docker compose up --build --abort-on-container-exit --exit-code-from probe
+sudo docker compose up --build --abort-on-container-exit --exit-code-from probe
 ```
 
 First build compiles the orchestrator binary (Rust, ~1–2 min cold). A

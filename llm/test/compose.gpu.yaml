@@ -1,0 +1,55 @@
+x-model: &model "hf.co/mmnga-o/llm-jp-4-8b-thinking-gguf:Q8_0"
+
+services:
+  llm:
+    build:
+      context: ..
+    container_name: kklocalagent-test-llm
+    environment:
+      # Small CPU-friendly model from the same family as the production
+      # default (gemma3:4b).
+      LLM_MODEL: *model
+      OLLAMA_KEEP_ALIVE: "1h"
+    ports:
+      # Published so interactive debugging (`curl 127.0.0.1:7050/api/tags`
+      # from the host) mirrors what the probe does internally via the
+      # compose network (llm:11434).
+      - "7050:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    deploy:
+        resources:
+          reservations:
+            devices:
+              - driver: nvidia
+                count: 1
+                capabilities: [gpu]
+
+  probe:
+    image: curlimages/curl:latest
+    container_name: kklocalagent-test-llm-probe
+    depends_on:
+      llm:
+        # Gated on /api/show returning 200 for LLM_MODEL (see the
+        # HEALTHCHECK in ../Dockerfile) so this fires only after the
+        # pull completes.
+        condition: service_healthy
+    environment:
+      MODEL: *model
+    command:
+      # $$MODEL escapes compose-level interpolation so the shell inside
+      # the container expands it from the `environment:` above. A bare
+      # ${MODEL} would be substituted by compose from the *host* env at
+      # `up` time (and silently become empty if unset).
+      - sh
+      - -eu
+      - -c
+      - |
+        echo "[probe] POST /api/chat model=$${MODEL}"
+        curl -sS -X POST http://llm:11434/api/chat \
+          -H 'Content-Type: application/json' \
+          --data-raw "{\"model\":\"$${MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"日本の首都はどこですか？一言で答えてください。\"}],\"stream\":false}"
+        echo
+
+volumes:
+  ollama-data:

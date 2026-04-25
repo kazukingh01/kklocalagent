@@ -5,8 +5,8 @@ probe ──POST /api/chat──► llm (ollama, CPU) ──► stdout JSON resp
 ```
 
 ```bash
-cd llm/test
-docker compose up --build
+sudo docker compose -f compose.cpu.yaml up --build
+sudo docker compose -f compose.gpu.yaml up --build
 ```
 
 ## Interactive probing
@@ -19,6 +19,10 @@ curl -sS http://127.0.0.1:7050/api/tags | jq .
 curl -sS -X POST http://127.0.0.1:7050/api/chat \
     -H 'Content-Type: application/json' \
     -d '{"model":"gemma3:1b","messages":[{"role":"user","content":"今日はどんな気分？"}],"stream":false}'
+
+curl -sS -X POST http://127.0.0.1:7050/api/chat \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"hf.co/mmnga-o/llm-jp-4-8b-thinking-gguf:Q8_0","messages":[{"role":"user","content":"今日はどんな気分？"}],"stream":false}'
 
 # Chat (streaming — one JSON per line, `-N` disables curl buffering)
 curl -N -sS -X POST http://127.0.0.1:7050/api/chat \
