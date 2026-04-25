@@ -56,6 +56,7 @@ docker run --rm \
 | `WW_COOLDOWN_SEC` | `2.0` | Minimum interval between two fires (shim-side debounce). |
 | `WW_INFERENCE_FRAMEWORK` | `tflite` | `tflite` (Linux default) or `onnx` (Windows-safe). |
 | `WW_PORT` | `7030` | HTTP port for `/health`. |
+| `WW_SINK_MODE` | `orchestrator` | `orchestrator` = real POST to `WW_ORCHESTRATOR_URL`. `dry-run` = log the envelope only (used by the online manual smoke). |
 
 ## Event envelope
 

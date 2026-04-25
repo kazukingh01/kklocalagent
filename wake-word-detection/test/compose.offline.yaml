@@ -1,7 +1,11 @@
-# Wake-word-detection smoke test.
+# Wake-word-detection offline smoke test.
 #
-#   probe — Python sidecar playing both roles that a real deployment
-#           splits across audio-io + orchestrator:
+# Self-contained variant — does NOT require audio-io running on
+# Windows. The probe plays both roles a real deployment splits across
+# audio-io and the orchestrator. See compose.online.yaml for the live
+# audio-io variant.
+#
+#   probe — Python sidecar:
 #             * WS server  :9100  — streams alexa_test.wav as 20ms s16le
 #               mono 16kHz PCM frames (same format audio-io emits).
 #             * HTTP server :9200 — receives POST /events, and exits 0
@@ -10,10 +14,11 @@
 #           openWakeWord, posts events back to probe's HTTP.
 #
 # Run from this directory:
-#   docker compose up --build --abort-on-container-exit --exit-code-from probe
+#   sudo docker compose -f compose.offline.yaml up --build \
+#       --abort-on-container-exit --exit-code-from probe
 #
 # Tear down:
-#   docker compose down
+#   sudo docker compose -f compose.offline.yaml down
 
 services:
   probe:

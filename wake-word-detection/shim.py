@@ -5,11 +5,22 @@ to openWakeWord in 80ms chunks, and POSTs a WakeWordDetected event to
 the orchestrator when any configured model's score crosses the
 threshold. Also serves /health so compose can gate `service_healthy` on
 both model load and WS connection.
+
+Two sink modes (mirrors `voice-activity-detection`'s `SinkMode`):
+
+* ``orchestrator`` (default) — real POST to ``WW_ORCHESTRATOR_URL``.
+  Used by the offline smoke (POSTs to a probe sink) and by the
+  production compose (POSTs to the orchestrator).
+* ``dry-run`` — skip the POST and log the would-be envelope instead.
+  Used by the online manual test against a live audio-io: lets you
+  speak into a real mic and verify wake-word detection works without
+  needing an orchestrator stack running.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -20,6 +31,8 @@ import numpy as np
 import websockets
 from aiohttp import ClientSession, ClientTimeout, web
 from openwakeword.model import Model
+
+VALID_SINK_MODES = ("orchestrator", "dry-run")
 
 # audio-io emits s16le mono @ 16kHz. openWakeWord wants chunks that are
 # multiples of 80ms (1280 samples = 2560 bytes) for best efficiency.
@@ -51,6 +64,11 @@ class Shim:
         self.cooldown = env_float("WW_COOLDOWN_SEC", 2.0)
         self.framework = os.environ.get("WW_INFERENCE_FRAMEWORK", "tflite")
         self.port = env_int("WW_PORT", 7030)
+        self.sink_mode = os.environ.get("WW_SINK_MODE", "orchestrator").lower()
+        if self.sink_mode not in VALID_SINK_MODES:
+            raise SystemExit(
+                f"WW_SINK_MODE must be one of {VALID_SINK_MODES}, got {self.sink_mode!r}"
+            )
 
         self.model: Optional[Model] = None
         self.http: Optional[ClientSession] = None
@@ -60,9 +78,10 @@ class Shim:
 
     def load_model(self) -> None:
         log.info(
-            "loading openWakeWord models=%s framework=%s",
+            "loading openWakeWord models=%s framework=%s sink=%s",
             self.model_names,
             self.framework,
+            self.sink_mode,
         )
         # Model(...) resolves bare names (e.g. "alexa") against the
         # bundled pre-trained models baked into the image at build time.
@@ -120,6 +139,12 @@ class Shim:
             "score": score,
             "ts": ts,
         }
+        if self.sink_mode == "dry-run":
+            # Online manual test path — surface the envelope without
+            # needing a live orchestrator at the other end.
+            log.info("[dry-run] would POST WakeWordDetected: %s",
+                     json.dumps(envelope, ensure_ascii=False))
+            return
         assert self.http is not None
         try:
             async with self.http.post(self.orchestrator_url, json=envelope) as resp:
