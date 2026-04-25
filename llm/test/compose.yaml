@@ -30,6 +30,7 @@ services:
       # Small CPU-friendly model from the same family as the production
       # default (gemma3:4b).
       LLM_MODEL: *model
+      OLLAMA_KEEP_ALIVE: "1h"
     ports:
       # Published so interactive debugging (`curl 127.0.0.1:7050/api/tags`
       # from the host) mirrors what the probe does internally via the
