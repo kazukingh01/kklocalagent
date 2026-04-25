@@ -16,7 +16,7 @@ production stack splits across `audio-io` and the orchestrator.
 
 ```bash
 cd wake-word-detection/test
-docker compose up --build --abort-on-container-exit --exit-code-from probe
+sudo docker compose up --build --abort-on-container-exit --exit-code-from probe
 ```
 
 Expected output once the build finishes (first build pulls ~20 MB of
