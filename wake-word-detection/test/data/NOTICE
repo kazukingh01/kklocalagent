@@ -1,0 +1,11 @@
+alexa_test.wav is redistributed from:
+
+    https://github.com/dscripka/openWakeWord
+    (file: tests/data/alexa_test.wav, commit on main branch)
+
+Copyright 2022 David Scripka.
+Licensed under the Apache License, Version 2.0.
+See https://www.apache.org/licenses/LICENSE-2.0 for the full license.
+
+The file is unmodified. It is used here only as a fixture for the
+wake-word-detection smoke test; no distribution change has been made.
