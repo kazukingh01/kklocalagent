@@ -190,6 +190,15 @@ services:
       ORCH_LLM_URL: http://llm:11434/api/chat
       ORCH_LLM_MODEL: gemma3:1b
       ORCH_TTS_URL: http://tts-streamer:7070/speak
+      ORCH_TTS_STOP_URL: http://tts-streamer:7070/stop
+      # v1.0 wake gating: the fixture stream contains "alexa" before
+      # the JFK utterance, so wake-word-detection arms the orchestrator
+      # before VAD's SpeechEnded for the JFK segment. Generous arm
+      # window so a slow first cold whisper load doesn't expire the
+      # window between the alexa wake and the alexa SpeechEnded.
+      ORCH_WAKE_REQUIRED: "true"
+      ORCH_WAKE_ARM_WINDOW_MS: "30000"
+      ORCH_WAKE_BARGE_IN: "true"
       ORCH_RESULT_SINK_URL: http://assert:9300/sink
     depends_on:
       automatic-speech-recognition:

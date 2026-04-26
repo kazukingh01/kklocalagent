@@ -32,6 +32,12 @@ services:
       ORCH_LLM_URL: http://probe:9200/api/chat
       # The model name isn't validated by the mock; any non-empty value works.
       ORCH_LLM_MODEL: gemma3:4b
+      # Disable wake gating: this smoke posts SpeechEnded directly with
+      # no preceding WakeWordDetected, which v1.0 default would (correctly)
+      # drop. Wake state-machine semantics are covered by the orchestrator
+      # crate's `state::tests` unit tests; this smoke only validates that
+      # the orchestrator plumbs SpeechEnded → ASR → LLM in the right order.
+      ORCH_WAKE_REQUIRED: "false"
       # Tighter per-request budgets than production defaults since the
       # mock responds instantly — keeps the smoke fast on regression.
       RUST_LOG: info,orchestrator=debug

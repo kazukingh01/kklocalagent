@@ -51,9 +51,12 @@ FRAME_PERIOD = FRAME_MS / 1000.0
 
 log = logging.getLogger("tts-streamer")
 
-# Single-flight: serialise overlapping /speak requests so frames from
-# different turns don't interleave on the shared /spk WS connection.
-SPEAK_LOCK = asyncio.Lock()
+# Tracks the currently running speak task so /stop can cancel it
+# (barge-in). Exactly one task at a time — a new /speak cancels the
+# previous task before starting, matching audio-io's "newest wins"
+# playback semantics.
+CURRENT_TASK: asyncio.Task | None = None
+TASK_LOCK = asyncio.Lock()
 
 
 async def synthesize(client: httpx.AsyncClient, text: str, speaker: int) -> bytes:
@@ -172,16 +175,54 @@ async def speak(request: web.Request) -> web.Response:
             {"ok": False, "error": "text must be a non-empty string"}, status=400
         )
 
-    # Serialised: prevents two /speak calls from interleaving frames on
-    # the shared /spk channel. The first request holds the lock; the
-    # second waits.
-    async with SPEAK_LOCK:
+    global CURRENT_TASK
+    # Cancel any in-flight task before starting the new one. Two /speak
+    # calls overlapping is the barge-in case (orchestrator preferring
+    # the new utterance over the old reply); failing the previous task
+    # with CancelledError is exactly what we want.
+    async with TASK_LOCK:
+        if CURRENT_TASK is not None and not CURRENT_TASK.done():
+            CURRENT_TASK.cancel()
+        task = asyncio.create_task(speak_one(text.strip()))
+        CURRENT_TASK = task
+
+    try:
+        result = await task
+        return web.json_response(result)
+    except asyncio.CancelledError:
+        # 499 Client Closed Request — surfacing the cancel as a
+        # non-success status lets the orchestrator log it as
+        # "cancelled" without conflating it with synth/network errors.
+        log.info("speak cancelled (barge-in)")
+        return web.json_response(
+            {"ok": False, "cancelled": True}, status=499
+        )
+    except Exception as e:  # noqa: BLE001
+        log.error("speak failed: %s", e)
+        return web.json_response({"ok": False, "error": str(e)}, status=502)
+
+
+async def stop(_: web.Request) -> web.Response:
+    """Cancel any in-flight /speak task and tell audio-io to drop
+    pending playback. Idempotent — safe to call when nothing is
+    speaking. Used by orchestrator's barge-in path."""
+    global CURRENT_TASK
+    cancelled = False
+    async with TASK_LOCK:
+        if CURRENT_TASK is not None and not CURRENT_TASK.done():
+            CURRENT_TASK.cancel()
+            cancelled = True
+
+    # Drop already-buffered playback. The cancel above stops further
+    # frames from being WS-pushed, but audio-io still has a few
+    # hundred ms in its ring — /spk/stop drains it for a clean cut.
+    if AUDIO_IO_BASE:
         try:
-            result = await speak_one(text.strip())
+            async with httpx.AsyncClient(timeout=2.0) as c:
+                await c.post(f"{AUDIO_IO_BASE}/spk/stop")
         except Exception as e:  # noqa: BLE001
-            log.error("speak failed: %s", e)
-            return web.json_response({"ok": False, "error": str(e)}, status=502)
-    return web.json_response(result)
+            log.warning("POST /spk/stop failed: %s", e)
+    return web.json_response({"ok": True, "cancelled": cancelled})
 
 
 def main() -> None:
@@ -197,6 +238,7 @@ def main() -> None:
     app = web.Application()
     app.router.add_get("/health", health)
     app.router.add_post("/speak", speak)
+    app.router.add_post("/stop", stop)
     web.run_app(app, host=HOST, port=PORT, print=lambda *_: None)
 
 

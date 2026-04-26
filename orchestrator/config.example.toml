@@ -32,11 +32,29 @@ max_inflight = 1
 # service which fronts VOICEVOX + the audio-io /spk push.
 [tts]
 url = "http://tts-streamer:7070/speak"
+# Cancel-in-flight URL. Used by `wake.barge_in` to interrupt a
+# TTS reply when the operator says the wake word again. Empty
+# disables the cancel side-effect.
+stop_url = "http://tts-streamer:7070/stop"
 # Generous because the streamer's response covers VOICEVOX synthesis
 # *and* WS-streaming the frames at real time — a 5 s utterance
 # physically takes 5 s to push through audio-io.
 timeout_ms = 60000
 max_inflight = 1
+
+# Wake-gating policy. v1.0 default: gate the ASR→LLM→TTS pipeline
+# on a recent WakeWordDetected event. Set `required = false` to fall
+# back to v0.1 always-listening behaviour (every SpeechEnded fires
+# the pipeline; useful for tests and debugging without speaking).
+[wake]
+required = true
+# How long after a WakeWordDetected to accept SpeechEnded, in ms.
+# Single-use: consumed when a SpeechEnded fires inside it.
+arm_window_ms = 8000
+# When true and a new WakeWordDetected arrives mid-turn, cancel the
+# in-flight TTS via `tts.stop_url` and re-arm. Off = mid-turn wake
+# arms the *next* utterance but doesn't interrupt the current reply.
+barge_in = true
 
 # Optional outbound forwarder for handled events. When url is empty
 # (the default) no forwarding happens — the orchestrator runs

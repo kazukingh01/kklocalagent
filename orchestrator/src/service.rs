@@ -5,6 +5,11 @@
 //! on a best-effort basis — unknown names are logged and acknowledged
 //! (forward-compat: producers can add new event types before the
 //! orchestrator learns about them).
+//!
+//! v1.0 introduces wake-gated dispatch (see `state::WakeMachine`):
+//! `SpeechEnded` events run the pipeline only when preceded by a
+//! recent `WakeWordDetected`. Set `wake.required = false` to fall
+//! back to v0.1 always-listening behaviour.
 
 use std::sync::Arc;
 
@@ -22,11 +27,13 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::events::EventEnvelope;
-use crate::pipeline::{self, forward_to_result_sink, Backends};
+use crate::pipeline::{self, forward_to_result_sink, tts_stop, Backends};
+use crate::state::{WakeMachine, WakeResult};
 
 #[derive(Clone)]
 struct AppState {
     backends: Arc<Backends>,
+    wake: Arc<WakeMachine>,
 }
 
 pub async fn run(config: Config) -> Result<()> {
@@ -36,7 +43,8 @@ pub async fn run(config: Config) -> Result<()> {
         config.tts.clone(),
         config.result_sink.clone(),
     )?);
-    let state = AppState { backends };
+    let wake = Arc::new(WakeMachine::new(&config.wake));
+    let state = AppState { backends, wake };
 
     let app = Router::new()
         .route("/health", get(health))
@@ -51,7 +59,7 @@ pub async fn run(config: Config) -> Result<()> {
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
-    info!(%addr, "orchestrator listening");
+    info!(%addr, wake_required = config.wake.required, "orchestrator listening");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -85,7 +93,9 @@ async fn events(
 
     match ev.name.as_str() {
         "SpeechStarted" => {
-            // v0.1: no state machine yet — just log.
+            // Logged for observability. Doesn't affect state — the
+            // wake machine waits for SpeechEnded (the utterance is
+            // useless until it's complete).
             info!(
                 target: "orch::events",
                 frame_index = ?ev.frame_index,
@@ -98,32 +108,79 @@ async fn events(
                     target: "orch::events",
                     "SpeechEnded without audio_base64 — skipping pipeline"
                 );
-            } else if let Err(e) = dispatch_utterance(&state, &ev) {
-                warn!(target: "orch::events", "dispatch failed: {e:#}");
+            } else {
+                // Wake gate: drop SpeechEnded events that don't follow
+                // a recent WakeWordDetected. Logged at info (not warn)
+                // because dropping is the *normal* path for
+                // background-noise utterances in v1.0.
+                match state.wake.try_dispatch() {
+                    Some(guard) => {
+                        if let Err(e) = dispatch_utterance(&state, &ev, guard) {
+                            warn!(target: "orch::events", "dispatch failed: {e:#}");
+                        }
+                    }
+                    None => {
+                        info!(
+                            target: "orch::events",
+                            "SpeechEnded dropped: not armed (say the wake word first, or set wake.required=false)"
+                        );
+                    }
+                }
             }
         }
         "WakeWordDetected" => {
-            // v0.1 is VAD-triggered (always-listening); wake is logged
-            // here so the later state-machine work (#4 §9 step 10) can
-            // promote it to Armed without a schema change. The full
-            // event is also forwarded to result_sink so external
-            // observers (and the integration test) see it.
-            info!(
-                target: "orch::events",
-                model = ?ev.model,
-                score = ?ev.score,
-                "wake word detected"
-            );
+            // Always forward to result_sink — observers (the v0.1
+            // assertion harness, future activity logs) want every
+            // wake event regardless of state.
             let payload = json!({
                 "name": "WakeWordDetected",
                 "model": ev.model,
                 "score": ev.score,
                 "ts": ev.ts,
             });
-            let backends = state.backends.clone();
+            let backends_for_sink = state.backends.clone();
             tokio::spawn(async move {
-                forward_to_result_sink(&backends, &payload).await;
+                forward_to_result_sink(&backends_for_sink, &payload).await;
             });
+
+            match state.wake.on_wake() {
+                WakeResult::Bypass => {
+                    info!(
+                        target: "orch::events",
+                        model = ?ev.model,
+                        score = ?ev.score,
+                        "wake word detected (always-listening; no gate)"
+                    );
+                }
+                WakeResult::Armed => {
+                    info!(
+                        target: "orch::events",
+                        model = ?ev.model,
+                        score = ?ev.score,
+                        "wake word detected: armed"
+                    );
+                }
+                WakeResult::ArmedBusy => {
+                    info!(
+                        target: "orch::events",
+                        model = ?ev.model,
+                        score = ?ev.score,
+                        "wake word detected mid-turn: armed for next utterance (barge_in disabled)"
+                    );
+                }
+                WakeResult::BargeIn => {
+                    info!(
+                        target: "orch::events",
+                        model = ?ev.model,
+                        score = ?ev.score,
+                        "wake word detected mid-turn: barge-in — cancelling current TTS"
+                    );
+                    let backends_for_stop = state.backends.clone();
+                    tokio::spawn(async move {
+                        tts_stop(&backends_for_stop).await;
+                    });
+                }
+            }
         }
         other => {
             info!(target: "orch::events", name = %other, "unhandled event");
@@ -132,7 +189,11 @@ async fn events(
     (StatusCode::OK, Json(json!({"ok": true})))
 }
 
-fn dispatch_utterance(state: &AppState, ev: &EventEnvelope) -> Result<()> {
+fn dispatch_utterance(
+    state: &AppState,
+    ev: &EventEnvelope,
+    guard: crate::state::ProcessingGuard,
+) -> Result<()> {
     // Defensive: has_utterance_audio() has already established these.
     let b64 = ev
         .audio_base64
@@ -141,12 +202,14 @@ fn dispatch_utterance(state: &AppState, ev: &EventEnvelope) -> Result<()> {
     let sample_rate = ev.sample_rate.context("sample_rate missing")?;
     let pcm = pipeline::decode_audio(b64)?;
 
-    // Run the ASR→LLM turn off the request-response path so the HTTP
-    // caller (VAD) isn't blocked for the full transcription+chat
-    // latency, and so a backend hang can't starve incoming events.
+    // Move the guard into the spawned task so the wake machine stays
+    // in `Processing` until the pipeline finishes — barge-in detection
+    // (WakeResult::BargeIn) and the "drop second SpeechEnded mid-turn"
+    // semantics both depend on this.
     let backends = state.backends.clone();
     tokio::spawn(async move {
         pipeline::run_turn(backends, pcm, sample_rate).await;
+        drop(guard);
     });
     Ok(())
 }

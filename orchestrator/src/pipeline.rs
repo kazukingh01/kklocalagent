@@ -260,7 +260,12 @@ async fn tts_speak(backends: &Backends, text: &str) {
     match res {
         Ok(resp) => {
             let status = resp.status();
-            if status.is_success() {
+            // 499 is what tts-streamer returns when /stop cancelled
+            // an in-flight /speak (barge-in). It's the *expected*
+            // outcome for the cancelled turn — log at info, not warn,
+            // so it doesn't pollute production logs every time the
+            // user interrupts the assistant.
+            if status.is_success() || status.as_u16() == 499 {
                 info!(target: "orch::pipeline", "TTS ok ({status})");
             } else {
                 let body = resp.text().await.unwrap_or_default();
@@ -275,6 +280,40 @@ async fn tts_speak(backends: &Backends, text: &str) {
         Err(e) => warn!(target: "orch::pipeline", "TTS POST failed: {e:#}"),
     }
     drop(permit);
+}
+
+/// POST `tts.stop_url` to cancel an in-flight `/speak` on the
+/// streamer. No-op when stop_url is empty (barge-in disabled or
+/// tts-streamer doesn't expose `/stop`). Failures are logged but
+/// never propagate — the wake state has already transitioned, so
+/// failing the stop POST shouldn't block the next turn.
+pub async fn tts_stop(backends: &Backends) {
+    if backends.tts.stop_url.is_empty() {
+        return;
+    }
+    let res = backends
+        .http
+        .post(&backends.tts.stop_url)
+        .timeout(std::time::Duration::from_millis(backends.tts.timeout_ms))
+        .send()
+        .await;
+    match res {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.is_success() {
+                info!(target: "orch::pipeline", "TTS stop ok ({status})");
+            } else {
+                let body = resp.text().await.unwrap_or_default();
+                warn!(
+                    target: "orch::pipeline",
+                    "TTS stop responded {}: {}",
+                    status,
+                    body.chars().take(200).collect::<String>()
+                );
+            }
+        }
+        Err(e) => warn!(target: "orch::pipeline", "TTS stop POST failed: {e:#}"),
+    }
 }
 
 async fn asr_transcribe(backends: &Backends, wav: Vec<u8>) -> Result<String> {
