@@ -1,0 +1,6 @@
+# Compose env override — host-specific (WINDOWS_HOST, model picks).
+# Copy `.env.example` → `.env` and edit. The example file is tracked;
+# `.env` itself never is.
+.env
+.env.local
+.env.*.local

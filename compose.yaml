@@ -52,15 +52,28 @@ services:
       # shell inside the container expands it from the env above. Bare
       # ${ASR_MODEL} would be substituted at compose-parse time and end
       # up empty unless the operator also exports it on the host.
+      #
+      # Download to a `.tmp` and atomic-rename only on curl success so
+      # an interrupted run (Ctrl-C, OOM, network drop) leaves no
+      # partial file masquerading as a complete model. whisper.cpp
+      # silently truncates a partial GGML and then bails at load time
+      # with "not all tensors loaded" — which surfaces as an unhealthy
+      # `automatic-speech-recognition` container, not as an obvious
+      # download error. A sibling `.tmp` is harmless on the next run
+      # because the existence check below is on the *final* path.
       - sh
       - -ec
       - |
-        if [ ! -f "/models/$$ASR_MODEL" ]; then
+        FINAL="/models/$$ASR_MODEL"
+        TMP="$$FINAL.tmp"
+        if [ ! -f "$$FINAL" ]; then
           apk add --no-cache curl ca-certificates >/dev/null
           echo "fetching $$ASR_MODEL..."
+          rm -f "$$TMP"
           curl -L --fail --progress-bar \
-            -o "/models/$$ASR_MODEL" \
+            -o "$$TMP" \
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$$ASR_MODEL"
+          mv "$$TMP" "$$FINAL"
           echo "fetched."
         else
           echo "$$ASR_MODEL already cached, skipping."
@@ -68,6 +81,8 @@ services:
         exec sleep infinity
     healthcheck:
       # Same-name escaping: $$ASR_MODEL expands inside the container.
+      # The atomic rename above guarantees that file existence ⇒ the
+      # full file is present.
       test: ["CMD-SHELL", "[ -f \"/models/$$ASR_MODEL\" ]"]
       interval: 5s
       timeout: 2s
