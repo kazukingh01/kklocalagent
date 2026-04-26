@@ -1,0 +1,80 @@
+# Offline scenario tests for the orchestrator's v1.0 control flow.
+#
+# Three orchestrator instances with different wake configs:
+#   orch-strict   — wake.required=true, arm=2s, barge_in=true
+#   orch-no-barge — wake.required=true, arm=2s, barge_in=false
+#   orch-loose    — wake.required=false (always-listening, v0.1 fallback)
+#
+# All three POST to the *scenarios* container's mock backends:
+#   :9100 ASR /inference
+#   :9200 LLM /api/chat
+#   :9300 TTS /speak + /stop
+#   :9400 sink /sink
+#
+# scenarios.py drives each orch through a sequence of /events POSTs
+# and asserts on the mocks' call counters. No real models — every
+# downstream is mocked, so this completes in seconds and works on
+# CPU-only / network-restricted hosts.
+#
+# Run from this directory:
+#   docker compose up --build --abort-on-container-exit --exit-code-from scenarios
+
+# Same image for all three orch instances — only env differs.
+x-orch: &orch
+  build:
+    context: ../..
+  image: kklocalagent/orchestrator-scenarios
+  environment: &orch-env
+    RUST_LOG: info,orchestrator=info
+    ORCH_LISTEN: 0.0.0.0:7000
+    ORCH_ASR_URL: http://scenarios:9100/inference
+    ORCH_LLM_URL: http://scenarios:9200/api/chat
+    ORCH_LLM_MODEL: mock
+    ORCH_TTS_URL: http://scenarios:9300/speak
+    ORCH_TTS_STOP_URL: http://scenarios:9300/stop
+    ORCH_RESULT_SINK_URL: http://scenarios:9400/sink
+
+services:
+  orch-strict:
+    <<: *orch
+    container_name: kklocalagent-test-scen-strict
+    environment:
+      <<: *orch-env
+      ORCH_WAKE_REQUIRED: "true"
+      ORCH_WAKE_ARM_WINDOW_MS: "2000"
+      ORCH_WAKE_BARGE_IN: "true"
+
+  orch-no-barge:
+    <<: *orch
+    container_name: kklocalagent-test-scen-no-barge
+    environment:
+      <<: *orch-env
+      ORCH_WAKE_REQUIRED: "true"
+      ORCH_WAKE_ARM_WINDOW_MS: "2000"
+      ORCH_WAKE_BARGE_IN: "false"
+
+  orch-loose:
+    <<: *orch
+    container_name: kklocalagent-test-scen-loose
+    environment:
+      <<: *orch-env
+      ORCH_WAKE_REQUIRED: "false"
+
+  scenarios:
+    build:
+      context: .
+    container_name: kklocalagent-test-scen-runner
+    depends_on:
+      orch-strict:
+        condition: service_healthy
+      orch-no-barge:
+        condition: service_healthy
+      orch-loose:
+        condition: service_healthy
+    environment:
+      ORCH_STRICT_URL: http://orch-strict:7000
+      ORCH_NO_BARGE_URL: http://orch-no-barge:7000
+      ORCH_LOOSE_URL: http://orch-loose:7000
+      # Must match the strict / no-barge orchs' ORCH_WAKE_ARM_WINDOW_MS
+      # above — used by the "arm window expires" scenario.
+      ARM_WINDOW_MS: "2000"
