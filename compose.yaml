@@ -1,0 +1,221 @@
+# kklocalagent production stack.
+#
+# Wires every WSL2-side module. audio-io is Windows-native and runs
+# OUTSIDE compose — VAD and wake-word-detection subscribe to its WS
+# /mic endpoint over the LAN, the same way the *-online smoke tests
+# do. The default WINDOWS_HOST resolves to the WSL2 host gateway;
+# override with a literal IP if your setup needs it.
+#
+# Prerequisites:
+#   1. audio-io.exe running on Windows with `[server] host = "0.0.0.0"`
+#      and the default port 7010. See audio-io/README.md.
+#   2. NVIDIA Container Toolkit + WSL2 GPU support if you want LLM /
+#      TTS on the GPU. Comment out the `deploy:` blocks below to fall
+#      back to CPU.
+#
+# Run from the repo root:
+#   docker compose up -d --build
+#
+#   # override the model at boot:
+#   LLM_MODEL='hf.co/mmnga-o/llm-jp-4-8b-thinking-gguf:Q8_0' \
+#       docker compose up -d --build
+#
+# Tear down (keep model caches):
+#   docker compose down
+# Tear down and wipe caches:
+#   docker compose down -v
+
+# Single source of truth for the LLM model — fed to both the `llm`
+# service (what to pull at startup) and `orchestrator` (what to chat
+# against). YAML anchors don't expand env vars themselves, so we route
+# through `${...}` and reuse the resulting string via the anchor.
+x-llm-model: &llm-model "${LLM_MODEL:-gemma3:4b}"
+x-asr-model: &asr-model "${ASR_MODEL:-ggml-small-q8_0.bin}"
+
+services:
+  # --- model bootstrap -----------------------------------------------
+
+  asr-models:
+    # First-run only: fetches the whisper model into the asr-models
+    # volume, then idles. Subsequent runs are no-ops. Idling (rather
+    # than exiting) keeps the dependency healthcheck stable for the
+    # lifetime of the stack.
+    image: alpine:3
+    container_name: kklocalagent-asr-models
+    restart: unless-stopped
+    volumes:
+      - asr-models:/models
+    environment:
+      ASR_MODEL: *asr-model
+    entrypoint:
+      # `$$ASR_MODEL` escapes compose's own ${...} interpolation so the
+      # shell inside the container expands it from the env above. Bare
+      # ${ASR_MODEL} would be substituted at compose-parse time and end
+      # up empty unless the operator also exports it on the host.
+      - sh
+      - -ec
+      - |
+        if [ ! -f "/models/$$ASR_MODEL" ]; then
+          apk add --no-cache curl ca-certificates >/dev/null
+          echo "fetching $$ASR_MODEL..."
+          curl -L --fail --progress-bar \
+            -o "/models/$$ASR_MODEL" \
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$$ASR_MODEL"
+          echo "fetched."
+        else
+          echo "$$ASR_MODEL already cached, skipping."
+        fi
+        exec sleep infinity
+    healthcheck:
+      # Same-name escaping: $$ASR_MODEL expands inside the container.
+      test: ["CMD-SHELL", "[ -f \"/models/$$ASR_MODEL\" ]"]
+      interval: 5s
+      timeout: 2s
+      retries: 60
+      start_period: 5s
+
+  # --- backends ------------------------------------------------------
+
+  automatic-speech-recognition:
+    build:
+      context: ./automatic-speech-recognition
+    container_name: kklocalagent-asr
+    restart: unless-stopped
+    depends_on:
+      asr-models:
+        condition: service_healthy
+    volumes:
+      - asr-models:/models:ro
+    environment:
+      WHISPER_MODEL: *asr-model
+      WHISPER_LANGUAGE: ja
+    ports:
+      - "7040:8080"
+
+  llm:
+    build:
+      context: ./llm
+    container_name: kklocalagent-llm
+    restart: unless-stopped
+    environment:
+      LLM_MODEL: *llm-model
+      # Pin weights in memory so each turn doesn't pay the cold-load
+      # tax (~10 s for an 8B Q8_0 on CPU).
+      OLLAMA_KEEP_ALIVE: "-1"
+    volumes:
+      - ollama-data:/root/.ollama
+    ports:
+      - "7050:11434"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  text-to-speech:
+    # VOICEVOX engine. Driven by `tts-streamer` (below); the orchestrator
+    # does not call this directly. Port 7060 is published so manual
+    # /audio_query + /synthesis calls from the host still work.
+    build:
+      context: ./text-to-speech
+    container_name: kklocalagent-tts
+    restart: unless-stopped
+    ports:
+      - "7060:50021"
+
+  tts-streamer:
+    # HTTP shim: orchestrator POSTs `{"text":...}` here on every turn,
+    # this service synthesizes via VOICEVOX, resamples to 16 kHz s16le
+    # mono, and streams the frames over WS to audio-io's /spk endpoint
+    # on the Windows host.
+    build:
+      context: ./tts-streamer
+    container_name: kklocalagent-tts-streamer
+    restart: unless-stopped
+    environment:
+      VOICEVOX_URL: http://text-to-speech:50021
+      VOICEVOX_SPEAKER: "3"
+      SPK_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/spk
+      AUDIO_IO_BASE: http://${WINDOWS_HOST:-host.docker.internal}:7010
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "7070:7070"
+    depends_on:
+      text-to-speech:
+        condition: service_healthy
+
+  # --- producers (subscribe to Windows audio-io /mic over the LAN) ---
+
+  voice-activity-detection:
+    build:
+      context: ./voice-activity-detection
+    container_name: kklocalagent-vad
+    restart: unless-stopped
+    environment:
+      RUST_LOG: info,voice_activity_detection=info
+      VAD_MIC_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/mic
+      VAD_SINK_MODE: orchestrator
+      VAD_ORCHESTRATOR_URL: http://orchestrator:7000/events
+      # Required so the orchestrator receives utterance PCM and can
+      # run ASR. Off by default in the VAD config because it bloats
+      # dry-run/asr-direct logs — necessary here.
+      VAD_LOG_AUDIO_IN_EVENT: "true"
+    extra_hosts:
+      # Plain Linux docker (non-Docker-Desktop, non-WSL2) doesn't
+      # resolve `host.docker.internal` by default. host-gateway makes
+      # it point at the docker bridge gateway = the host. Harmless on
+      # Docker Desktop / WSL2 where the resolver already exists.
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+
+  wake-word-detection:
+    build:
+      context: ./wake-word-detection
+    container_name: kklocalagent-wwd
+    restart: unless-stopped
+    environment:
+      WW_MIC_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/mic
+      WW_SINK_MODE: orchestrator
+      WW_ORCHESTRATOR_URL: http://orchestrator:7000/events
+      WW_MODELS: alexa
+      WW_THRESHOLD: "0.5"
+      WW_COOLDOWN_SEC: "2.0"
+      WW_INFERENCE_FRAMEWORK: tflite
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+
+  # --- system under test ---------------------------------------------
+
+  orchestrator:
+    build:
+      context: ./orchestrator
+    container_name: kklocalagent-orch
+    restart: unless-stopped
+    environment:
+      RUST_LOG: info,orchestrator=info
+      ORCH_LISTEN: 0.0.0.0:7000
+      ORCH_ASR_URL: http://automatic-speech-recognition:8080/inference
+      ORCH_LLM_URL: http://llm:11434/api/chat
+      ORCH_LLM_MODEL: *llm-model
+      ORCH_TTS_URL: http://tts-streamer:7070/speak
+    ports:
+      - "7000:7000"
+    depends_on:
+      automatic-speech-recognition:
+        condition: service_healthy
+      llm:
+        condition: service_healthy
+      tts-streamer:
+        condition: service_healthy
+
+volumes:
+  asr-models:
+  ollama-data:

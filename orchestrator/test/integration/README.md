@@ -17,27 +17,36 @@ mic-stub ──WS /mic──► VAD ────────────POST /ev
               │                                                     │
               └────► transcript ──► orchestrator ──► assistant ◄────┘
                                           │
-                              POST /sink (TurnCompleted +
-                                          WakeWordDetected forwards)
-                                          ▼
-                                       assert  → exit 0 / 1
+                              POST /sink (TurnCompleted +     ┌───► tts-streamer ─► VOICEVOX
+                                          WakeWordDetected forwards)│         │
+                                          ▼                         │         ▼ /spk WS
+                                       assert ◄── /stats poll ───── spk-sink (mock audio-io)
+                                          │
+                                       exit 0 / 1
 ```
 
 ## What gets verified
 
-The `assert` service receives two kinds of events forwarded from the
-orchestrator's `result_sink`:
+The `assert` service watches three signals concurrently:
 
-1. **`WakeWordDetected`** — fired by `wake-word-detection` on the
-   "alexa" segment of the fixture stream. Proves `wake-word-detection`
-   can consume audio-io-shaped PCM and reach the orchestrator.
-2. **`TurnCompleted`** — fired by the orchestrator after a
-   SpeechEnded → ASR → LLM round trip. Proves VAD picked an utterance,
-   the orchestrator wrapped + posted it, whisper transcribed
-   non-empty text, and ollama generated a non-empty assistant reply.
+1. **`WakeWordDetected`** (forwarded via `result_sink`) — fired by
+   `wake-word-detection` on the "alexa" segment of the fixture stream.
+   Proves `wake-word-detection` can consume audio-io-shaped PCM and
+   reach the orchestrator.
+2. **`TurnCompleted`** (forwarded via `result_sink`) — fired by the
+   orchestrator after a SpeechEnded → ASR → LLM round trip. Proves VAD
+   picked an utterance, the orchestrator wrapped + posted it, whisper
+   transcribed non-empty text, and ollama generated a non-empty
+   assistant reply.
+3. **TTS frames on `/spk`** (polled from `spk-sink`'s `/stats`) — at
+   least `SPK_MIN_BYTES` (640 B = one frame, default) of *non-silent*
+   audio. Proves the orchestrator's TTS stage POSTed `/speak` to
+   `tts-streamer`, which synthesised via VOICEVOX, resampled to 16 kHz
+   s16le mono, and streamed paced frames over WebSocket — the same
+   path that hits audio-io's `/spk` in production.
 
-Both within `ASSERT_TIMEOUT_SEC` (180 s by default) → `assert` exits
-0. Either missing → exit 1, with the partial state printed for
+All three within `ASSERT_TIMEOUT_SEC` (300 s by default) → `assert`
+exits 0. Any missing → exit 1, with partial state printed for
 diagnosis.
 
 ## Models (matching each module's own test)
@@ -47,6 +56,7 @@ diagnosis.
 | ASR | `ggml-small-q8_0.bin` (~252 MB) | `automatic-speech-recognition/test/compose.offline.yaml` |
 | LLM | `gemma3:1b` (~815 MB) | `llm/test/compose.yaml` |
 | Wake | `alexa` (bundled, ~860 KB) | `wake-word-detection/test/compose.yaml` |
+| TTS | VOICEVOX `cpu-latest` ONNX | `text-to-speech/Dockerfile` (default speaker = 3, ずんだもん) |
 
 The whisper model is fetched into a named volume (`asr-models`) by an
 init-only `asr-models` service on first run, so the smoke is
@@ -115,6 +125,7 @@ real models end-to-end:
 | **VAD → orchestrator** | ✗ | ✅ |
 | **wake-word → orchestrator** | ✗ | ✅ |
 | **mic-stub PCM → VAD/wake-word** | ✗ | ✅ |
+| **orchestrator → TTS → /spk** | ✗ | ✅ (real VOICEVOX, mock audio-io as `spk-sink`) |
 | Real model accuracy on real audio | ✗ | ✅ (smoke level — non-empty text only) |
 
 ## Troubleshooting

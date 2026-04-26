@@ -26,6 +26,18 @@ model = "gemma3:4b"
 timeout_ms = 120000
 max_inflight = 1
 
+# Optional TTS speak channel. When url is empty (default) the
+# orchestrator skips the TTS stage entirely — the assistant reply is
+# logged but not voiced. Production wires this at the `tts-streamer`
+# service which fronts VOICEVOX + the audio-io /spk push.
+[tts]
+url = "http://tts-streamer:7070/speak"
+# Generous because the streamer's response covers VOICEVOX synthesis
+# *and* WS-streaming the frames at real time — a 5 s utterance
+# physically takes 5 s to push through audio-io.
+timeout_ms = 60000
+max_inflight = 1
+
 # Optional outbound forwarder for handled events. When url is empty
 # (the default) no forwarding happens — the orchestrator runs
 # log-only. Currently emits:

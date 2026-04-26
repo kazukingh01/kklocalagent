@@ -22,7 +22,7 @@ use serde_json::json;
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
-use crate::config::{AsrConfig, LlmConfig, ResultSinkConfig};
+use crate::config::{AsrConfig, LlmConfig, ResultSinkConfig, TtsConfig};
 
 /// Wrap a raw little-endian 16-bit mono PCM buffer in a 44-byte WAV
 /// header. Duplicated from voice-activity-detection's helper — the two
@@ -70,13 +70,20 @@ pub struct Backends {
     pub http: reqwest::Client,
     pub asr: AsrConfig,
     pub llm: LlmConfig,
+    pub tts: TtsConfig,
     pub result_sink: ResultSinkConfig,
     pub asr_inflight: Arc<Semaphore>,
     pub llm_inflight: Arc<Semaphore>,
+    pub tts_inflight: Arc<Semaphore>,
 }
 
 impl Backends {
-    pub fn new(asr: AsrConfig, llm: LlmConfig, result_sink: ResultSinkConfig) -> Result<Self> {
+    pub fn new(
+        asr: AsrConfig,
+        llm: LlmConfig,
+        tts: TtsConfig,
+        result_sink: ResultSinkConfig,
+    ) -> Result<Self> {
         // Client timeout is disabled at the client level; per-request
         // timeouts are applied in the individual POST builders below so
         // that slower models (ASR on `large-v3-turbo`, LLM on a big
@@ -86,13 +93,19 @@ impl Backends {
             .context("building reqwest client")?;
         let asr_inflight = Arc::new(Semaphore::new(asr.max_inflight as usize));
         let llm_inflight = Arc::new(Semaphore::new(llm.max_inflight as usize));
+        // tts.max_inflight is 0 only when tts is disabled (validated in
+        // Config::validate). Use max(1) so the Semaphore stays well-formed
+        // either way — try_acquire is gated on tts.url being set anyway.
+        let tts_inflight = Arc::new(Semaphore::new(tts.max_inflight.max(1) as usize));
         Ok(Self {
             http,
             asr,
             llm,
+            tts,
             result_sink,
             asr_inflight,
             llm_inflight,
+            tts_inflight,
         })
     }
 }
@@ -185,29 +198,83 @@ pub async fn run_turn(backends: Arc<Backends>, pcm: Vec<u8>, sample_rate: u32) {
         }
     };
 
-    match llm_chat(&backends, &text).await {
-        Ok(reply) => {
-            info!(
-                target: "orch::pipeline",
-                user = %text,
-                assistant = %reply,
-                "turn complete"
-            );
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs_f64())
-                .unwrap_or(0.0);
-            let payload = json!({
-                "name": "TurnCompleted",
-                "user": text,
-                "assistant": reply,
-                "ts": ts,
-            });
-            forward_to_result_sink(&backends, &payload).await;
+    let reply = match llm_chat(&backends, &text).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(target: "orch::pipeline", "LLM failed: {e:#}");
+            drop(llm_permit);
+            return;
         }
-        Err(e) => warn!(target: "orch::pipeline", "LLM failed: {e:#}"),
-    }
+    };
     drop(llm_permit);
+
+    info!(
+        target: "orch::pipeline",
+        user = %text,
+        assistant = %reply,
+        "turn complete"
+    );
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let payload = json!({
+        "name": "TurnCompleted",
+        "user": text,
+        "assistant": reply,
+        "ts": ts,
+    });
+    forward_to_result_sink(&backends, &payload).await;
+
+    // TTS stage. Disabled when tts.url is empty — degrades to "log
+    // only" so dev runs without `tts-streamer` still complete the turn.
+    // Empty replies (rare; would mean LLM said literally nothing) skip
+    // TTS rather than POST an empty string the streamer would reject.
+    if !backends.tts.url.is_empty() && !reply.is_empty() {
+        tts_speak(&backends, &reply).await;
+    }
+}
+
+async fn tts_speak(backends: &Backends, text: &str) {
+    let permit = match backends.tts_inflight.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            warn!(
+                target: "orch::pipeline",
+                "TTS at capacity ({} in flight); skipping speak",
+                backends.tts.max_inflight
+            );
+            return;
+        }
+    };
+
+    let body = json!({ "text": text });
+    let res = backends
+        .http
+        .post(&backends.tts.url)
+        .json(&body)
+        .timeout(std::time::Duration::from_millis(backends.tts.timeout_ms))
+        .send()
+        .await;
+    match res {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.is_success() {
+                info!(target: "orch::pipeline", "TTS ok ({status})");
+            } else {
+                let body = resp.text().await.unwrap_or_default();
+                warn!(
+                    target: "orch::pipeline",
+                    "TTS responded {}: {}",
+                    status,
+                    body.chars().take(200).collect::<String>()
+                );
+            }
+        }
+        Err(e) => warn!(target: "orch::pipeline", "TTS POST failed: {e:#}"),
+    }
+    drop(permit);
 }
 
 async fn asr_transcribe(backends: &Backends, wav: Vec<u8>) -> Result<String> {

@@ -33,6 +33,7 @@ pub async fn run(config: Config) -> Result<()> {
     let backends = Arc::new(Backends::new(
         config.asr.clone(),
         config.llm.clone(),
+        config.tts.clone(),
         config.result_sink.clone(),
     )?);
     let state = AppState { backends };

@@ -9,6 +9,7 @@
 #
 #   orchestrator ──POST /inference──► automatic-speech-recognition
 #                ──POST /api/chat───► llm
+#                ──POST /speak─────► tts-streamer ──► VOICEVOX ──► spk-sink (/spk WS)
 #                ──POST /sink───────► assert (test driver)
 #
 # The fixture stream contains:
@@ -17,14 +18,15 @@
 # Wake-word-detection should fire on "alexa" and post WakeWordDetected.
 # VAD should emit a SpeechEnded for jfk.wav (and likely also for
 # "alexa", since v0.1 doesn't gate on wake yet) → orchestrator → ASR →
-# LLM → TurnCompleted forwarded to the assert service. The assert
-# service exits 0 once both WakeWordDetected and TurnCompleted have
-# been observed within ASSERT_TIMEOUT_SEC.
+# LLM → TTS → /spk push to spk-sink. The assert service exits 0 once
+# WakeWordDetected, TurnCompleted, AND non-silent bytes on spk-sink
+# have all been observed within ASSERT_TIMEOUT_SEC.
 #
-# Models are deliberately the same ones each module's own test uses:
+# Models are deliberately the lightest CPU-friendly tier:
 #   ASR: ggml-small-q8_0.bin (whisper.cpp; ~252 MB)
 #   LLM: gemma3:1b           (ollama;       ~815 MB)
 #   WW : alexa               (openWakeWord; bundled in image)
+#   TTS: VOICEVOX cpu-latest (ONNX models bundled in upstream image)
 #
 # Run from this directory:
 #   docker compose up --build --abort-on-container-exit --exit-code-from assert
@@ -95,10 +97,34 @@ services:
     environment:
       # Same lightweight model as the llm module's own smoke.
       LLM_MODEL: gemma3:1b
+      # Pin weights so the second turn doesn't pay the cold-load tax,
+      # and so the assert window doesn't overlap with re-load.
+      OLLAMA_KEEP_ALIVE: "-1"
     volumes:
       - ollama-data:/root/.ollama
 
-  # --- audio source (mock audio-io) -----------------------------------
+  text-to-speech:
+    build:
+      context: ../../../text-to-speech
+    container_name: kklocalagent-test-int-tts
+
+  tts-streamer:
+    build:
+      context: ../../../tts-streamer
+    container_name: kklocalagent-test-int-tts-streamer
+    environment:
+      VOICEVOX_URL: http://text-to-speech:50021
+      VOICEVOX_SPEAKER: "3"
+      # Compose-internal /spk receiver — replaces audio-io for the smoke.
+      SPK_URL: ws://spk-sink:7010/spk
+      AUDIO_IO_BASE: http://spk-sink:7011
+    depends_on:
+      text-to-speech:
+        condition: service_healthy
+      spk-sink:
+        condition: service_healthy
+
+  # --- audio source / sink (mock audio-io) -----------------------------
 
   mic-stub:
     build:
@@ -108,6 +134,11 @@ services:
       context: ../../..
       dockerfile: orchestrator/test/integration/mic-stub/Dockerfile
     container_name: kklocalagent-test-int-mic-stub
+
+  spk-sink:
+    build:
+      context: ./spk-sink
+    container_name: kklocalagent-test-int-spk-sink
 
   # --- producers (VAD + wake-word) ------------------------------------
 
@@ -158,11 +189,14 @@ services:
       ORCH_ASR_URL: http://automatic-speech-recognition:8080/inference
       ORCH_LLM_URL: http://llm:11434/api/chat
       ORCH_LLM_MODEL: gemma3:1b
+      ORCH_TTS_URL: http://tts-streamer:7070/speak
       ORCH_RESULT_SINK_URL: http://assert:9300/sink
     depends_on:
       automatic-speech-recognition:
         condition: service_healthy
       llm:
+        condition: service_healthy
+      tts-streamer:
         condition: service_healthy
       assert:
         condition: service_started
@@ -176,10 +210,15 @@ services:
     environment:
       ASSERT_PORT: "9300"
       # Generous: cold whisper-server load + first cold gemma3:1b
-      # response can take a minute even on a beefy CPU. The probe still
-      # exits 0 the moment both events arrive — this is the *upper*
+      # response + first cold VOICEVOX synth can take a few minutes
+      # combined on CPU. The probe still exits 0 the moment all three
+      # signals (wake / turn / spk-bytes) arrive — this is the *upper*
       # bound for failure.
-      ASSERT_TIMEOUT_SEC: "180"
+      ASSERT_TIMEOUT_SEC: "300"
+      SPK_SINK_URL: http://spk-sink:7011/stats
+    depends_on:
+      spk-sink:
+        condition: service_healthy
 
 volumes:
   asr-models:

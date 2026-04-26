@@ -8,6 +8,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub asr: AsrConfig,
     pub llm: LlmConfig,
+    pub tts: TtsConfig,
     pub result_sink: ResultSinkConfig,
 }
 
@@ -73,6 +74,26 @@ pub struct LlmConfig {
     pub max_inflight: u32,
 }
 
+/// Optional outbound TTS speak channel. When `url` is empty (the
+/// default) the orchestrator skips TTS entirely — the assistant reply
+/// is logged but not voiced. Useful for dev environments where the
+/// `tts-streamer` service isn't running, or for headless CI runs.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TtsConfig {
+    /// `tts-streamer` `/speak` URL. Empty disables the stage.
+    pub url: String,
+    /// HTTP timeout per speak POST, in milliseconds. Generous because
+    /// the upstream call covers VOICEVOX synthesis + WS streaming the
+    /// frames at real time — a 5-second utterance physically takes 5 s
+    /// to push through audio-io.
+    pub timeout_ms: u64,
+    /// Maximum simultaneous in-flight TTS requests. 1 mirrors the
+    /// streamer's own single-flight lock; raise only if the streamer
+    /// is replaced with a multi-channel speaker.
+    pub max_inflight: u32,
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -97,6 +118,19 @@ impl Default for LlmConfig {
             url: "http://llm:11434/api/chat".into(),
             model: "gemma3:4b".into(),
             timeout_ms: 120_000,
+            max_inflight: 1,
+        }
+    }
+}
+
+impl Default for TtsConfig {
+    fn default() -> Self {
+        Self {
+            // Empty = TTS stage disabled. Production compose populates
+            // this; dev / CI runs without `tts-streamer` leave it empty
+            // so the pipeline still completes without trying to speak.
+            url: String::new(),
+            timeout_ms: 60_000,
             max_inflight: 1,
         }
     }
@@ -134,6 +168,14 @@ impl Config {
         }
         if self.llm.max_inflight == 0 {
             anyhow::bail!("llm.max_inflight must be >= 1");
+        }
+        if !self.tts.url.is_empty() {
+            if self.tts.timeout_ms == 0 {
+                anyhow::bail!("tts.timeout_ms must be >= 1 when url is set");
+            }
+            if self.tts.max_inflight == 0 {
+                anyhow::bail!("tts.max_inflight must be >= 1 when url is set");
+            }
         }
         if !self.result_sink.url.is_empty() && self.result_sink.timeout_ms == 0 {
             anyhow::bail!("result_sink.timeout_ms must be >= 1 when url is set");

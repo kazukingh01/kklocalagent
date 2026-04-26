@@ -21,7 +21,10 @@ The state machine (§8) and barge-in are deferred to step 10.
   4. takes the returned `text`,
   5. POSTs it as a user turn to LLM's `/api/chat` (ollama API,
      `stream: false`),
-  6. logs the assistant reply.
+  6. forwards a `TurnCompleted` event to `result_sink` (if configured),
+  7. POSTs the assistant reply to `tts-streamer`'s `/speak` (if
+     `tts.url` is set). The streamer handles VOICEVOX synthesis +
+     resampling + the framed WS push to audio-io's `/spk`.
 - `SpeechStarted` / `WakeWordDetected` are received and logged only.
   The state machine work (step 10) will promote `WakeWordDetected` to
   an `Armed` transition without a schema change.
@@ -60,6 +63,8 @@ full shape and defaults. The env vars supported by the binary:
 | `ORCH_ASR_URL` | `asr.url` | `http://automatic-speech-recognition:8080/inference` |
 | `ORCH_LLM_URL` | `llm.url` | `http://llm:11434/api/chat` |
 | `ORCH_LLM_MODEL` | `llm.model` | `gemma3:4b` |
+| `ORCH_TTS_URL` | `tts.url` (empty disables TTS) | `""` |
+| `ORCH_RESULT_SINK_URL` | `result_sink.url` | `""` |
 | `RUST_LOG` | tracing filter | `info` |
 
 ## Event envelope
