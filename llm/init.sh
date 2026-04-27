@@ -12,7 +12,12 @@ set -euo pipefail
 MODEL="${LLM_MODEL:-gemma3:4b}"
 
 echo "[init] starting ollama serve (model=${MODEL})"
-ollama serve &
+# Filter out GIN per-request access logs ("[GIN] ... | 200 | ... POST /api/chat").
+# `ollama serve` is backgrounded so $! is its PID (not grep's), keeping the
+# `wait "${SERVE_PID}"` below as a clean signal-propagation point. Process
+# substitution receives both stdout and stderr; --line-buffered so logs aren't
+# held back waiting for a 4 KiB block to fill.
+ollama serve > >(grep --line-buffered -v '^\[GIN\]') 2>&1 &
 SERVE_PID=$!
 
 # /api/tags returns 200 as soon as the HTTP server binds, regardless of
