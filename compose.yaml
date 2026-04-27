@@ -237,7 +237,11 @@ services:
       # v1.0 wake gating. Override via .env (`ORCH_WAKE_REQUIRED=false`)
       # to fall back to v0.1 always-listening behaviour for debugging.
       ORCH_WAKE_REQUIRED: "${ORCH_WAKE_REQUIRED:-true}"
-      ORCH_WAKE_ARM_WINDOW_MS: "${ORCH_WAKE_ARM_WINDOW_MS:-8000}"
+      # Two distinct windows: post-wake (5 s for SpeechStarted) and
+      # post-turn (10 s for follow-up SpeechStarted). Either expires
+      # → state returns to Idle and operator must re-wake.
+      ORCH_WAKE_WINDOW_MS: "${ORCH_WAKE_WINDOW_MS:-5000}"
+      ORCH_TURN_FOLLOWUP_WINDOW_MS: "${ORCH_TURN_FOLLOWUP_WINDOW_MS:-10000}"
       ORCH_WAKE_BARGE_IN: "${ORCH_WAKE_BARGE_IN:-true}"
     ports:
       - "7000:7000"

@@ -197,7 +197,11 @@ services:
       # window so a slow first cold whisper load doesn't expire the
       # window between the alexa wake and the alexa SpeechEnded.
       ORCH_WAKE_REQUIRED: "true"
-      ORCH_WAKE_ARM_WINDOW_MS: "30000"
+      # Long windows for the integration test: cold whisper / gemma3
+      # load can take ~30 s, so a short wake_window would expire
+      # between the alexa wake event and the JFK SpeechEnded.
+      ORCH_WAKE_WINDOW_MS: "30000"
+      ORCH_TURN_FOLLOWUP_WINDOW_MS: "30000"
       ORCH_WAKE_BARGE_IN: "true"
       ORCH_RESULT_SINK_URL: http://assert:9300/sink
     depends_on:

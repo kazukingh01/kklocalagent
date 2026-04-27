@@ -28,7 +28,7 @@ use tracing::{info, warn};
 use crate::config::Config;
 use crate::events::EventEnvelope;
 use crate::pipeline::{self, forward_to_result_sink, tts_stop, Backends};
-use crate::state::{DispatchOutcome, WakeMachine, WakeResult};
+use crate::state::{DispatchOutcome, SpeechStartedOutcome, WakeMachine, WakeResult};
 
 #[derive(Clone)]
 struct AppState {
@@ -93,30 +93,76 @@ async fn events(
 
     match ev.name.as_str() {
         "SpeechStarted" => {
-            // SpeechStarted is informational — the utterance audio
-            // isn't here yet, so the wake machine doesn't transition.
-            // We still distinguish "passed through" vs "dropped
-            // because a turn is in flight" so production logs make
-            // it obvious which VAD frames were intentionally ignored.
-            // Drop logs share the structured `event="..."` and
-            // `reason="..."` fields with SpeechEnded drops below so
-            // a single `grep 'orch::events.*reason='` lifts every
-            // dropped event regardless of type.
-            if state.wake.is_in_turn() {
-                warn!(
-                    target: "orch::events",
-                    event = "SpeechStarted",
-                    reason = "in_turn",
-                    frame_index = ?ev.frame_index,
-                    ts = ?ev.ts,
-                    "VAD event dropped: turn in progress"
-                );
-            } else {
-                info!(
-                    target: "orch::events",
-                    frame_index = ?ev.frame_index,
-                    "speech started"
-                );
+            // SpeechStarted is the *cancel* trigger for armed-window
+            // timers (per v1.0 spec). on_speech_started() handles the
+            // state transition (ArmedAfter* → Listening); here we
+            // just turn its outcome into a structured log line so
+            // the operator can see exactly why each VAD frame was
+            // accepted or dropped. Drop logs share `event=` /
+            // `reason=` fields with SpeechEnded drops below — a
+            // single `grep 'reason='` finds every dropped VAD event.
+            match state.wake.on_speech_started() {
+                SpeechStartedOutcome::Bypass => {
+                    info!(
+                        target: "orch::events",
+                        frame_index = ?ev.frame_index,
+                        "speech started (always-listening; no gate)"
+                    );
+                }
+                SpeechStartedOutcome::Listening => {
+                    info!(
+                        target: "orch::events",
+                        frame_index = ?ev.frame_index,
+                        "speech started: listening for SpeechEnded"
+                    );
+                }
+                SpeechStartedOutcome::DroppedIdle => {
+                    warn!(
+                        target: "orch::events",
+                        event = "SpeechStarted",
+                        reason = "not_armed",
+                        frame_index = ?ev.frame_index,
+                        ts = ?ev.ts,
+                        "VAD event dropped: not armed (say the wake word first)"
+                    );
+                }
+                SpeechStartedOutcome::DroppedAlreadyListening => {
+                    info!(
+                        target: "orch::events",
+                        frame_index = ?ev.frame_index,
+                        "speech started: already listening (duplicate SS, ignored)"
+                    );
+                }
+                SpeechStartedOutcome::DroppedInTurn => {
+                    warn!(
+                        target: "orch::events",
+                        event = "SpeechStarted",
+                        reason = "in_turn",
+                        frame_index = ?ev.frame_index,
+                        ts = ?ev.ts,
+                        "VAD event dropped: turn in progress"
+                    );
+                }
+                SpeechStartedOutcome::WakeWindowExpired => {
+                    warn!(
+                        target: "orch::events",
+                        event = "SpeechStarted",
+                        reason = "wake_window_expired",
+                        frame_index = ?ev.frame_index,
+                        ts = ?ev.ts,
+                        "VAD event dropped: wake window expired before SpeechStarted"
+                    );
+                }
+                SpeechStartedOutcome::TurnWindowExpired => {
+                    warn!(
+                        target: "orch::events",
+                        event = "SpeechStarted",
+                        reason = "turn_window_expired",
+                        frame_index = ?ev.frame_index,
+                        ts = ?ev.ts,
+                        "VAD event dropped: turn-followup window expired"
+                    );
+                }
             }
         }
         "SpeechEnded" => {
@@ -157,13 +203,22 @@ async fn events(
                             "VAD event dropped: turn in progress"
                         );
                     }
-                    DispatchOutcome::ArmExpired => {
+                    DispatchOutcome::WakeWindowExpired => {
                         warn!(
                             target: "orch::events",
                             event = "SpeechEnded",
-                            reason = "arm_expired",
+                            reason = "wake_window_expired",
                             ts = ?ev.ts,
-                            "VAD event dropped: arm window expired"
+                            "VAD event dropped: wake window expired"
+                        );
+                    }
+                    DispatchOutcome::TurnWindowExpired => {
+                        warn!(
+                            target: "orch::events",
+                            event = "SpeechEnded",
+                            reason = "turn_window_expired",
+                            ts = ?ev.ts,
+                            "VAD event dropped: turn-followup window expired"
                         );
                     }
                 }

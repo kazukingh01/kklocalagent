@@ -54,12 +54,20 @@ max_inflight = 1
 # the pipeline; useful for tests and debugging without speaking).
 [wake]
 required = true
-# How long after a WakeWordDetected to accept SpeechEnded, in ms.
-# Single-use: consumed when a SpeechEnded fires inside it.
-arm_window_ms = 8000
+# Window after a WakeWordDetected during which a SpeechStarted must
+# arrive, in milliseconds. After this expires without a SpeechStarted,
+# the state returns to Idle and the operator must re-wake.
+wake_window_ms = 5000
+# Window after a Turn finishes (TTS end) during which the *next*
+# SpeechStarted is accepted as a follow-up — no fresh wake required.
+# Lets the operator continue a conversation. After this expires,
+# state returns to Idle.
+turn_followup_window_ms = 10000
 # When true and a new WakeWordDetected arrives mid-turn, cancel the
-# in-flight TTS via `tts.stop_url` and re-arm. Off = mid-turn wake
-# arms the *next* utterance but doesn't interrupt the current reply.
+# in-flight TTS via `tts.stop_url` and re-arm with the wake_window.
+# Off = mid-turn wake doesn't interrupt the current reply, but the
+# post-turn state will be ArmedAfterWake (5 s) instead of
+# ArmedAfterTurn (10 s).
 barge_in = true
 
 # Optional outbound forwarder for handled events. When url is empty

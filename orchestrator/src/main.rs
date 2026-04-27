@@ -45,9 +45,15 @@ struct Args {
     #[arg(long, env = "ORCH_WAKE_REQUIRED")]
     wake_required: Option<bool>,
 
-    /// Override `wake.arm_window_ms`.
-    #[arg(long, env = "ORCH_WAKE_ARM_WINDOW_MS")]
-    wake_arm_window_ms: Option<u64>,
+    /// Override `wake.wake_window_ms` (window for SpeechStarted after
+    /// a WakeWordDetected).
+    #[arg(long, env = "ORCH_WAKE_WINDOW_MS")]
+    wake_window_ms: Option<u64>,
+
+    /// Override `wake.turn_followup_window_ms` (window for the next
+    /// SpeechStarted after a Turn ends).
+    #[arg(long, env = "ORCH_TURN_FOLLOWUP_WINDOW_MS")]
+    turn_followup_window_ms: Option<u64>,
 
     /// Override `wake.barge_in` (true / false).
     #[arg(long, env = "ORCH_WAKE_BARGE_IN")]
@@ -95,8 +101,11 @@ async fn main() -> Result<()> {
     if let Some(v) = args.wake_required {
         config.wake.required = v;
     }
-    if let Some(v) = args.wake_arm_window_ms {
-        config.wake.arm_window_ms = v;
+    if let Some(v) = args.wake_window_ms {
+        config.wake.wake_window_ms = v;
+    }
+    if let Some(v) = args.turn_followup_window_ms {
+        config.wake.turn_followup_window_ms = v;
     }
     if let Some(v) = args.wake_barge_in {
         config.wake.barge_in = v;

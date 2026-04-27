@@ -143,11 +143,13 @@ run_phase() {
   return $exit_code
 }
 
-# v1.0 default: wake-gated, 2 s arm window, barge-in on. Most of the
-# scenarios live here.
+# v1.0 default: wake-gated, 2 s wake window, 2 s post-turn follow-up
+# window, barge-in on. Both windows are short so the "window expires"
+# scenarios complete in seconds.
 run_phase strict \
     -e "ORCH_WAKE_REQUIRED=true" \
-    -e "ORCH_WAKE_ARM_WINDOW_MS=2000" \
+    -e "ORCH_WAKE_WINDOW_MS=2000" \
+    -e "ORCH_TURN_FOLLOWUP_WINDOW_MS=2000" \
     -e "ORCH_WAKE_BARGE_IN=true"
 
 # v0.1 fallback: wake gating disabled (every SpeechEnded fires).
@@ -159,7 +161,8 @@ run_phase loose \
 # reply before listening again).
 run_phase no-barge \
     -e "ORCH_WAKE_REQUIRED=true" \
-    -e "ORCH_WAKE_ARM_WINDOW_MS=2000" \
+    -e "ORCH_WAKE_WINDOW_MS=2000" \
+    -e "ORCH_TURN_FOLLOWUP_WINDOW_MS=2000" \
     -e "ORCH_WAKE_BARGE_IN=false"
 
 echo

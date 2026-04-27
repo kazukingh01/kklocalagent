@@ -110,31 +110,42 @@ pub struct TtsConfig {
 
 /// Wake-word gating policy. Controls whether SpeechEnded events
 /// trigger the ASR→LLM→TTS pipeline based on prior WakeWordDetected
-/// events. v1.0 default; set `required=false` to fall back to v0.1
-/// always-listening mode (every SpeechEnded triggers).
+/// events, and how long the operator has to start speaking.
+///
+/// State machine (v1.0):
+///   - Wake event arms a `wake_window_ms` window for SpeechStarted.
+///   - SpeechStarted within the window → Listening (no timeout) →
+///     SpeechEnded → run pipeline.
+///   - When the pipeline finishes, a separate `turn_followup_window_ms`
+///     window opens for the *next* SpeechStarted (follow-up question
+///     without re-saying the wake word).
+///   - Either window expiring → back to Idle (re-wake required).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct WakeConfig {
-    /// When true, only SpeechEnded events that arrive within
-    /// `arm_window_ms` of a WakeWordDetected event run the pipeline.
-    /// Other SpeechEnded events are dropped with a log line. When
-    /// false the orchestrator runs in always-listening mode (v0.1
-    /// behaviour) — useful for headless tests and noisy debug
-    /// sessions where saying the wake word is impractical.
+    /// When true, the wake state machine is active. When false the
+    /// orchestrator runs in v0.1 always-listening mode (every
+    /// SpeechEnded triggers the pipeline regardless of state).
     pub required: bool,
-    /// How long after a WakeWordDetected to accept SpeechEnded, in
-    /// milliseconds. Refreshed on every WakeWordDetected. The window
-    /// is consumed (single-use) the first time SpeechEnded fires
-    /// inside it — subsequent SpeechEnded events require another
-    /// wake.
-    pub arm_window_ms: u64,
+    /// Window after a WakeWordDetected during which a SpeechStarted
+    /// must arrive, in milliseconds. After this expires without a
+    /// SpeechStarted, the state returns to Idle and the operator
+    /// must say the wake word again.
+    pub wake_window_ms: u64,
+    /// Window after a Turn completes (TTS end / ASR-empty / LLM-error
+    /// — any natural pipeline exit) during which a follow-up
+    /// SpeechStarted is accepted without a fresh wake word. Lets the
+    /// operator continue a conversation without re-priming each
+    /// utterance. After this expires the state returns to Idle.
+    pub turn_followup_window_ms: u64,
     /// When true, a WakeWordDetected event arriving while the
     /// pipeline is `Processing` (ASR / LLM / TTS in flight) cancels
-    /// the in-flight TTS via `tts.stop_url`, transitions back to
-    /// `Armed`, and accepts the next utterance — the operator
-    /// interrupting the assistant. When false, mid-turn wake events
-    /// still arm the next window but don't interrupt the current
-    /// reply.
+    /// the in-flight TTS via `tts.stop_url`, transitions to
+    /// `ArmedAfterWake`, and accepts the next utterance — the
+    /// operator interrupting the assistant. When false, mid-turn
+    /// wake events instead defer to "the *next* state after the
+    /// current turn ends should be ArmedAfterWake (5 s)" — the
+    /// current reply finishes uninterrupted.
     pub barge_in: bool,
 }
 
@@ -184,14 +195,20 @@ impl Default for TtsConfig {
 
 impl Default for WakeConfig {
     fn default() -> Self {
-        // v1.0 defaults: gated on wake, 8 s window, barge-in on.
-        // arm_window_ms = 8 s gives a natural pause for the user to
-        // collect their thoughts after saying the wake word and still
-        // tightly bounds the "false-positive whisper hallucination on
-        // background noise" failure mode that v0.1 exhibits.
+        // v1.0 defaults: gated on wake, 5 s post-wake window, 10 s
+        // post-turn follow-up window, barge-in on.
+        //
+        // 5 s after wake reflects the natural cadence of "say
+        // 'alexa', then start the question" — long enough for a
+        // breath, short enough to bound whisper-hallucination noise.
+        //
+        // 10 s after turn lets the operator keep the conversation
+        // going without re-priming, but expires quickly enough that
+        // ambient noise stops triggering once they've moved on.
         Self {
             required: true,
-            arm_window_ms: 8_000,
+            wake_window_ms: 5_000,
+            turn_followup_window_ms: 10_000,
             barge_in: true,
         }
     }
@@ -238,8 +255,13 @@ impl Config {
                 anyhow::bail!("tts.max_inflight must be >= 1 when url is set");
             }
         }
-        if self.wake.required && self.wake.arm_window_ms == 0 {
-            anyhow::bail!("wake.arm_window_ms must be >= 1 when wake.required is true");
+        if self.wake.required {
+            if self.wake.wake_window_ms == 0 {
+                anyhow::bail!("wake.wake_window_ms must be >= 1 when wake.required is true");
+            }
+            if self.wake.turn_followup_window_ms == 0 {
+                anyhow::bail!("wake.turn_followup_window_ms must be >= 1 when wake.required is true");
+            }
         }
         if !self.result_sink.url.is_empty() && self.result_sink.timeout_ms == 0 {
             anyhow::bail!("result_sink.timeout_ms must be >= 1 when url is set");

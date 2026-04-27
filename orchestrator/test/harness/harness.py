@@ -52,10 +52,12 @@ LLM_PORT = 9200
 TTS_PORT = 9300
 SINK_PORT = 9400
 
-# Strict orchestrator's arm window (must agree with test.sh's
-# ORCH_WAKE_ARM_WINDOW_MS for the strict flavor). Used by the
-# expiry test to know how long to sleep.
-ARM_WINDOW_MS = 2000
+# Strict orchestrator's two windows (must agree with test.sh's
+# ORCH_WAKE_WINDOW_MS / ORCH_TURN_FOLLOWUP_WINDOW_MS for the strict
+# flavor). Used by the "window expires" scenarios to know how long
+# to sleep before the next event.
+WAKE_WINDOW_MS = 2000
+TURN_FOLLOWUP_WINDOW_MS = 2000
 
 # How long to wait after POSTing to /events before reading mock
 # counters. The orchestrator returns 200 immediately and runs the
@@ -434,37 +436,87 @@ async def strict_se_during_turn_dropped(
     expect(len(mocks.tts_speak_calls), 1, "TTS speak (mid-turn SE dropped)")
 
 
-async def strict_arm_is_single_use(
+async def strict_followup_within_window_dispatches(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
-    """One wake event grants ONE turn. A second SpeechEnded right
-    after — without a fresh wake — must be dropped."""
+    """After a Turn ends, the next SpeechEnded within
+    `turn_followup_window_ms` must dispatch a *second* full pipeline
+    run *without* a fresh wake — that's the v1.0 follow-up
+    semantics. (Replaces the v0.x "single-use arm" scenario which
+    expected the second SE to be dropped.)"""
     mocks.reset()
     await post_event(session, orch, wake_word_detected())
     await post_event(session, orch, vad_speech_ended())
-    # Let the first turn drain so we test the single-use property in
-    # isolation — not "Processing state blocks the second SE".
+    # Let the first turn drain so state transitions Processing →
+    # ArmedAfterTurn (the test fixture window is 2 s — plenty).
     await asyncio.sleep(SETTLE_SEC)
+    # Now in ArmedAfterTurn. A SpeechEnded *without* a fresh wake
+    # should still dispatch via the follow-up window.
     await post_event(session, orch, vad_speech_ended())
     await asyncio.sleep(SETTLE_SEC)
-    expect(len(mocks.asr_calls), 1, "ASR (single-use arm)")
-    expect(len(mocks.llm_calls), 1, "LLM (single-use arm)")
+    expect(len(mocks.asr_calls), 2, "ASR (follow-up dispatched)")
+    expect(len(mocks.llm_calls), 2, "LLM (follow-up dispatched)")
+    expect(len(mocks.tts_speak_calls), 2, "TTS (follow-up dispatched)")
 
 
-async def strict_arm_window_expires(
+async def strict_followup_window_expires(
+    session: aiohttp.ClientSession, orch: str, mocks: Mocks
+) -> None:
+    """If no SpeechEnded arrives within
+    `turn_followup_window_ms` of a turn ending, the state returns
+    to Idle and the next SE is dropped (operator must re-wake)."""
+    mocks.reset()
+    await post_event(session, orch, wake_word_detected())
+    await post_event(session, orch, vad_speech_ended())
+    await asyncio.sleep(SETTLE_SEC)  # turn drains → ArmedAfterTurn
+    # Sleep past the turn-followup window.
+    await asyncio.sleep(TURN_FOLLOWUP_WINDOW_MS / 1000.0 + 0.5)
+    await post_event(session, orch, vad_speech_ended())
+    await asyncio.sleep(SETTLE_SEC)
+    expect(len(mocks.asr_calls), 1, "ASR (follow-up window expired)")
+    expect(len(mocks.llm_calls), 1, "LLM (follow-up window expired)")
+
+
+async def strict_wake_during_followup_resets_to_armed_after_wake(
+    session: aiohttp.ClientSession, orch: str, mocks: Mocks
+) -> None:
+    """A WakeWordDetected during the post-turn follow-up window
+    transitions state back to ArmedAfterWake (resetting the timer
+    to wake_window_ms). Spec: "B 中の WWD は A に遷移".
+
+    Observable consequence: a second wake mid-followup must still
+    forward to sink, and the next SpeechEnded must dispatch via the
+    refreshed window. We don't directly observe "which window was
+    used", but we *do* observe that wake_calls_to_sink increments
+    and the dispatch succeeds."""
+    mocks.reset()
+    await post_event(session, orch, wake_word_detected())
+    await post_event(session, orch, vad_speech_ended())
+    await asyncio.sleep(SETTLE_SEC)  # ArmedAfterTurn
+    # A second wake during ArmedAfterTurn → ArmedAfterWake.
+    await post_event(session, orch, wake_word_detected())
+    await post_event(session, orch, vad_speech_ended())
+    await asyncio.sleep(SETTLE_SEC)
+    expect(len(mocks.asr_calls), 2, "ASR (wake-during-followup re-arms)")
+    wakes = sum(1 for s in mocks.sink_calls if s["name"] == "WakeWordDetected")
+    expect(wakes, 2, "sink WakeWordDetected (both wakes forwarded)")
+
+
+async def strict_wake_window_expires(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
     """A wake that's gone stale by the time SpeechEnded arrives must
     not dispatch — the user said the wake word, then went silent
     long enough that we shouldn't trust the next noise as "the
-    intended utterance"."""
+    intended utterance". Specifically tests the post-wake window
+    (5 s default; test fixture sets 2 s)."""
     mocks.reset()
     await post_event(session, orch, wake_word_detected())
-    await asyncio.sleep(ARM_WINDOW_MS / 1000.0 + 1.0)
+    await asyncio.sleep(WAKE_WINDOW_MS / 1000.0 + 0.5)
     await post_event(session, orch, vad_speech_ended())
     await asyncio.sleep(SETTLE_SEC)
-    expect(len(mocks.asr_calls), 0, "ASR (window expired)")
-    expect(len(mocks.llm_calls), 0, "LLM (window expired)")
+    expect(len(mocks.asr_calls), 0, "ASR (wake window expired)")
+    expect(len(mocks.llm_calls), 0, "LLM (wake window expired)")
 
 
 async def strict_wake_always_to_sink(
@@ -785,8 +837,10 @@ GROUPS: dict[str, list[tuple[str, Test]]] = {
         ("system prompt prepended as {role:'system'}", strict_system_prompt_prepended),
         ("happy path: wake → SE → full pipeline", strict_happy_path),
         ("SE during in-flight turn is dropped", strict_se_during_turn_dropped),
-        ("arm is single-use (2nd SE without re-wake dropped)", strict_arm_is_single_use),
-        ("arm window expires", strict_arm_window_expires),
+        ("follow-up SE within turn window dispatches", strict_followup_within_window_dispatches),
+        ("turn-followup window expires", strict_followup_window_expires),
+        ("wake during follow-up resets to wake-window", strict_wake_during_followup_resets_to_armed_after_wake),
+        ("wake window expires", strict_wake_window_expires),
         ("WakeWordDetected always forwarded to sink", strict_wake_always_to_sink),
         ("barge-in during ASR aborts pipeline", strict_barge_in_during_asr_aborts),
         ("barge-in during LLM aborts pipeline", strict_barge_in_during_llm_aborts),
