@@ -28,7 +28,7 @@ use tracing::{info, warn};
 use crate::config::Config;
 use crate::events::EventEnvelope;
 use crate::pipeline::{self, forward_to_result_sink, tts_stop, Backends};
-use crate::state::{WakeMachine, WakeResult};
+use crate::state::{DispatchOutcome, WakeMachine, WakeResult};
 
 #[derive(Clone)]
 struct AppState {
@@ -93,36 +93,77 @@ async fn events(
 
     match ev.name.as_str() {
         "SpeechStarted" => {
-            // Logged for observability. Doesn't affect state — the
-            // wake machine waits for SpeechEnded (the utterance is
-            // useless until it's complete).
-            info!(
-                target: "orch::events",
-                frame_index = ?ev.frame_index,
-                "speech started"
-            );
+            // SpeechStarted is informational — the utterance audio
+            // isn't here yet, so the wake machine doesn't transition.
+            // We still distinguish "passed through" vs "dropped
+            // because a turn is in flight" so production logs make
+            // it obvious which VAD frames were intentionally ignored.
+            // Drop logs share the structured `event="..."` and
+            // `reason="..."` fields with SpeechEnded drops below so
+            // a single `grep 'orch::events.*reason='` lifts every
+            // dropped event regardless of type.
+            if state.wake.is_in_turn() {
+                warn!(
+                    target: "orch::events",
+                    event = "SpeechStarted",
+                    reason = "in_turn",
+                    frame_index = ?ev.frame_index,
+                    ts = ?ev.ts,
+                    "VAD event dropped: turn in progress"
+                );
+            } else {
+                info!(
+                    target: "orch::events",
+                    frame_index = ?ev.frame_index,
+                    "speech started"
+                );
+            }
         }
         "SpeechEnded" => {
             if !ev.has_utterance_audio() {
-                info!(
+                warn!(
                     target: "orch::events",
-                    "SpeechEnded without audio_base64 — skipping pipeline"
+                    event = "SpeechEnded",
+                    reason = "no_audio",
+                    ts = ?ev.ts,
+                    "VAD event dropped: missing audio_base64"
                 );
             } else {
-                // Wake gate: drop SpeechEnded events that don't follow
-                // a recent WakeWordDetected. Logged at info (not warn)
-                // because dropping is the *normal* path for
-                // background-noise utterances in v1.0.
+                // Wake gate: drop SpeechEnded events that don't pass
+                // the gate. Each outcome is logged with a distinct
+                // `reason=` so a particular dropped utterance can be
+                // traced to the exact branch.
                 match state.wake.try_dispatch() {
-                    Some(guard) => {
+                    DispatchOutcome::Run(guard) => {
                         if let Err(e) = dispatch_utterance(&state, &ev, guard) {
                             warn!(target: "orch::events", "dispatch failed: {e:#}");
                         }
                     }
-                    None => {
-                        info!(
+                    DispatchOutcome::NotArmed => {
+                        warn!(
                             target: "orch::events",
-                            "SpeechEnded dropped: not armed (say the wake word first, or set wake.required=false)"
+                            event = "SpeechEnded",
+                            reason = "not_armed",
+                            ts = ?ev.ts,
+                            "VAD event dropped: no recent WakeWordDetected (say the wake word first, or set wake.required=false)"
+                        );
+                    }
+                    DispatchOutcome::InTurn => {
+                        warn!(
+                            target: "orch::events",
+                            event = "SpeechEnded",
+                            reason = "in_turn",
+                            ts = ?ev.ts,
+                            "VAD event dropped: turn in progress"
+                        );
+                    }
+                    DispatchOutcome::ArmExpired => {
+                        warn!(
+                            target: "orch::events",
+                            event = "SpeechEnded",
+                            reason = "arm_expired",
+                            ts = ?ev.ts,
+                            "VAD event dropped: arm window expired"
                         );
                     }
                 }

@@ -79,6 +79,28 @@ pub struct ProcessingGuard {
     machine: Arc<WakeMachine>,
 }
 
+/// Outcome of `WakeMachine::try_dispatch`. The variants distinguish
+/// the *reason* a SpeechEnded was rejected so the caller can log
+/// each case under its own message — important for diagnosing why
+/// a particular utterance was dropped (whisper-hallucination noise
+/// vs. spoken-while-still-replying vs. arm window timed out).
+pub enum DispatchOutcome {
+    /// Accept the SpeechEnded and run the pipeline. Caller holds the
+    /// guard for the duration of the turn.
+    Run(ProcessingGuard),
+    /// Wake gate is empty: no recent WakeWordDetected. Drop silently
+    /// (this is the normal path for noise / hallucinations under
+    /// `wake.required=true`).
+    NotArmed,
+    /// A turn is already in flight. Drop without disturbing the
+    /// current Turn — wake-during-Processing is what triggers
+    /// barge-in instead, via on_wake().
+    InTurn,
+    /// A wake word was received recently but more than `arm_window_ms`
+    /// ago. Drop and reset to Idle.
+    ArmExpired,
+}
+
 impl Drop for ProcessingGuard {
     fn drop(&mut self) {
         self.machine.complete();
@@ -137,15 +159,15 @@ impl WakeMachine {
     }
 
     /// React to a SpeechEnded event with utterance audio. Returns
-    /// `Some(ProcessingGuard)` if the caller should run the pipeline,
-    /// `None` if the event should be dropped (Idle, or arm window
-    /// expired). The guard's `Drop` releases the state back to Idle.
-    pub fn try_dispatch(self: &Arc<Self>) -> Option<ProcessingGuard> {
+    /// `DispatchOutcome::Run(guard)` when the caller should run the
+    /// pipeline, or one of three drop reasons. The guard's `Drop`
+    /// releases the state back to Idle on turn completion.
+    pub fn try_dispatch(self: &Arc<Self>) -> DispatchOutcome {
         if !self.required {
             // Always-listening: no Processing state. Each turn is
             // independent; the guard's complete() is a no-op in this
             // mode (see `complete`).
-            return Some(ProcessingGuard { machine: self.clone() });
+            return DispatchOutcome::Run(ProcessingGuard { machine: self.clone() });
         }
         let mut g = self.inner.lock().expect("wake state poisoned");
         let now = Instant::now();
@@ -153,16 +175,31 @@ impl WakeMachine {
             (Phase::Armed, Some(t)) if t > now => {
                 g.phase = Phase::Processing;
                 g.armed_until = None;
-                Some(ProcessingGuard { machine: self.clone() })
+                DispatchOutcome::Run(ProcessingGuard { machine: self.clone() })
             }
             (Phase::Armed, _) => {
                 // Window expired between wake and SpeechEnded. Reset.
                 g.phase = Phase::Idle;
                 g.armed_until = None;
-                None
+                DispatchOutcome::ArmExpired
             }
-            _ => None,
+            (Phase::Processing, _) => DispatchOutcome::InTurn,
+            (Phase::Idle, _) => DispatchOutcome::NotArmed,
         }
+    }
+
+    /// Whether a turn is currently being processed. Used by the
+    /// SpeechStarted handler to log "ignored — turn in progress"
+    /// instead of the regular "speech started", so the operator can
+    /// see at a glance which VAD frames the orchestrator deliberately
+    /// passed over. No-op when `required=false` — without the gate
+    /// there's no Processing phase to be in.
+    pub fn is_in_turn(&self) -> bool {
+        if !self.required {
+            return false;
+        }
+        let g = self.inner.lock().expect("wake state poisoned");
+        g.phase == Phase::Processing
     }
 
     /// Called from ProcessingGuard::drop. Transitions Processing →
@@ -193,23 +230,35 @@ mod tests {
         Arc::new(WakeMachine::new(&c))
     }
 
+    fn run_guard(o: DispatchOutcome) -> Option<ProcessingGuard> {
+        match o {
+            DispatchOutcome::Run(g) => Some(g),
+            _ => None,
+        }
+    }
+
+    fn is_run(o: &DispatchOutcome) -> bool {
+        matches!(o, DispatchOutcome::Run(_))
+    }
+
     #[test]
     fn idle_drops_speech_ended() {
         let m = mk(cfg(true, 1000, true));
-        assert!(m.try_dispatch().is_none());
+        assert!(matches!(m.try_dispatch(), DispatchOutcome::NotArmed));
     }
 
     #[test]
     fn wake_then_speech_dispatches_then_idles() {
         let m = mk(cfg(true, 1000, true));
         assert_eq!(m.on_wake(), WakeResult::Armed);
-        let permit = m.try_dispatch();
+        let permit = run_guard(m.try_dispatch());
         assert!(permit.is_some());
-        // Second SpeechEnded without another wake: dropped.
-        assert!(m.try_dispatch().is_none());
+        // Second SpeechEnded without another wake while still
+        // Processing → InTurn drop (distinct from NotArmed).
+        assert!(matches!(m.try_dispatch(), DispatchOutcome::InTurn));
         drop(permit);
-        // After turn completes: still idle, next SpeechEnded dropped.
-        assert!(m.try_dispatch().is_none());
+        // After turn completes: back to Idle, next SE dropped as NotArmed.
+        assert!(matches!(m.try_dispatch(), DispatchOutcome::NotArmed));
     }
 
     #[test]
@@ -217,7 +266,7 @@ mod tests {
         let m = mk(cfg(true, 1, true)); // 1 ms window
         assert_eq!(m.on_wake(), WakeResult::Armed);
         std::thread::sleep(Duration::from_millis(10));
-        assert!(m.try_dispatch().is_none());
+        assert!(matches!(m.try_dispatch(), DispatchOutcome::ArmExpired));
     }
 
     #[test]
@@ -225,15 +274,15 @@ mod tests {
         let m = mk(cfg(false, 1000, true));
         assert_eq!(m.on_wake(), WakeResult::Bypass);
         // No wake needed.
-        assert!(m.try_dispatch().is_some());
-        assert!(m.try_dispatch().is_some());
+        assert!(is_run(&m.try_dispatch()));
+        assert!(is_run(&m.try_dispatch()));
     }
 
     #[test]
     fn barge_in_returns_bargein_during_processing() {
         let m = mk(cfg(true, 1000, true));
         m.on_wake();
-        let _permit = m.try_dispatch().unwrap();
+        let _permit = run_guard(m.try_dispatch()).unwrap();
         // Processing now. Wake again:
         assert_eq!(m.on_wake(), WakeResult::BargeIn);
     }
@@ -242,7 +291,7 @@ mod tests {
     fn no_barge_in_returns_armedbusy_during_processing() {
         let m = mk(cfg(true, 1000, false));
         m.on_wake();
-        let _permit = m.try_dispatch().unwrap();
+        let _permit = run_guard(m.try_dispatch()).unwrap();
         assert_eq!(m.on_wake(), WakeResult::ArmedBusy);
     }
 
@@ -250,10 +299,32 @@ mod tests {
     fn turn_completion_returns_to_idle() {
         let m = mk(cfg(true, 1000, true));
         m.on_wake();
-        let permit = m.try_dispatch().unwrap();
+        let permit = run_guard(m.try_dispatch()).unwrap();
         drop(permit);
         // New wake → arm again; the next dispatch should succeed.
         m.on_wake();
-        assert!(m.try_dispatch().is_some());
+        assert!(is_run(&m.try_dispatch()));
+    }
+
+    #[test]
+    fn is_in_turn_tracks_processing_phase() {
+        let m = mk(cfg(true, 1000, true));
+        assert!(!m.is_in_turn(), "Idle");
+        m.on_wake();
+        assert!(!m.is_in_turn(), "Armed");
+        let permit = run_guard(m.try_dispatch()).unwrap();
+        assert!(m.is_in_turn(), "Processing");
+        drop(permit);
+        assert!(!m.is_in_turn(), "Idle after turn");
+    }
+
+    #[test]
+    fn is_in_turn_false_in_loose_mode() {
+        // required=false bypasses the gate entirely; there's no
+        // Processing phase, so is_in_turn always reports false even
+        // while a notional turn is running.
+        let m = mk(cfg(false, 1000, true));
+        let _permit = run_guard(m.try_dispatch()).unwrap();
+        assert!(!m.is_in_turn());
     }
 }

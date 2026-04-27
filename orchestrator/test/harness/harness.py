@@ -363,6 +363,41 @@ async def strict_happy_path(
         raise AssertionError(f"sink saw {sink_names}")
 
 
+async def strict_se_during_turn_dropped(
+    session: aiohttp.ClientSession, orch: str, mocks: Mocks
+) -> None:
+    """A second SpeechEnded that arrives WHILE the previous turn is
+    still mid-pipeline must be dropped (no second ASR/LLM/TTS run).
+    Distinct from `arm_is_single_use`: that one tests "after the turn
+    finishes, the arm is consumed"; this one tests "during the turn
+    the gate refuses everything regardless of arm state". The mock
+    TTS holds /speak open via speak_blocks so we can observe the
+    Processing phase deterministically."""
+    mocks.reset()
+    mocks.speak_blocks = True
+
+    await post_event(session, orch, wake_word_detected())
+    await post_event(session, orch, vad_speech_ended())
+    try:
+        await asyncio.wait_for(mocks.speak_in_progress.wait(), timeout=3.0)
+    except asyncio.TimeoutError:
+        raise AssertionError("TTS /speak never entered the blocking phase")
+
+    # Now the orchestrator is in Processing. Send another SE.
+    # Even with no fresh wake the second SE goes into the gate, which
+    # must return InTurn (drop without affecting the running turn).
+    await post_event(session, orch, vad_speech_ended())
+
+    # Release the held /speak so the original turn finishes cleanly.
+    mocks.speak_release.set()
+    await asyncio.sleep(SETTLE_SEC)
+
+    # Exactly one of each — the second SE was dropped.
+    expect(len(mocks.asr_calls), 1, "ASR (mid-turn SE dropped)")
+    expect(len(mocks.llm_calls), 1, "LLM (mid-turn SE dropped)")
+    expect(len(mocks.tts_speak_calls), 1, "TTS speak (mid-turn SE dropped)")
+
+
 async def strict_arm_is_single_use(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
@@ -648,6 +683,7 @@ GROUPS: dict[str, list[tuple[str, Test]]] = {
         ("drop SE without wake", strict_drop_se_without_wake),
         ("system prompt prepended as {role:'system'}", strict_system_prompt_prepended),
         ("happy path: wake → SE → full pipeline", strict_happy_path),
+        ("SE during in-flight turn is dropped", strict_se_during_turn_dropped),
         ("arm is single-use (2nd SE without re-wake dropped)", strict_arm_is_single_use),
         ("arm window expires", strict_arm_window_expires),
         ("WakeWordDetected always forwarded to sink", strict_wake_always_to_sink),

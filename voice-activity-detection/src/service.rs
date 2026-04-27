@@ -7,7 +7,7 @@ use futures_util::StreamExt;
 use serde::Serialize;
 use tokio::sync::Semaphore;
 use tokio_tungstenite::tungstenite::protocol::Message;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use webrtc_vad::{SampleRate, Vad, VadMode};
 
 use crate::config::{Config, DiagConfig, SinkMode};
@@ -59,7 +59,11 @@ impl Diag {
             let mean_sq = self.sum_of_frame_mean_sq as f64 / self.frames as f64;
             let rms = mean_sq.sqrt() as u32;
             let ratio = self.voiced as f32 / self.frames as f32;
-            info!(
+            // Debug-level: a per-second summary line is too chatty
+            // for production INFO. Operators investigating false
+            // triggers can re-enable it via
+            // `RUST_LOG=info,vad::diag=debug`.
+            debug!(
                 target: "vad::diag",
                 "[diag] rms={rms} speech_ratio={ratio:.2} ({}/{} voiced)",
                 self.voiced,
