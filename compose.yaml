@@ -198,9 +198,14 @@ services:
       WW_SINK_MODE: orchestrator
       WW_ORCHESTRATOR_URL: http://orchestrator:7000/events
       WW_MODELS: alexa
-      WW_THRESHOLD: "0.5"
+      WW_THRESHOLD: "${WW_THRESHOLD:-0.5}"
       WW_COOLDOWN_SEC: "2.0"
       WW_INFERENCE_FRAMEWORK: tflite
+      # Diagnostic: when > 0, log the peak score seen in each window
+      # so the operator can tune WW_THRESHOLD. Off (0) by default.
+      # Set to e.g. 5.0 in .env to see "what scores my voice is
+      # producing" without changing the source code.
+      WW_PEAK_LOG_INTERVAL_SEC: "${WW_PEAK_LOG_INTERVAL_SEC:-0}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

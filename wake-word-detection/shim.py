@@ -62,6 +62,22 @@ class Shim:
         ]
         self.threshold = env_float("WW_THRESHOLD", 0.5)
         self.cooldown = env_float("WW_COOLDOWN_SEC", 2.0)
+        # Diagnostic: when > 0, periodically log the highest score
+        # observed in each window so the operator can tune
+        # `WW_THRESHOLD` based on actual mic / pronunciation /
+        # ambient-noise behaviour. Set to 0 (default) to keep the
+        # event-driven log cadence — the "wake never logs unless it
+        # fires" semantics that suits production but hides why a
+        # particular utterance didn't trigger. Typical values:
+        #   5.0 — light diagnostic during threshold tuning
+        #   1.0 — aggressive diagnostic for noisy mics
+        self.peak_log_interval = env_float("WW_PEAK_LOG_INTERVAL_SEC", 0.0)
+        # Floor below which peak-score logging is suppressed even when
+        # peak_log_interval is on; avoids spamming the log with the
+        # background-noise floor (~0.0–0.05 from openWakeWord's
+        # tflite alexa model). Voice that produces scores above this
+        # is interesting; below is treated as silence.
+        self.peak_log_floor = env_float("WW_PEAK_LOG_FLOOR", 0.05)
         self.framework = os.environ.get("WW_INFERENCE_FRAMEWORK", "tflite")
         self.port = env_int("WW_PORT", 7030)
         self.sink_mode = os.environ.get("WW_SINK_MODE", "orchestrator").lower()
@@ -75,6 +91,11 @@ class Shim:
         self.ws_connected = False
         self.last_fire_ts = 0.0
         self.buffer = bytearray()
+        # Per-window peak-score tracker for the diagnostic log path.
+        # Reset each time a window is logged.
+        self.peak_score = 0.0
+        self.peak_model = ""
+        self.last_peak_log_ts = 0.0
 
     def load_model(self) -> None:
         log.info(
@@ -130,6 +151,27 @@ class Shim:
             if best_score >= self.threshold:
                 self.last_fire_ts = now
                 asyncio.create_task(self.fire(best_name, float(best_score), now))
+
+            # Diagnostic: periodically surface the highest score seen
+            # within each window so the operator can tune
+            # WW_THRESHOLD against real-world scores. Off by default
+            # (peak_log_interval == 0) — production keeps the silent
+            # event-driven cadence; threshold tuning sessions enable
+            # via env.
+            if self.peak_log_interval > 0:
+                if best_score > self.peak_score:
+                    self.peak_score = float(best_score)
+                    self.peak_model = best_name
+                if (now - self.last_peak_log_ts) >= self.peak_log_interval:
+                    if self.peak_score >= self.peak_log_floor:
+                        log.info(
+                            "peak score over last %.1fs: model=%s score=%.3f (threshold=%.2f)",
+                            self.peak_log_interval, self.peak_model,
+                            self.peak_score, self.threshold,
+                        )
+                    self.peak_score = 0.0
+                    self.peak_model = ""
+                    self.last_peak_log_ts = now
 
     async def fire(self, name: str, score: float, ts: float) -> None:
         log.info("detected: model=%s score=%.3f", name, score)
