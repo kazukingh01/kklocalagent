@@ -17,6 +17,38 @@
 #       docker compose -f compose.yaml -f compose.cpu.yaml up -d --build
 
 services:
+  # First-run model bootstrap: the GPU default would download
+  # `large-v3-turbo` (~1.6 GB) which is wasted weight on a CPU host
+  # the user picked specifically because it can't run that. Override
+  # the *fallback* here so plain CPU runs grab the lighter
+  # small-q8_0 (~244 MB) instead. `ASR_MODEL=...` on the host still
+  # wins over both flavors.
+  asr-models:
+    environment:
+      ASR_MODEL: "${ASR_MODEL:-ggml-small-q8_0.bin}"
+
+  automatic-speech-recognition:
+    build:
+      # CPU build of whisper.cpp (no CUDA). Upstream publishes one
+      # image per backend; the GPU base picks `main-cuda`, we flip
+      # back to `main` so the image runs on hosts without an nvidia
+      # driver.
+      context: ./automatic-speech-recognition
+      args:
+        WHISPER_VARIANT: main
+    environment:
+      # Must agree with `asr-models.environment.ASR_MODEL` above —
+      # whisper-server names the model file when loading, so a
+      # mismatch here would fail to mmap (or load the wrong weights).
+      # `WHISPER_MODEL` is what the runtime container reads; the
+      # bootstrap volume is shared, so both must resolve to the same
+      # filename.
+      WHISPER_MODEL: "${ASR_MODEL:-ggml-small-q8_0.bin}"
+    # Drop the GPU reservation from the merged config — same `!reset`
+    # pattern as `llm` below; without it the container won't start
+    # on hosts without an nvidia runtime.
+    deploy: !reset null
+
   llm:
     environment:
       # Lighter default for CPU. Same env knob as the GPU base, so

@@ -30,7 +30,7 @@
 # against). YAML anchors don't expand env vars themselves, so we route
 # through `${...}` and reuse the resulting string via the anchor.
 x-llm-model: &llm-model "${LLM_MODEL:-gemma3:4b}"
-x-asr-model: &asr-model "${ASR_MODEL:-ggml-small-q8_0.bin}"
+x-asr-model: &asr-model "${ASR_MODEL:-ggml-large-v3-turbo-q8_0.bin}"
 
 services:
   # --- model bootstrap -----------------------------------------------
@@ -94,6 +94,12 @@ services:
   automatic-speech-recognition:
     build:
       context: ./automatic-speech-recognition
+      args:
+        # CUDA build of whisper.cpp. Upstream publishes one image per
+        # backend (`main`, `main-cuda`, `main-musa`, `main-intel`); we
+        # pick at build time. The CPU override flips this back to
+        # `main` so the image runs on hosts without an nvidia driver.
+        WHISPER_VARIANT: main-cuda
     container_name: kklocalagent-asr
     restart: unless-stopped
     depends_on:
@@ -106,6 +112,13 @@ services:
       WHISPER_LANGUAGE: ja
     ports:
       - "7040:8080"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
   llm:
     build:
