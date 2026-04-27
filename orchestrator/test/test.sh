@@ -106,11 +106,35 @@ run_phase() {
     return 1
   fi
 
-  # Drive the test cases. The harness exits non-zero on any failure
-  # within the flavor; `set -e` propagates that to test.sh.
-  docker exec "$HARNESS_NAME" python /app/harness.py \
+  # Stream orchestrator container stdout in parallel with the harness
+  # driver so both log streams appear interleaved on this script's
+  # stdout in real time. Each line is prefixed with the source so a
+  # mixed dump remains readable:
+  #   [orch]    INFO orch::events: received event name=...
+  #   [harness] PASS: ...
+  # `sed -u` (unbuffered) and `python -u` are required — without
+  # them stdio block-buffering when piped delays output by hundreds
+  # of ms, which defeats "see what happened in real time".
+  (docker logs -f "$ORCH_NAME" 2>&1 | sed -u 's/^/[orch]    /') &
+  local log_pid=$!
+
+  local exit_code=0
+  # `set -o pipefail` (set at the top of the script) makes the pipe
+  # exit non-zero when docker exec fails, even though sed succeeds.
+  # `|| exit_code=$?` captures that without tripping `set -e`.
+  docker exec "$HARNESS_NAME" python -u /app/harness.py \
       --orch-url "http://${ORCH_NAME}:7000" \
-      --flavor "$flavor"
+      --flavor "$flavor" 2>&1 \
+      | sed -u 's/^/[harness] /' \
+      || exit_code=$?
+
+  # Stop the orch log follower before the next phase replaces the
+  # container — otherwise the bg sed keeps writing into the new
+  # container's logs and the prefixes lose their flavor context.
+  kill "$log_pid" 2>/dev/null || true
+  wait "$log_pid" 2>/dev/null || true
+
+  return $exit_code
 }
 
 # v1.0 default: wake-gated, 2 s arm window, barge-in on. Most of the
