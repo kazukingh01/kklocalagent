@@ -29,6 +29,10 @@ struct Args {
     #[arg(long, env = "ORCH_LLM_MODEL")]
     llm_model: Option<String>,
 
+    /// Override `llm.system_prompt`. Empty disables the system message.
+    #[arg(long, env = "ORCH_LLM_SYSTEM_PROMPT")]
+    llm_system_prompt: Option<String>,
+
     /// Override `tts.url`. Empty disables the TTS stage.
     #[arg(long, env = "ORCH_TTS_URL")]
     tts_url: Option<String>,
@@ -78,6 +82,9 @@ async fn main() -> Result<()> {
     }
     if let Some(v) = args.llm_model {
         config.llm.model = v;
+    }
+    if let Some(v) = args.llm_system_prompt {
+        config.llm.system_prompt = v;
     }
     if let Some(v) = args.tts_url {
         config.tts.url = v;

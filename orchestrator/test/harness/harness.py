@@ -302,6 +302,34 @@ async def strict_drop_se_without_wake(
     expect(len(mocks.sink_calls), 0, "sink (no wake)")
 
 
+async def strict_system_prompt_prepended(
+    session: aiohttp.ClientSession, orch: str, mocks: Mocks
+) -> None:
+    """When ORCH_LLM_SYSTEM_PROMPT is set, the orchestrator must
+    prepend a {role:"system"} message before the user turn. Verifies
+    role, content, and order — catches regressions where the system
+    message slot ends up after `user` (some clients do this and the
+    LLM ignores it) or with the wrong role string."""
+    mocks.reset()
+    await post_event(session, orch, wake_word_detected())
+    await post_event(session, orch, vad_speech_ended())
+    await asyncio.sleep(SETTLE_SEC)
+    expect(len(mocks.llm_calls), 1, "LLM")
+    msgs = mocks.llm_calls[0]["messages"]
+    if len(msgs) != 2:
+        raise AssertionError(f"messages: expected 2 (system+user), got {len(msgs)}: {msgs}")
+    if msgs[0].get("role") != "system":
+        raise AssertionError(f"messages[0].role: expected 'system', got {msgs[0].get('role')!r}")
+    if not msgs[0].get("content"):
+        raise AssertionError("messages[0].content is empty — system_prompt didn't propagate")
+    if msgs[1].get("role") != "user":
+        raise AssertionError(f"messages[1].role: expected 'user', got {msgs[1].get('role')!r}")
+    if msgs[1].get("content") != mocks.asr_text:
+        raise AssertionError(
+            f"messages[1].content: expected ASR text {mocks.asr_text!r}, got {msgs[1].get('content')!r}"
+        )
+
+
 async def strict_happy_path(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
@@ -618,6 +646,7 @@ async def no_barge_mid_turn_wake_does_not_cancel(
 GROUPS: dict[str, list[tuple[str, Test]]] = {
     "strict": [
         ("drop SE without wake", strict_drop_se_without_wake),
+        ("system prompt prepended as {role:'system'}", strict_system_prompt_prepended),
         ("happy path: wake → SE → full pipeline", strict_happy_path),
         ("arm is single-use (2nd SE without re-wake dropped)", strict_arm_is_single_use),
         ("arm window expires", strict_arm_window_expires),

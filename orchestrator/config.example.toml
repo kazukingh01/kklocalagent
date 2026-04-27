@@ -22,6 +22,12 @@ max_inflight = 1
 url = "http://llm:11434/api/chat"
 # Must match a model pulled by the llm module (see llm/init.sh).
 model = "gemma3:4b"
+# Optional: prepended as {role:"system"} on every chat request.
+# Empty (the default) → no system message; the LLM sees only the
+# user turn. ollama normalises this to whatever chat template the
+# loaded model uses, so the same string works across gemma3 / llama3
+# / qwen / deepseek without per-model branching.
+system_prompt = ""
 # gemma3:4b on CPU can take a while on long prompts; 120 s is generous.
 timeout_ms = 120000
 max_inflight = 1

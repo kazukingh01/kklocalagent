@@ -43,6 +43,12 @@ ORCH_BASE_ENV=(
   -e "ORCH_ASR_URL=http://${HARNESS_NAME}:9100/inference"
   -e "ORCH_LLM_URL=http://${HARNESS_NAME}:9200/api/chat"
   -e "ORCH_LLM_MODEL=mock"
+  # Short fixed prompt for the test — production uses the longer
+  # voice-assistant persona via compose. The harness's
+  # `system_prompt_prepended` scenario only checks that *some* non-
+  # empty system content reaches the LLM in role:"system" before the
+  # user turn, so the exact text doesn't matter.
+  -e "ORCH_LLM_SYSTEM_PROMPT=You are a test assistant."
   -e "ORCH_TTS_URL=http://${HARNESS_NAME}:9300/speak"
   -e "ORCH_TTS_STOP_URL=http://${HARNESS_NAME}:9300/stop"
   -e "ORCH_RESULT_SINK_URL=http://${HARNESS_NAME}:9400/sink"

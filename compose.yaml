@@ -220,6 +220,13 @@ services:
       ORCH_ASR_URL: http://automatic-speech-recognition:8080/inference
       ORCH_LLM_URL: http://llm:11434/api/chat
       ORCH_LLM_MODEL: *llm-model
+      # Voice-assistant persona — prepended to every chat as
+      # {role:"system"}. Tells the model its replies are spoken aloud
+      # (no markdown / lists), to keep responses short, default to
+      # Japanese, and maintain conversational rhythm. Override at
+      # boot via ORCH_LLM_SYSTEM_PROMPT in .env if the deployment
+      # wants a different persona / language.
+      ORCH_LLM_SYSTEM_PROMPT: "${ORCH_LLM_SYSTEM_PROMPT:-You are a voice assistant; your replies are spoken aloud, so write the way people speak — no markdown, no lists, no code blocks. Keep every response to one or two short sentences. Default to Japanese (日本語) unless the user clearly speaks another language. Maintain a brisk, natural conversational rhythm.}"
       ORCH_TTS_URL: http://tts-streamer:7070/speak
       ORCH_TTS_STOP_URL: http://tts-streamer:7070/stop
       # v1.0 wake gating. Override via .env (`ORCH_WAKE_REQUIRED=false`)

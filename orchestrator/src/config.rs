@@ -69,6 +69,13 @@ pub struct LlmConfig {
     /// Model name passed through to ollama (must exist in the LLM
     /// container's cache — see the `llm/` module).
     pub model: String,
+    /// Optional system prompt prepended as `{role: "system"}` to every
+    /// chat request. Empty (the default) → no system message is sent
+    /// and the request is a single user turn, matching v0.x behaviour.
+    /// Most production deployments want a non-empty value here so the
+    /// LLM knows it's responding through TTS (no markdown / short
+    /// answers / conversational rhythm).
+    pub system_prompt: String,
     /// HTTP timeout per chat POST, in milliseconds.
     pub timeout_ms: u64,
     /// Maximum simultaneous in-flight LLM chat requests.
@@ -154,6 +161,7 @@ impl Default for LlmConfig {
         Self {
             url: "http://llm:11434/api/chat".into(),
             model: "gemma3:4b".into(),
+            system_prompt: String::new(),
             timeout_ms: 120_000,
             max_inflight: 1,
         }

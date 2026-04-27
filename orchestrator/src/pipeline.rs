@@ -348,12 +348,24 @@ async fn asr_transcribe(backends: &Backends, wav: Vec<u8>) -> Result<String> {
 }
 
 async fn llm_chat(backends: &Backends, user_text: &str) -> Result<String> {
+    // Prepend system prompt when configured. ollama's /api/chat
+    // normalises {role:"system"} into the model's chat template
+    // regardless of which model is loaded — empty string here means
+    // "send only the user turn" (v0.x behaviour).
+    let mut messages = Vec::with_capacity(2);
+    if !backends.llm.system_prompt.is_empty() {
+        messages.push(ChatMessage {
+            role: "system",
+            content: &backends.llm.system_prompt,
+        });
+    }
+    messages.push(ChatMessage {
+        role: "user",
+        content: user_text,
+    });
     let body = ChatRequest {
         model: &backends.llm.model,
-        messages: vec![ChatMessage {
-            role: "user",
-            content: user_text,
-        }],
+        messages,
         stream: false,
     };
     let resp = backends
