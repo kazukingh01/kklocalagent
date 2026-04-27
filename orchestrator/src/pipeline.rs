@@ -23,6 +23,7 @@ use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 use crate::config::{AsrConfig, LlmConfig, ResultSinkConfig, TtsConfig};
+use crate::state::WakeMachine;
 
 /// Wrap a raw little-endian 16-bit mono PCM buffer in a 44-byte WAV
 /// header. Duplicated from voice-activity-detection's helper — the two
@@ -144,10 +145,24 @@ pub async fn forward_to_result_sink(backends: &Backends, payload: &serde_json::V
     }
 }
 
-/// Run one full SpeechEnded → ASR → LLM turn. Logs the assistant reply
-/// on success; logs and swallows errors at each stage so one bad
-/// utterance can't bring the service down.
-pub async fn run_turn(backends: Arc<Backends>, pcm: Vec<u8>, sample_rate: u32) {
+/// Run one full SpeechEnded → ASR → LLM → sink → TTS turn. Logs the
+/// assistant reply on success; logs and swallows errors at each stage
+/// so one bad utterance can't bring the service down.
+///
+/// Barge-in: between every stage, check `wake.pipeline_still_active()`. If a
+/// `WakeWordDetected` arrived mid-turn, on_wake() will have flipped
+/// the state from Processing → Armed, and we abort here — no further
+/// HTTP is sent to the downstream modules. The in-flight HTTP call
+/// of the *current* stage still completes (we don't cancel awaits
+/// mid-request), but the next module never sees the request. This
+/// satisfies the v1.0 spec: "after barge-in, downstream modules from
+/// the detection point onward receive no HTTP".
+pub async fn run_turn(
+    backends: Arc<Backends>,
+    wake: Arc<WakeMachine>,
+    pcm: Vec<u8>,
+    sample_rate: u32,
+) {
     // ASR stage
     let asr_permit = match backends.asr_inflight.clone().try_acquire_owned() {
         Ok(p) => p,
@@ -179,6 +194,11 @@ pub async fn run_turn(backends: Arc<Backends>, pcm: Vec<u8>, sample_rate: u32) {
     };
     drop(asr_permit);
 
+    if !wake.pipeline_still_active() {
+        info!(target: "orch::pipeline", "barge-in detected after ASR; aborting turn (LLM / sink / TTS skipped)");
+        return;
+    }
+
     if text.is_empty() {
         info!(target: "orch::pipeline", "ASR returned empty text; skipping LLM");
         return;
@@ -208,6 +228,11 @@ pub async fn run_turn(backends: Arc<Backends>, pcm: Vec<u8>, sample_rate: u32) {
     };
     drop(llm_permit);
 
+    if !wake.pipeline_still_active() {
+        info!(target: "orch::pipeline", "barge-in detected after LLM; aborting turn (sink / TTS skipped)");
+        return;
+    }
+
     info!(
         target: "orch::pipeline",
         user = %text,
@@ -227,10 +252,18 @@ pub async fn run_turn(backends: Arc<Backends>, pcm: Vec<u8>, sample_rate: u32) {
     });
     forward_to_result_sink(&backends, &payload).await;
 
+    if !wake.pipeline_still_active() {
+        info!(target: "orch::pipeline", "barge-in detected after sink; aborting turn (TTS skipped)");
+        return;
+    }
+
     // TTS stage. Disabled when tts.url is empty — degrades to "log
     // only" so dev runs without `tts-streamer` still complete the turn.
     // Empty replies (rare; would mean LLM said literally nothing) skip
     // TTS rather than POST an empty string the streamer would reject.
+    // If a wake fires *during* the speak, the existing tts_stop()
+    // path (fired from on_wake → service.rs) cancels it — that's the
+    // only barge-in flavor whose abort isn't gated by these checks.
     if !backends.tts.url.is_empty() && !reply.is_empty() {
         tts_speak(&backends, &reply).await;
     }

@@ -91,8 +91,21 @@ class Mocks:
         self.tts_speak_status = 200
         self.sink_status = 200
 
-        # Barge-in coordination: /speak optionally awaits this event
-        # before responding so /stop can cancel it deterministically.
+        # Barge-in coordination knobs. When set, the corresponding
+        # mock handler awaits its release event before responding — so
+        # the test can observe a "stage in flight" state and fire a
+        # WakeWordDetected at exactly the moment we want.
+        # `*_in_progress` is set as the handler enters the wait,
+        # `*_release` is set by the test (or another handler) to let
+        # the mock respond.
+        self.asr_blocks = False
+        self.asr_release = asyncio.Event()
+        self.asr_in_progress = asyncio.Event()
+
+        self.llm_blocks = False
+        self.llm_release = asyncio.Event()
+        self.llm_in_progress = asyncio.Event()
+
         self.speak_blocks = False
         self.speak_release = asyncio.Event()
         self.speak_in_progress = asyncio.Event()
@@ -109,6 +122,12 @@ class Mocks:
         self.llm_content = "OK from mock LLM"
         self.tts_speak_status = 200
         self.sink_status = 200
+        self.asr_blocks = False
+        self.asr_release.clear()
+        self.asr_in_progress.clear()
+        self.llm_blocks = False
+        self.llm_release.clear()
+        self.llm_in_progress.clear()
         self.speak_blocks = False
         self.speak_release.clear()
         self.speak_in_progress.clear()
@@ -130,6 +149,15 @@ class Mocks:
         self.asr_calls.append(
             {"file_bytes": size, "response_format_json": had_response_format}
         )
+        # Block before responding when the test sets `asr_blocks` so
+        # a barge-in scenario can fire WakeWordDetected at the moment
+        # ASR is "in flight" (deterministic stand-in for slow whisper).
+        if self.asr_blocks:
+            self.asr_in_progress.set()
+            try:
+                await asyncio.wait_for(self.asr_release.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
         if self.asr_status != 200:
             return web.json_response({"error": "mock"}, status=self.asr_status)
         return web.json_response({"text": self.asr_text})
@@ -137,6 +165,14 @@ class Mocks:
     async def llm_handler(self, request: web.Request) -> web.Response:
         body = await request.json()
         self.llm_calls.append(body)
+        # Same block-before-respond pattern as ASR — used by the
+        # "barge-in during LLM" scenario.
+        if self.llm_blocks:
+            self.llm_in_progress.set()
+            try:
+                await asyncio.wait_for(self.llm_release.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
         if self.llm_status != 200:
             return web.json_response({"error": "mock"}, status=self.llm_status)
         return web.json_response(
@@ -447,6 +483,71 @@ async def strict_wake_always_to_sink(
     expect(len(mocks.asr_calls), 0, "ASR (wake-only)")
 
 
+async def strict_barge_in_during_asr_aborts(
+    session: aiohttp.ClientSession, orch: str, mocks: Mocks
+) -> None:
+    """A wake event arriving while ASR is in flight must abort the
+    rest of the turn — no LLM call, no sink TurnCompleted forward,
+    no TTS speak. The original ASR HTTP request still completes (we
+    don't cancel awaits mid-request), so asr_calls counts 1, but
+    everything downstream gets zero. Verifies the post-ASR
+    `wake.is_in_turn()` check in run_turn."""
+    mocks.reset()
+    mocks.asr_blocks = True
+
+    await post_event(session, orch, wake_word_detected())
+    await post_event(session, orch, vad_speech_ended())
+    try:
+        await asyncio.wait_for(mocks.asr_in_progress.wait(), timeout=3.0)
+    except asyncio.TimeoutError:
+        raise AssertionError("ASR /inference never entered the blocking phase")
+
+    # Now the orchestrator is in Processing, blocked inside ASR.
+    # Fire barge-in — orch flips state Processing → Armed and POSTs
+    # tts /stop (no-op because no /speak yet).
+    await post_event(session, orch, wake_word_detected())
+
+    # Release ASR so run_turn can reach its post-ASR check.
+    mocks.asr_release.set()
+    await asyncio.sleep(SETTLE_SEC)
+
+    expect(len(mocks.asr_calls), 1, "ASR (was in flight, completed)")
+    expect(len(mocks.llm_calls), 0, "LLM (post-ASR abort)")
+    expect(len(mocks.tts_speak_calls), 0, "TTS (post-ASR abort)")
+    turns = sum(1 for s in mocks.sink_calls if s["name"] == "TurnCompleted")
+    expect(turns, 0, "sink TurnCompleted (post-ASR abort)")
+
+
+async def strict_barge_in_during_llm_aborts(
+    session: aiohttp.ClientSession, orch: str, mocks: Mocks
+) -> None:
+    """Same as the ASR variant but the wake fires while the LLM is
+    in flight. ASR has already completed, so asr_calls=1 and
+    llm_calls=1, but TTS and the TurnCompleted sink forward are both
+    skipped — the post-LLM `wake.is_in_turn()` check catches it."""
+    mocks.reset()
+    mocks.llm_blocks = True
+
+    await post_event(session, orch, wake_word_detected())
+    await post_event(session, orch, vad_speech_ended())
+    try:
+        await asyncio.wait_for(mocks.llm_in_progress.wait(), timeout=3.0)
+    except asyncio.TimeoutError:
+        raise AssertionError("LLM /api/chat never entered the blocking phase")
+
+    # Barge-in mid-LLM.
+    await post_event(session, orch, wake_word_detected())
+
+    mocks.llm_release.set()
+    await asyncio.sleep(SETTLE_SEC)
+
+    expect(len(mocks.asr_calls), 1, "ASR (completed pre-barge-in)")
+    expect(len(mocks.llm_calls), 1, "LLM (was in flight, completed)")
+    expect(len(mocks.tts_speak_calls), 0, "TTS (post-LLM abort)")
+    turns = sum(1 for s in mocks.sink_calls if s["name"] == "TurnCompleted")
+    expect(turns, 0, "sink TurnCompleted (post-LLM abort)")
+
+
 async def strict_barge_in_cancels_tts(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
@@ -687,6 +788,8 @@ GROUPS: dict[str, list[tuple[str, Test]]] = {
         ("arm is single-use (2nd SE without re-wake dropped)", strict_arm_is_single_use),
         ("arm window expires", strict_arm_window_expires),
         ("WakeWordDetected always forwarded to sink", strict_wake_always_to_sink),
+        ("barge-in during ASR aborts pipeline", strict_barge_in_during_asr_aborts),
+        ("barge-in during LLM aborts pipeline", strict_barge_in_during_llm_aborts),
         ("barge-in cancels in-flight TTS", strict_barge_in_cancels_tts),
         ("unknown event name is acked (forward-compat)", strict_unknown_event_is_acked),
         ("SpeechStarted alone is logged only", strict_speech_started_alone),

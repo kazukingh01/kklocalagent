@@ -202,6 +202,28 @@ impl WakeMachine {
         g.phase == Phase::Processing
     }
 
+    /// Whether the pipeline should still send HTTP to downstream
+    /// stages for the *current* turn. Called from `pipeline::run_turn`
+    /// between stages; a `false` return aborts the rest of the turn
+    /// (no further LLM / sink / TTS POSTs).
+    ///
+    /// Loose mode (`required=false`) returns true unconditionally —
+    /// there's no barge-in mechanism without the state machine, so
+    /// every dispatched turn runs to completion regardless of any
+    /// wake events that arrive in parallel.
+    ///
+    /// Strict mode returns true only while phase is still
+    /// `Processing`. A wake-during-turn flips phase to `Armed` (via
+    /// `on_wake`'s BargeIn branch); this method then returns false
+    /// and the pipeline short-circuits.
+    pub fn pipeline_still_active(&self) -> bool {
+        if !self.required {
+            return true;
+        }
+        let g = self.inner.lock().expect("wake state poisoned");
+        g.phase == Phase::Processing
+    }
+
     /// Called from ProcessingGuard::drop. Transitions Processing →
     /// Idle. If a barge-in already promoted us to Armed mid-turn,
     /// leave that alone — the new arm window is owned by the next

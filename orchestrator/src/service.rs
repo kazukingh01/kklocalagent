@@ -247,9 +247,14 @@ fn dispatch_utterance(
     // in `Processing` until the pipeline finishes — barge-in detection
     // (WakeResult::BargeIn) and the "drop second SpeechEnded mid-turn"
     // semantics both depend on this.
+    //
+    // Pass `wake` into run_turn too: the pipeline polls
+    // `wake.is_in_turn()` between stages, so a barge-in flips the
+    // state to Armed and the next stage's HTTP is skipped.
     let backends = state.backends.clone();
+    let wake = state.wake.clone();
     tokio::spawn(async move {
-        pipeline::run_turn(backends, pcm, sample_rate).await;
+        pipeline::run_turn(backends, wake, pcm, sample_rate).await;
         drop(guard);
     });
     Ok(())
