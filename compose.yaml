@@ -197,7 +197,7 @@ services:
       WW_MIC_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/mic
       WW_SINK_MODE: orchestrator
       WW_ORCHESTRATOR_URL: http://orchestrator:7000/events
-      WW_MODELS: alexa
+      WW_MODELS: "${WW_MODELS:-alexa}"
       WW_THRESHOLD: "${WW_THRESHOLD:-0.5}"
       WW_COOLDOWN_SEC: "2.0"
       WW_INFERENCE_FRAMEWORK: tflite
