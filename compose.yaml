@@ -110,6 +110,14 @@ services:
     environment:
       WHISPER_MODEL: *asr-model
       WHISPER_LANGUAGE: ja
+      # Tell nvidia-container-toolkit what driver libs to mount.
+      # Ollama's image presets these internally; whisper.cpp's upstream
+      # `main-cuda` image does not, and recent toolkit versions skip
+      # mounting libcuda/libnvidia-ml when these are unset — leading
+      # to `ggml_cuda_init: no CUDA-capable device is detected` even
+      # though `deploy.resources` did request a GPU.
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
     ports:
       - "7040:8080"
     deploy:
