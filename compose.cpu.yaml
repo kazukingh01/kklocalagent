@@ -24,6 +24,12 @@ services:
       # changes between flavors. The orchestrator's ORCH_LLM_MODEL
       # below tracks this so they don't drift.
       LLM_MODEL: "${LLM_MODEL:-gemma3:1b}"
+      # GPU-only knobs from the base compose are dropped here:
+      # OLLAMA_FLASH_ATTENTION + OLLAMA_KV_CACHE_TYPE both require a
+      # CUDA / Metal backend and are no-ops (or warn) on the CPU
+      # build. The general scheduling knobs still apply.
+      OLLAMA_FLASH_ATTENTION: ""
+      OLLAMA_KV_CACHE_TYPE: ""
     # Compose-spec `!reset` clears the entire `deploy` block from
     # the merged config — required because compose merges nested
     # maps recursively, so dropping just `devices: []` would still
