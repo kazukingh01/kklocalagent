@@ -239,7 +239,16 @@ def main() -> None:
     app.router.add_get("/health", health)
     app.router.add_post("/speak", speak)
     app.router.add_post("/stop", stop)
-    web.run_app(app, host=HOST, port=PORT, print=lambda *_: None)
+    # access_log=None suppresses aiohttp's per-request INFO line. The
+    # Dockerfile HEALTHCHECK pings GET /health every 10 s; without
+    # this each ping logs a `"GET /health 200 OK"` line that drowns
+    # out real /speak / /stop traffic. /speak and /stop already log
+    # their own lifecycle messages (synthesised: ..., speak cancelled
+    # (barge-in)) at module level, so dropping the access log doesn't
+    # hide anything diagnostic.
+    web.run_app(
+        app, host=HOST, port=PORT, access_log=None, print=lambda *_: None
+    )
 
 
 if __name__ == "__main__":

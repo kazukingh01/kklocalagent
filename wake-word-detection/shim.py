@@ -163,7 +163,15 @@ class Shim:
     async def start_http(self) -> None:
         app = web.Application()
         app.router.add_get("/health", self.health)
-        runner = web.AppRunner(app)
+        # access_log=None suppresses aiohttp's per-request INFO line.
+        # The Dockerfile HEALTHCHECK pings GET /health every 10 s, so
+        # the access logger fires that often by default — too chatty
+        # for production. Other paths besides /health don't exist on
+        # this server, so dropping the access log doesn't hide
+        # anything diagnostic; failures are still surfaced as the
+        # response status (503) the orchestrator's healthcheck
+        # observes.
+        runner = web.AppRunner(app, access_log=None)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", self.port)
         await site.start()
