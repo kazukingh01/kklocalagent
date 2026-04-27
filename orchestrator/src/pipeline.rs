@@ -1,16 +1,19 @@
-//! SpeechEnded → ASR → LLM pipeline.
+//! SpeechEnded → ASR → LLM (streaming) → TTS pipeline.
 //!
-//! Shape of one turn, per #4 §5:
+//! Shape of one turn:
 //!
 //! ```text
-//! orchestrator ──POST /inference──► ASR (whisper.cpp)
-//!              ──POST /api/chat───► LLM (ollama)
-//!              (logs the assistant response)
+//! orchestrator ──POST /inference──────► ASR (whisper.cpp)
+//!              ──POST /api/chat (ndjson)► LLM (ollama)
+//!                  ├─ delta tokens accumulate into a sentence buffer
+//!                  └─ each completed sentence ──POST /speak──► TTS
 //! ```
 //!
 //! Per-stage concurrency is bounded by a `Semaphore` so the orchestrator
 //! degrades predictably (drop with warning) instead of queuing unboundedly
-//! if VAD fires faster than the backends can keep up.
+//! if VAD fires faster than the backends can keep up. The TTS permit is
+//! held for the *whole turn* (across N /speak calls) so two consecutive
+//! sentences from the same turn don't race for the same slot.
 
 use std::sync::Arc;
 
@@ -19,7 +22,7 @@ use base64::Engine;
 use reqwest::multipart;
 use serde::Serialize;
 use serde_json::json;
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Semaphore};
 use tracing::{info, warn};
 
 use crate::config::{AsrConfig, LlmConfig, ResultSinkConfig, TtsConfig};
@@ -205,7 +208,20 @@ pub async fn run_turn(
     }
     info!(target: "orch::pipeline", text = %text, "transcribed");
 
-    // LLM stage
+    // LLM stage (streaming).
+    //
+    // Pipeline shape (pipelined, sentence-granular):
+    //   LLM /api/chat (stream=true) ─emit sentence─► mpsc ─► TTS consumer
+    //                                                          │
+    //                                              POST /speak (serial)
+    //
+    // While the LLM is still generating sentence N+1, the consumer is
+    // already pacing sentence N's audio out to the streamer. First
+    // audio reaches the user when the *first* sentence boundary is
+    // hit, instead of when the *last* token is generated. The TTS
+    // semaphore is held once for the whole turn (not per sentence) so
+    // two consecutive sentences from the same turn don't race for the
+    // permit and skip themselves.
     let llm_permit = match backends.llm_inflight.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
@@ -218,18 +234,57 @@ pub async fn run_turn(
         }
     };
 
-    let reply = match llm_chat(&backends, &text).await {
+    // Channel buffers up to 8 sentences. Tuned to absorb a slow TTS
+    // step (synthesis can be a few hundred ms) without back-pressuring
+    // the LLM read loop on a fast model — but bounded so a runaway
+    // generation can't OOM the orchestrator.
+    let (sentence_tx, sentence_rx) = mpsc::channel::<String>(8);
+
+    // Acquire the TTS permit once per turn. None when at capacity or
+    // when TTS is disabled — consumer still drains the channel either
+    // way (so the LLM read loop never wedges) but skips the actual
+    // POST /speak.
+    let tts_permit = if !backends.tts.url.is_empty() {
+        match backends.tts_inflight.clone().try_acquire_owned() {
+            Ok(p) => Some(p),
+            Err(_) => {
+                warn!(
+                    target: "orch::pipeline",
+                    "TTS at capacity ({} in flight); turn will skip /speak",
+                    backends.tts.max_inflight
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let consumer = spawn_tts_consumer(
+        backends.clone(),
+        wake.clone(),
+        sentence_rx,
+        tts_permit,
+    );
+
+    let reply_result = llm_chat_streaming(&backends, &wake, &text, sentence_tx).await;
+    // Sender dropped here → channel closes once consumer drains;
+    // awaiting the consumer ensures the last /speak finishes before
+    // we return (so the next turn's run_turn can't open a new /speak
+    // while this one's tail is still pacing out).
+    let _ = consumer.await;
+    drop(llm_permit);
+
+    let reply = match reply_result {
         Ok(r) => r,
         Err(e) => {
             warn!(target: "orch::pipeline", "LLM failed: {e:#}");
-            drop(llm_permit);
             return;
         }
     };
-    drop(llm_permit);
 
     if !wake.pipeline_still_active() {
-        info!(target: "orch::pipeline", "barge-in detected after LLM; aborting turn (sink / TTS skipped)");
+        info!(target: "orch::pipeline", "barge-in detected after LLM; aborting turn (sink skipped)");
         return;
     }
 
@@ -251,37 +306,39 @@ pub async fn run_turn(
         "ts": ts,
     });
     forward_to_result_sink(&backends, &payload).await;
-
-    if !wake.pipeline_still_active() {
-        info!(target: "orch::pipeline", "barge-in detected after sink; aborting turn (TTS skipped)");
-        return;
-    }
-
-    // TTS stage. Disabled when tts.url is empty — degrades to "log
-    // only" so dev runs without `tts-streamer` still complete the turn.
-    // Empty replies (rare; would mean LLM said literally nothing) skip
-    // TTS rather than POST an empty string the streamer would reject.
-    // If a wake fires *during* the speak, the existing tts_stop()
-    // path (fired from on_wake → service.rs) cancels it — that's the
-    // only barge-in flavor whose abort isn't gated by these checks.
-    if !backends.tts.url.is_empty() && !reply.is_empty() {
-        tts_speak(&backends, &reply).await;
-    }
 }
 
-async fn tts_speak(backends: &Backends, text: &str) {
-    let permit = match backends.tts_inflight.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            warn!(
-                target: "orch::pipeline",
-                "TTS at capacity ({} in flight); skipping speak",
-                backends.tts.max_inflight
-            );
-            return;
+/// TTS consumer task: drains the sentence channel, calling
+/// `tts_speak_inner` serially per sentence while the turn is still
+/// active. Holds the turn-level TTS permit until the channel closes.
+fn spawn_tts_consumer(
+    backends: Arc<Backends>,
+    wake: Arc<WakeMachine>,
+    mut rx: mpsc::Receiver<String>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(sentence) = rx.recv().await {
+            // Drain the rest after barge-in so the LLM sender can
+            // finish without blocking, but skip the actual /speak.
+            // tts_stop() (fired from on_wake → service.rs) has
+            // already cancelled any in-flight /speak — we just stop
+            // queuing new ones.
+            if !wake.pipeline_still_active() {
+                continue;
+            }
+            if permit.is_none() || backends.tts.url.is_empty() || sentence.is_empty() {
+                continue;
+            }
+            tts_speak_inner(&backends, &sentence).await;
         }
-    };
+        drop(permit);
+    })
+}
 
+/// Inner /speak POST. Permit management is the caller's responsibility
+/// — see `spawn_tts_consumer` (per-turn permit) for the streaming path.
+async fn tts_speak_inner(backends: &Backends, text: &str) {
     let body = json!({ "text": text });
     let res = backends
         .http
@@ -312,7 +369,6 @@ async fn tts_speak(backends: &Backends, text: &str) {
         }
         Err(e) => warn!(target: "orch::pipeline", "TTS POST failed: {e:#}"),
     }
-    drop(permit);
 }
 
 /// POST `tts.stop_url` to cancel an in-flight `/speak` on the
@@ -380,7 +436,22 @@ async fn asr_transcribe(backends: &Backends, wav: Vec<u8>) -> Result<String> {
     Ok(text)
 }
 
-async fn llm_chat(backends: &Backends, user_text: &str) -> Result<String> {
+/// Streaming /api/chat. Reads ollama's ndjson response one line at a
+/// time, accumulates `message.content` deltas, and emits each sentence
+/// (split on `。 ！ ？ ! ? \n`) into `sentence_tx` as soon as it
+/// completes. The full assistant reply is returned at the end for
+/// logging + sink forwarding.
+///
+/// Barge-in: a `wake.pipeline_still_active() == false` between
+/// sentences (or between deltas) returns early, dropping the response
+/// stream and closing the underlying connection — so ollama stops
+/// generating tokens we'd never use.
+async fn llm_chat_streaming(
+    backends: &Backends,
+    wake: &WakeMachine,
+    user_text: &str,
+    sentence_tx: mpsc::Sender<String>,
+) -> Result<String> {
     // Prepend system prompt when configured. ollama's /api/chat
     // normalises {role:"system"} into the model's chat template
     // regardless of which model is loaded — empty string here means
@@ -399,9 +470,9 @@ async fn llm_chat(backends: &Backends, user_text: &str) -> Result<String> {
     let body = ChatRequest {
         model: &backends.llm.model,
         messages,
-        stream: false,
+        stream: true,
     };
-    let resp = backends
+    let mut resp = backends
         .http
         .post(&backends.llm.url)
         .json(&body)
@@ -410,22 +481,108 @@ async fn llm_chat(backends: &Backends, user_text: &str) -> Result<String> {
         .await
         .context("POST /api/chat")?;
     let status = resp.status();
-    let text = resp.text().await.context("read /api/chat body")?;
     if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
         anyhow::bail!("LLM responded {status}: {text}");
     }
-    // ollama /api/chat with stream=false returns one JSON object:
-    //   {"model":"...","message":{"role":"assistant","content":"..."},
-    //    "done":true,...}
-    let parsed: serde_json::Value = serde_json::from_str(&text)
-        .with_context(|| format!("parse /api/chat response: {text}"))?;
-    let content = parsed
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    Ok(content)
+
+    // Byte-level accumulator (chunks may split mid-line); newline (0x0A)
+    // is ASCII and never appears mid-UTF-8 codepoint, so splitting at
+    // `\n` is always at a valid string boundary.
+    let mut byte_buf: Vec<u8> = Vec::new();
+    // Per-sentence text accumulator: deltas append here and we drain
+    // each completed sentence out into the channel.
+    let mut sentence_buf = String::new();
+    let mut full_reply = String::new();
+
+    'outer: loop {
+        let chunk = resp
+            .chunk()
+            .await
+            .context("read /api/chat stream")?;
+        let chunk = match chunk {
+            Some(c) => c,
+            None => break, // EOF without explicit done:true — flush below.
+        };
+        byte_buf.extend_from_slice(&chunk);
+
+        while let Some(nl_pos) = byte_buf.iter().position(|&b| b == b'\n') {
+            let raw: Vec<u8> = byte_buf.drain(..=nl_pos).collect();
+            let line = match std::str::from_utf8(&raw[..nl_pos]) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let parsed: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(target: "orch::pipeline", "skipping unparseable LLM stream line: {e}");
+                    continue;
+                }
+            };
+
+            let delta = parsed
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+            if !delta.is_empty() {
+                sentence_buf.push_str(delta);
+                full_reply.push_str(delta);
+
+                // Drain every completed sentence from the buffer.
+                while let Some(end) = find_sentence_end(&sentence_buf) {
+                    let remainder = sentence_buf.split_off(end);
+                    let sentence = std::mem::replace(&mut sentence_buf, remainder)
+                        .trim()
+                        .to_string();
+                    if sentence.is_empty() {
+                        continue;
+                    }
+                    if !wake.pipeline_still_active() {
+                        // Drop response → connection closes →
+                        // ollama stops generating. No further
+                        // sentences emitted.
+                        return Ok(full_reply);
+                    }
+                    if sentence_tx.send(sentence).await.is_err() {
+                        // Consumer gone — abandon stream.
+                        return Ok(full_reply);
+                    }
+                }
+            }
+
+            if parsed
+                .get("done")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                break 'outer;
+            }
+        }
+    }
+
+    // Flush trailing partial sentence (final chunk had no terminator).
+    let tail = sentence_buf.trim().to_string();
+    if !tail.is_empty() && wake.pipeline_still_active() {
+        let _ = sentence_tx.send(tail).await;
+    }
+    Ok(full_reply.trim().to_string())
+}
+
+/// Find the first sentence-terminator in `s` and return the byte
+/// offset *after* it (so `s[..end]` is the sentence including its
+/// terminator). Terminators: `。 ！ ？ ! ? \n`. Returns None if no
+/// terminator is present yet.
+fn find_sentence_end(s: &str) -> Option<usize> {
+    for (i, ch) in s.char_indices() {
+        if matches!(ch, '。' | '！' | '？' | '!' | '?' | '\n') {
+            return Some(i + ch.len_utf8());
+        }
+    }
+    None
 }
 
 /// Decode `audio_base64` to raw PCM bytes.
@@ -455,5 +612,27 @@ mod tests {
         let raw = vec![1u8, 2, 3, 4, 5];
         let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
         assert_eq!(decode_audio(&b64).unwrap(), raw);
+    }
+
+    #[test]
+    fn find_sentence_end_detects_each_terminator() {
+        // 。 (3 bytes), ！ (3 bytes), ？ (3 bytes), ! and ? (1 byte), \n (1 byte).
+        assert_eq!(find_sentence_end("こんにちは。world"), Some("こんにちは。".len()));
+        assert_eq!(find_sentence_end("やあ！ next"), Some("やあ！".len()));
+        assert_eq!(find_sentence_end("元気？ next"), Some("元気？".len()));
+        assert_eq!(find_sentence_end("hi! next"), Some(3));
+        assert_eq!(find_sentence_end("hi? next"), Some(3));
+        assert_eq!(find_sentence_end("line1\nline2"), Some(6));
+        assert_eq!(find_sentence_end("no terminator yet"), None);
+        assert_eq!(find_sentence_end(""), None);
+    }
+
+    #[test]
+    fn find_sentence_end_returns_first_terminator() {
+        // Two sentences in one string: end of the *first* is what we want
+        // so the caller can drain one sentence at a time.
+        let s = "前。後！";
+        let end = find_sentence_end(s).unwrap();
+        assert_eq!(&s[..end], "前。");
     }
 }

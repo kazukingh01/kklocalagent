@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import json
 import logging
 import sys
 import time
@@ -177,6 +178,38 @@ class Mocks:
                 pass
         if self.llm_status != 200:
             return web.json_response({"error": "mock"}, status=self.llm_status)
+        # Orchestrator always sends `stream: true` against /api/chat.
+        # Mirror ollama's ndjson contract: one line per delta plus a
+        # final `{done: true}` line. We emit the entire `llm_content`
+        # in a single delta — sufficient for tests asserting on the
+        # full reply, and keeps the mock simple. The real ollama emits
+        # one line per token; the orchestrator's parser handles either.
+        if body.get("stream"):
+            response = web.StreamResponse(status=200)
+            response.content_type = "application/x-ndjson"
+            await response.prepare(request)
+            if self.llm_content:
+                line = json.dumps(
+                    {
+                        "model": body.get("model"),
+                        "message": {"role": "assistant", "content": self.llm_content},
+                        "done": False,
+                    }
+                ) + "\n"
+                await response.write(line.encode())
+            final = json.dumps(
+                {
+                    "model": body.get("model"),
+                    "message": {"role": "assistant", "content": ""},
+                    "done": True,
+                }
+            ) + "\n"
+            await response.write(final.encode())
+            await response.write_eof()
+            return response
+        # Non-streaming path kept for completeness — no current caller
+        # exercises it, but a plain JSON response is the right thing
+        # for any future client that POSTs `stream: false`.
         return web.json_response(
             {
                 "model": body.get("model"),
