@@ -706,24 +706,46 @@ async fn llm_chat_streaming(
 
 /// Find the first sentence-terminator in `s` and return the byte
 /// offset *after* it (so `s[..end]` is the sentence including its
-/// terminator). Terminators: `。 、 ！ ？ … ! ? \n`. Returns None
-/// if no terminator is present yet.
+/// terminator). Returns None if no terminator is present yet.
 ///
-/// The Japanese comma `、` and ellipsis `…` are *prosodic* breaks,
-/// not full sentence ends, but VOICEVOX naturally inserts a short
-/// pause at each so flushing per-chunk shortens time-to-first-audio
-/// without warping the spoken cadence. ASCII `.` and `,` deliberately
-/// stay out — they would mis-split numerics like "1.5" or "1,000",
-/// and English clausal commas ("a, b, and c") would each become a
-/// separate TTS unit with a wrong-feeling prosodic break. The
-/// Japanese `、` is safe because it never appears mid-numeric.
+/// Terminator policy:
+/// * Full-width `。 ！ ？` and prosodic breaks `、 …`, plus `\n`,
+///   are unconditional terminators. The Japanese comma `、` is safe
+///   because it never appears mid-numeric, and VOICEVOX inserts a
+///   short prosodic pause at it so flushing per-`、` shortens
+///   time-to-first-audio without warping cadence.
+/// * ASCII `. ! ?` are terminators *only when followed by whitespace*.
+///   The lookahead lets English-only LLM replies stream sentence-by-
+///   sentence — without an ASCII rule, a model that answers in pure
+///   English produces zero terminators and `sentence_buf` accumulates
+///   the whole turn before the trailing flush, defeating streaming.
+///   The whitespace gate keeps numerics like "1.5" and host names
+///   like "api.example.com" intact. Abbreviations followed by a
+///   space ("Mr. Smith", "etc. and") still split — accepted v1
+///   trade-off because the resulting TTS just gets a small extra
+///   pause where the period is, which sounds like a beat in fluent
+///   reading.
+/// * ASCII `,` deliberately stays out — English clausal commas
+///   ("a, b, and c") would each become a separate TTS unit with a
+///   wrong-feeling break.
+/// * A bare ASCII terminator at end-of-buffer (no lookahead char)
+///   does *not* split — the trailing flush at end-of-stream emits
+///   the final partial sentence.
 fn find_sentence_end(s: &str) -> Option<usize> {
-    for (i, ch) in s.char_indices() {
-        if matches!(
-            ch,
-            '。' | '、' | '！' | '？' | '…' | '!' | '?' | '\n'
-        ) {
-            return Some(i + ch.len_utf8());
+    let mut iter = s.char_indices().peekable();
+    while let Some((i, ch)) = iter.next() {
+        match ch {
+            '。' | '、' | '！' | '？' | '…' | '\n' => {
+                return Some(i + ch.len_utf8());
+            }
+            '!' | '?' | '.' => {
+                if let Some(&(_, next)) = iter.peek() {
+                    if next.is_whitespace() {
+                        return Some(i + ch.len_utf8());
+                    }
+                }
+            }
+            _ => {}
         }
     }
     None
@@ -755,17 +777,39 @@ mod tests {
         assert_eq!(find_sentence_end("元気？ next"), Some("元気？".len()));
         assert_eq!(find_sentence_end("えーと、それで"), Some("えーと、".len()));
         assert_eq!(find_sentence_end("うーん…続き"), Some("うーん…".len()));
+        // ASCII !? followed by whitespace → split (the common English
+        // sentence-end shape; matches v0 behaviour).
         assert_eq!(find_sentence_end("hi! next"), Some(3));
         assert_eq!(find_sentence_end("hi? next"), Some(3));
         assert_eq!(find_sentence_end("line1\nline2"), Some(6));
         assert_eq!(find_sentence_end("no terminator yet"), None);
-        // ASCII `.` and `,` stay non-terminators so numerics aren't split.
-        assert_eq!(find_sentence_end("about 1.5 meters"), None);
+        // ASCII `,` stays non-terminator (English clausal commas would
+        // produce wrong-feeling prosodic breaks via VOICEVOX).
         assert_eq!(find_sentence_end("price 1,000 yen"), None);
-        // English clausal commas don't terminate either — would
-        // produce wrong-feeling prosodic breaks via VOICEVOX.
         assert_eq!(find_sentence_end("a, b, and c"), None);
         assert_eq!(find_sentence_end(""), None);
+    }
+
+    #[test]
+    fn find_sentence_end_ascii_period_requires_whitespace_after() {
+        // The English-streaming rule. `.` followed by space terminates;
+        // `.` mid-numeric or mid-identifier does not. Without this,
+        // English LLM replies never stream — `sentence_buf` accumulates
+        // the entire turn until the trailing flush.
+        assert_eq!(find_sentence_end("Hello. World"), Some(6));
+        assert_eq!(find_sentence_end("Done.\nNext"), Some(5));
+        // Numerics / host names / file extensions stay intact.
+        assert_eq!(find_sentence_end("about 1.5 meters"), None);
+        assert_eq!(find_sentence_end("api.example.com"), None);
+        assert_eq!(find_sentence_end("file.txt is here"), None);
+        // Same gate applies to ASCII ! and ?.
+        assert_eq!(find_sentence_end("Hi!World"), None);
+        assert_eq!(find_sentence_end("Why?Yes"), None);
+        // Bare terminator at end-of-buffer doesn't split — the trailing
+        // flush at end-of-stream emits the final partial sentence.
+        assert_eq!(find_sentence_end("Done."), None);
+        assert_eq!(find_sentence_end("Done!"), None);
+        assert_eq!(find_sentence_end("Done?"), None);
     }
 
     #[test]
@@ -916,6 +960,33 @@ mod tests {
         }
         assert_eq!(sentences, vec!["こんにちは。", "今日はいい天気ですね。"]);
         assert_eq!(reply, "こんにちは。今日はいい天気ですね。");
+    }
+
+    #[tokio::test]
+    async fn llm_chat_streaming_drains_english_sentences_on_period_then_space() {
+        // English-only reply: no Japanese terminators ever appear, so
+        // streaming is fully driven by the ASCII period/?/! +
+        // whitespace rule. Without that rule sentence_buf would
+        // accumulate the entire reply until the trailing flush.
+        let body = concat!(
+            r#"{"message":{"content":"Hello world."}}"#, "\n",
+            r#"{"message":{"content":" How are you?"}}"#, "\n",
+            r#"{"message":{"content":" I am fine!"}}"#, "\n",
+            r#"{"done":true}"#, "\n",
+        ).as_bytes().to_vec();
+        let addr = spawn_mock_llm(body).await;
+        let backends = backends_with_llm_addr(addr);
+        let wake = loose_wake();
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        let _reply = llm_chat_streaming(&backends, &wake, "test", tx).await.unwrap();
+        let mut sentences = vec![];
+        while let Some(s) = rx.recv().await {
+            sentences.push(s);
+        }
+        assert_eq!(
+            sentences,
+            vec!["Hello world.", "How are you?", "I am fine!"]
+        );
     }
 
     #[tokio::test]

@@ -220,6 +220,23 @@ async def speak(request: web.Request) -> web.Response:
     # calls overlapping is the barge-in case (orchestrator preferring
     # the new utterance over the old reply); failing the previous task
     # with CancelledError is exactly what we want.
+    #
+    # Task lifecycle across overlapping /speak requests is intentional
+    # and worth pinning here so a future refactor doesn't "fix" it:
+    #
+    #   * The previous request's handler is still parked on its own
+    #     `await task` when this new request arrives. Cancelling that
+    #     task makes the previous handler's await raise
+    #     CancelledError, hit the except branch below, and return 499
+    #     to its caller.
+    #   * This new request's handler installs `task` as CURRENT_TASK
+    #     and awaits its OWN `task` local — so the two handlers do
+    #     not contend on the same future. The lock only guards the
+    #     cancel→replace, not the body.
+    #
+    # The result: the previous /speak's POST closes with 499 (the
+    # orchestrator logs it as "cancelled"), the new /speak proceeds
+    # cleanly, and no task is left awaiting itself or orphaned.
     async with TASK_LOCK:
         if CURRENT_TASK is not None and not CURRENT_TASK.done():
             CURRENT_TASK.cancel()

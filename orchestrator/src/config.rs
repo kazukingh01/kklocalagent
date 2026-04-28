@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use serde::Deserialize;
+use tracing::warn;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -333,6 +334,37 @@ impl Config {
         if !self.result_sink.url.is_empty() && self.result_sink.timeout_ms == 0 {
             anyhow::bail!("result_sink.timeout_ms must be >= 1 when url is set");
         }
+        // barge-in cancels the in-flight TTS via tts.stop_url. The
+        // pipeline's TTS consumer sits on a single tts_speak_inner
+        // .await for as long as tts-streamer takes to return, and the
+        // only thing that makes that return early on barge-in is a
+        // POST /stop landing on tts-streamer — which it can't do if
+        // stop_url is empty. Without stop_url, a barge-in mid-TTS is
+        // forced to wait the full /speak HTTP timeout (default 60 s)
+        // before the next turn can take the TTS permit. Refuse the
+        // mis-config at startup rather than ship a silent
+        // unresponsive-barge-in failure mode. Skipped when tts.url is
+        // empty (TTS stage entirely off — barge-in is moot).
+        if self.wake.barge_in && !self.tts.url.is_empty() && self.tts.stop_url.is_empty() {
+            anyhow::bail!(
+                "wake.barge_in=true requires tts.stop_url when tts.url is set \
+                 (without it, mid-TTS barge-in blocks until the /speak HTTP timeout)"
+            );
+        }
+        // Soft warning: tail_quiet_ms is sized assuming finalize_url
+        // is wired (the drain handshake pins the speaker-silent
+        // moment, so the window only needs to cover VAD's hangover
+        // ~400 ms). With finalize_url empty, the same window has to
+        // absorb audio-io's playback-ring drain time *and* VAD
+        // hangover — the default 400 ms is no longer enough. Warn
+        // rather than bail because the test path deliberately runs
+        // without finalize_url.
+        if !self.tts.url.is_empty() && self.tts.finalize_url.is_empty() {
+            warn!(
+                target: "orch::config",
+                "tts.finalize_url empty: tts.tail_quiet_ms must cover audio-io playback drain + VAD hangover (not just the latter)"
+            );
+        }
         Ok(())
     }
 }
@@ -358,5 +390,41 @@ mod tests {
         let mut cfg = Config::default();
         cfg.llm.model.clear();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn barge_in_without_stop_url_is_rejected() {
+        // Pin the mis-config check: wake.barge_in=true with tts.url set
+        // but stop_url empty must bail at startup. Without it, a
+        // mid-TTS barge-in would block the consumer on the /speak HTTP
+        // timeout (up to 60 s) before the next turn can take the TTS
+        // permit.
+        let mut cfg = Config::default();
+        cfg.tts.url = "http://tts:7070/speak".into();
+        cfg.tts.stop_url = String::new();
+        cfg.wake.barge_in = true;
+        let err = cfg.validate().expect_err("should reject barge_in without stop_url");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("stop_url"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn barge_in_without_stop_url_is_ok_when_tts_disabled() {
+        // tts.url empty = TTS stage entirely off, so barge-in is moot
+        // (there's no /speak to cancel). Validate must NOT bail here.
+        let mut cfg = Config::default();
+        cfg.tts.url = String::new();
+        cfg.tts.stop_url = String::new();
+        cfg.wake.barge_in = true;
+        cfg.validate().expect("tts disabled => barge_in flag is moot");
+    }
+
+    #[test]
+    fn barge_in_with_stop_url_is_accepted() {
+        let mut cfg = Config::default();
+        cfg.tts.url = "http://tts:7070/speak".into();
+        cfg.tts.stop_url = "http://tts:7070/stop".into();
+        cfg.wake.barge_in = true;
+        cfg.validate().expect("barge_in + stop_url is valid");
     }
 }
