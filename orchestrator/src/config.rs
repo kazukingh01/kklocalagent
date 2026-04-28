@@ -147,6 +147,19 @@ pub struct WakeConfig {
     /// current turn ends should be ArmedAfterWake (5 s)" — the
     /// current reply finishes uninterrupted.
     pub barge_in: bool,
+    /// SpeechEnded events arriving within this many milliseconds of
+    /// the most recent WakeWordDetected are dropped. Targets the
+    /// "VAD captures the wake word's own audio and fires SE for it"
+    /// flow: with no dropout, that SE dispatches a turn whose ASR
+    /// text is just the wake word ("Jervis"), the LLM treats it as
+    /// a real query, and TTS speaks a response to nothing the user
+    /// asked. A short window (default 800 ms) is enough to swallow
+    /// the wake-word audio but lets a continuous "Hey Jarvis,
+    /// what's the weather?" through, since VAD's silence hangover
+    /// pushes that SE to ~1.5–2 s after the wake fires. Set to 0
+    /// to disable. Only honoured when `required = true`; loose mode
+    /// dispatches every SE regardless.
+    pub post_wake_se_dropout_ms: u64,
 }
 
 impl Default for ServerConfig {
@@ -210,6 +223,13 @@ impl Default for WakeConfig {
             wake_window_ms: 5_000,
             turn_followup_window_ms: 10_000,
             barge_in: true,
+            // 800 ms covers the "wake word alone" case (VAD's typical
+            // 200–500 ms silence hangover means SE lands ~300–600 ms
+            // after the wake-word frame). Continuous speech (e.g.
+            // "Hey Jarvis, what's the weather") pushes the SE well
+            // past 1 s after the wake fires, so this default doesn't
+            // interfere with real commands.
+            post_wake_se_dropout_ms: 800,
         }
     }
 }

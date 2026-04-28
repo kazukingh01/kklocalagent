@@ -79,6 +79,14 @@ struct Inner {
     /// its guard) can't accidentally roll back the next turn's state
     /// from Processing → ArmedAfterTurn.
     turn_generation: u64,
+    /// Wall-clock instant of the most recent WakeWordDetected.
+    /// `try_dispatch()` consults this to drop SE events that arrive
+    /// within `post_wake_se_dropout` — those are VAD reporting the
+    /// silence after the wake word itself rather than a real command.
+    /// Cleared on a successful dispatch so a future SE that legitimately
+    /// arrives long after the wake (e.g. follow-up via ArmedAfterTurn)
+    /// isn't gated by a stale timestamp.
+    last_wake_at: Option<Instant>,
 }
 
 pub struct WakeMachine {
@@ -86,6 +94,10 @@ pub struct WakeMachine {
     wake_window: Duration,
     turn_followup_window: Duration,
     barge_in: bool,
+    /// `Some` when post-wake SE dropout is active. `None` (set when
+    /// the configured value is 0) disables the check entirely so the
+    /// dispatch path stays straight-through.
+    post_wake_se_dropout: Option<Duration>,
     inner: Mutex<Inner>,
 }
 
@@ -137,6 +149,12 @@ pub enum DispatchOutcome {
     /// State was ArmedAfterTurn but the follow-up window had expired;
     /// SE dropped.
     TurnWindowExpired,
+    /// SE arrived within `post_wake_se_dropout` of the most recent
+    /// WakeWordDetected — almost certainly VAD echoing the wake word's
+    /// own audio rather than a real command. State is left armed (the
+    /// original wake_window keeps ticking) so the operator's actual
+    /// follow-up utterance still dispatches.
+    DroppedTooSoonAfterWake,
 }
 
 /// Drop-on-completion guard. When dropped, transitions Processing
@@ -165,11 +183,14 @@ impl WakeMachine {
             wake_window: Duration::from_millis(cfg.wake_window_ms),
             turn_followup_window: Duration::from_millis(cfg.turn_followup_window_ms),
             barge_in: cfg.barge_in,
+            post_wake_se_dropout: (cfg.post_wake_se_dropout_ms > 0)
+                .then(|| Duration::from_millis(cfg.post_wake_se_dropout_ms)),
             inner: Mutex::new(Inner {
                 phase: Phase::Idle,
                 armed_until: None,
                 pending_wake_after_turn: false,
                 turn_generation: 0,
+                last_wake_at: None,
             }),
         }
     }
@@ -186,6 +207,11 @@ impl WakeMachine {
         }
         let mut g = self.inner.lock().expect("wake state poisoned");
         let now = Instant::now();
+        // Always stamp last_wake_at, even mid-Processing under
+        // barge_in=false where the phase doesn't move. The dropout
+        // check in try_dispatch keys off this regardless of phase, so
+        // a wake-word echo SE arriving 300 ms later is still gated.
+        g.last_wake_at = Some(now);
         let until = now + self.wake_window;
         match g.phase {
             Phase::Processing => {
@@ -277,6 +303,23 @@ impl WakeMachine {
         }
         let mut g = self.inner.lock().expect("wake state poisoned");
         let now = Instant::now();
+        // Wake-word echo dropout. VAD captures the wake word's own
+        // audio and fires SE for it ~300 ms later (silence hangover
+        // between "Hey Jarvis" and the operator's actual command, or
+        // the wake word standing alone). Without this, the orchestrator
+        // dispatches a turn whose ASR text *is* the wake word ("Jervis")
+        // and the LLM treats that as a real query. Real continuous
+        // commands push SE well past the dropout (>1 s) so they're
+        // unaffected. Phase is left untouched — the original
+        // wake_window keeps ticking and a follow-up SE within it still
+        // dispatches normally.
+        if let Some(dropout) = self.post_wake_se_dropout {
+            if let Some(t) = g.last_wake_at {
+                if now.saturating_duration_since(t) < dropout {
+                    return DispatchOutcome::DroppedTooSoonAfterWake;
+                }
+            }
+        }
         // Mint a fresh generation on every Processing transition. Any
         // guard from a previously-aborted turn carries a stale id and
         // will no-op when its Drop fires after we've already moved on.
@@ -284,6 +327,10 @@ impl WakeMachine {
             g.phase = Phase::Processing;
             g.armed_until = None;
             g.turn_generation = g.turn_generation.wrapping_add(1);
+            // Clear the wake stamp on a successful dispatch so a later
+            // SE in ArmedAfterTurn (legit follow-up) isn't gated by an
+            // ancient wake.
+            g.last_wake_at = None;
             ProcessingGuard {
                 machine: self.clone(),
                 generation: g.turn_generation,
@@ -372,11 +419,27 @@ mod tests {
     use super::*;
 
     fn cfg(required: bool, wake_ms: u64, turn_ms: u64, barge: bool) -> WakeConfig {
+        // Tests pre-dating the dropout default a 0-disabled value so
+        // the existing scenarios that fire SE immediately after wake
+        // still dispatch (otherwise every wake_then_se test would
+        // newly drop). Dropout-specific behaviour is covered by its
+        // own dedicated tests below.
         WakeConfig {
             required,
             wake_window_ms: wake_ms,
             turn_followup_window_ms: turn_ms,
             barge_in: barge,
+            post_wake_se_dropout_ms: 0,
+        }
+    }
+
+    fn cfg_dropout(wake_ms: u64, dropout_ms: u64) -> WakeConfig {
+        WakeConfig {
+            required: true,
+            wake_window_ms: wake_ms,
+            turn_followup_window_ms: 10_000,
+            barge_in: true,
+            post_wake_se_dropout_ms: dropout_ms,
         }
     }
 
@@ -518,6 +581,62 @@ mod tests {
         assert!(m.is_in_turn());
         drop(g);
         assert!(!m.is_in_turn()); // Now ArmedAfterTurn, not Processing
+    }
+
+    #[test]
+    fn se_within_post_wake_dropout_is_dropped() {
+        // VAD-captures-the-wake-word echo: SE arrives ~300 ms after
+        // WWD with the wake word audio. With dropout configured, the
+        // dispatch is rejected and state stays armed so the operator's
+        // real follow-up still triggers the pipeline.
+        let m = mk(cfg_dropout(5_000, 800));
+        m.on_wake();
+        // Immediate SE — well inside the 800 ms dropout.
+        assert!(matches!(
+            m.try_dispatch(),
+            DispatchOutcome::DroppedTooSoonAfterWake
+        ));
+        // State remained armed: a SS within the original wake_window
+        // still transitions to Listening.
+        assert_eq!(m.on_speech_started(), SpeechStartedOutcome::Listening);
+    }
+
+    #[test]
+    fn se_after_post_wake_dropout_dispatches() {
+        // Real continuous command: VAD's hangover pushes SE past the
+        // dropout window. Must dispatch normally.
+        let m = mk(cfg_dropout(5_000, 50)); // 50 ms — easy to wait past
+        m.on_wake();
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(matches!(m.try_dispatch(), DispatchOutcome::Run(_)));
+    }
+
+    #[test]
+    fn dropout_zero_disables_check() {
+        // Belt-and-braces for the operator escape hatch: setting
+        // post_wake_se_dropout_ms=0 must keep the legacy "lenient SE
+        // immediately after wake dispatches" behaviour intact.
+        let m = mk(cfg_dropout(5_000, 0));
+        m.on_wake();
+        assert!(matches!(m.try_dispatch(), DispatchOutcome::Run(_)));
+    }
+
+    #[test]
+    fn dropout_does_not_gate_followup_after_turn() {
+        // Once a real dispatch runs (past the dropout window),
+        // last_wake_at is cleared. A follow-up SE landing in
+        // ArmedAfterTurn must dispatch even when the configured
+        // dropout would otherwise span across both turns.
+        let m = mk(cfg_dropout(5_000, 50));
+        m.on_wake();
+        std::thread::sleep(Duration::from_millis(60)); // past 50 ms dropout
+        let g = run_guard(m.try_dispatch()).expect("first dispatch");
+        drop(g); // → ArmedAfterTurn, last_wake_at now cleared
+        // Follow-up SE — no fresh wake, no fresh wake stamp. With the
+        // stamp cleared, dropout has nothing to measure against and
+        // the dispatch proceeds. (Without the clear, every armed-
+        // after-turn dispatch would race the dropout window.)
+        assert!(matches!(m.try_dispatch(), DispatchOutcome::Run(_)));
     }
 
     #[test]

@@ -283,6 +283,14 @@ services:
       ORCH_WAKE_WINDOW_MS: "${ORCH_WAKE_WINDOW_MS:-5000}"
       ORCH_TURN_FOLLOWUP_WINDOW_MS: "${ORCH_TURN_FOLLOWUP_WINDOW_MS:-10000}"
       ORCH_WAKE_BARGE_IN: "${ORCH_WAKE_BARGE_IN:-true}"
+      # Drop SpeechEnded events that land within this window after a
+      # WakeWordDetected. Defends against VAD capturing the wake
+      # word's own audio and dispatching a turn whose ASR text is
+      # just "Jervis"/"Alexa"/etc. 800 ms covers the wake-word-only
+      # case (VAD silence hangover ~300 ms) without interfering with
+      # continuous "Hey Jarvis, …" commands (SE typically lands >1 s
+      # after wake). Set to 0 in .env to disable.
+      ORCH_POST_WAKE_SE_DROPOUT_MS: "${ORCH_POST_WAKE_SE_DROPOUT_MS:-800}"
     ports:
       - "7000:7000"
     depends_on:

@@ -234,6 +234,15 @@ async fn events(
                             "VAD event dropped: turn-followup window expired"
                         );
                     }
+                    DispatchOutcome::DroppedTooSoonAfterWake => {
+                        info!(
+                            target: "orch::events",
+                            event = "SpeechEnded",
+                            reason = "post_wake_se_dropout",
+                            ts = ?ev.ts,
+                            "VAD event dropped: SpeechEnded landed inside the wake-word echo window (likely VAD reporting the wake word's own audio); state stays armed for the operator's follow-up"
+                        );
+                    }
                 }
             }
         }

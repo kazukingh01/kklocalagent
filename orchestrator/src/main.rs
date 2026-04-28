@@ -59,6 +59,13 @@ struct Args {
     #[arg(long, env = "ORCH_WAKE_BARGE_IN")]
     wake_barge_in: Option<bool>,
 
+    /// Override `wake.post_wake_se_dropout_ms`. SpeechEnded events
+    /// arriving within this window after a WakeWordDetected are
+    /// dropped (defends against VAD capturing the wake word's own
+    /// audio and re-dispatching it as a turn). 0 disables.
+    #[arg(long, env = "ORCH_POST_WAKE_SE_DROPOUT_MS")]
+    post_wake_se_dropout_ms: Option<u64>,
+
     /// Override `result_sink.url`. Empty disables forwarding.
     #[arg(long, env = "ORCH_RESULT_SINK_URL")]
     result_sink_url: Option<String>,
@@ -109,6 +116,9 @@ async fn main() -> Result<()> {
     }
     if let Some(v) = args.wake_barge_in {
         config.wake.barge_in = v;
+    }
+    if let Some(v) = args.post_wake_se_dropout_ms {
+        config.wake.post_wake_se_dropout_ms = v;
     }
     if let Some(v) = args.result_sink_url {
         config.result_sink.url = v;

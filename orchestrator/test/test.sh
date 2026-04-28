@@ -52,6 +52,13 @@ ORCH_BASE_ENV=(
   -e "ORCH_TTS_URL=http://${HARNESS_NAME}:9300/speak"
   -e "ORCH_TTS_STOP_URL=http://${HARNESS_NAME}:9300/stop"
   -e "ORCH_RESULT_SINK_URL=http://${HARNESS_NAME}:9400/sink"
+  # Disable the post-wake SE dropout for tests. The harness fires
+  # WakeWordDetected and SpeechEnded back-to-back (no real audio
+  # between them — these are synthesised events), which production's
+  # 800 ms default would correctly classify as "VAD echoing the wake
+  # word" and drop. Tests want the legacy lenient dispatch so each
+  # scenario asserts its own pipeline outcome explicitly.
+  -e "ORCH_POST_WAKE_SE_DROPOUT_MS=0"
 )
 
 cleanup() {

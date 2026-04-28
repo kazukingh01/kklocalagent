@@ -69,6 +69,15 @@ turn_followup_window_ms = 10000
 # post-turn state will be ArmedAfterWake (5 s) instead of
 # ArmedAfterTurn (10 s).
 barge_in = true
+# Drop SpeechEnded events that land within this many milliseconds of
+# the most recent WakeWordDetected. Targets the "VAD captures the
+# wake word's own audio" flow: a bare "Hey Jarvis" makes VAD fire SE
+# ~300 ms later with the wake word itself as audio, which would
+# otherwise dispatch a turn whose ASR text is "Jervis"/"Alexa". A
+# continuous "Hey Jarvis, what's the weather?" pushes the SE past
+# 1 s thanks to VAD's silence hangover, so this default doesn't
+# block real commands. Set to 0 to disable.
+post_wake_se_dropout_ms = 800
 
 # Optional outbound forwarder for handled events. When url is empty
 # (the default) no forwarding happens — the orchestrator runs
