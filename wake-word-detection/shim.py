@@ -123,7 +123,7 @@ class Shim:
                     log.info("mic connected")
                     async for msg in ws:
                         if isinstance(msg, (bytes, bytearray)):
-                            self.process(bytes(msg))
+                            await self.process(bytes(msg))
             except Exception as e:  # noqa: BLE001 — log & reconnect on any failure
                 self.ws_connected = False
                 log.warning("mic ws error: %s; reconnecting in %.1fs", e, backoff)
@@ -132,7 +132,7 @@ class Shim:
             else:
                 self.ws_connected = False
 
-    def process(self, pcm: bytes) -> None:
+    async def process(self, pcm: bytes) -> None:
         # Re-buffer: audio-io emits 20ms frames but a single WS message
         # may carry several (and TCP coalesces), so slice into 80ms
         # chunks that openWakeWord prefers.
@@ -142,7 +142,18 @@ class Shim:
             chunk = bytes(self.buffer[:FRAME_BYTES])
             del self.buffer[:FRAME_BYTES]
             frame = np.frombuffer(chunk, dtype=np.int16)
-            scores = self.model.predict(frame)
+            # `model.predict` is a synchronous ML call — for tflite the
+            # default `alexa` model it's ~1–2 ms, but ONNX or larger
+            # models are tens of ms per chunk. Running it directly on
+            # the event loop blocks /health, the fire-and-forget POST,
+            # and the WS read for that long. `to_thread` puts it on the
+            # default executor so the loop stays responsive; tflite /
+            # onnxruntime release the GIL during inference, so the
+            # other coros really do run in parallel. Single-threaded
+            # access to the model is preserved because we await each
+            # call serially — the worker pool sees one predict at a
+            # time per shim instance.
+            scores = await asyncio.to_thread(self.model.predict, frame)
             now = time.time()
             if (now - self.last_fire_ts) < self.cooldown:
                 continue
