@@ -81,6 +81,17 @@ pub struct DetectorConfig {
     pub hang_frames: u32,
     /// Hard cap on utterance length. Forces an end event if speech runs longer.
     pub max_utterance_frames: u32,
+    /// Apply RNNoise (nnnoiseless) to every incoming frame before VAD
+    /// classification. Cleans steady-state background noise (fans,
+    /// AC, low keyboard hum) which both reduces VAD false positives
+    /// *and* gives ASR a less ambiguous signal — Whisper is prone to
+    /// hallucinating Japanese YouTube boilerplate ("ご視聴ありがとう
+    /// ございました", "(拍手)") on noisy near-silence and a denoise
+    /// pre-stage materially helps. Adds ~0.5% of one core; the
+    /// 16 k → 48 k → 16 k resampling that RNNoise needs adds one
+    /// frame (~10 ms) of pipeline latency. Off by default — flip on
+    /// when noisy mics demand it.
+    pub denoise: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -134,6 +145,7 @@ impl Default for DetectorConfig {
             start_frames: 3,          // ~60 ms of speech
             hang_frames: 20,          // ~400 ms of silence
             max_utterance_frames: 1500, // 30 s
+            denoise: false,
         }
     }
 }

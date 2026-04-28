@@ -233,6 +233,14 @@ services:
       # Override in .env if you say "えーと、…" mid-utterance and
       # find the agent cutting you off prematurely.
       VAD_HANG_FRAMES: "${VAD_HANG_FRAMES:-10}"
+      # RNNoise (nnnoiseless) pre-stage. On = denoise every 20 ms
+      # frame before VAD classification AND before ASR receives the
+      # utterance buffer. Cleans steady-state background (fans, AC,
+      # hum), reduces VAD false positives, and noticeably cuts
+      # Whisper's silence-hallucination rate ("ご視聴ありがとう
+      # ございました" / "(拍手)") on noisy near-silence. Adds
+      # ~0.5% of one core + ~10 ms pipeline latency. Off by default.
+      VAD_DENOISE: "${VAD_DENOISE:-false}"
     extra_hosts:
       # Plain Linux docker (non-Docker-Desktop, non-WSL2) doesn't
       # resolve `host.docker.internal` by default. host-gateway makes

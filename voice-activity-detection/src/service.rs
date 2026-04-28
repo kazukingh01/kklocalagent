@@ -146,6 +146,22 @@ async fn connect_and_run(
 
     let bytes_per_frame = cfg.detector.bytes_per_frame();
     let samples_per_frame = cfg.detector.samples_per_frame();
+    // Optional denoiser. Built once and held across frames so the
+    // RNNoise state and rubato FFT plans amortise across the whole
+    // session. None when `detector.denoise = false` — the audio
+    // path stays byte-identical to the previous build in that case.
+    let mut denoiser = if cfg.detector.denoise {
+        if cfg.detector.sample_rate != 16_000 {
+            anyhow::bail!(
+                "detector.denoise requires sample_rate=16000 (got {})",
+                cfg.detector.sample_rate
+            );
+        }
+        info!("denoise: nnnoiseless (RNNoise) enabled, frame={}", samples_per_frame);
+        Some(crate::denoise::Denoiser::new(samples_per_frame).context("init denoiser")?)
+    } else {
+        None
+    };
     let sr = cfg.detector.sample_rate;
     let mode = cfg.sink.mode;
     let log_audio = cfg.sink.log_audio_in_event;
@@ -175,13 +191,27 @@ async fn connect_and_run(
         };
         scratch.extend_from_slice(&payload);
         while scratch.len() >= bytes_per_frame {
-            let frame: Vec<u8> = scratch.drain(..bytes_per_frame).collect();
+            let mut frame: Vec<u8> = scratch.drain(..bytes_per_frame).collect();
             samples.clear();
             samples.extend(
                 frame
                     .chunks_exact(2)
                     .map(|p| i16::from_le_bytes([p[0], p[1]])),
             );
+            // RNNoise pre-stage. Mutates `samples` in place; we then
+            // re-encode the cleaned PCM back into `frame` so the
+            // utterance buffer that goes to ASR (via fsm.push_frame
+            // → fsm.utterance_buffer()) carries the denoised audio
+            // too — Whisper sees a less ambiguous signal, fewer
+            // hallucinations on near-silence.
+            if let Some(d) = denoiser.as_mut() {
+                d.process(&mut samples).context("denoise frame")?;
+                for (i, s) in samples.iter().enumerate() {
+                    let bytes = s.to_le_bytes();
+                    frame[i * 2] = bytes[0];
+                    frame[i * 2 + 1] = bytes[1];
+                }
+            }
             let is_speech = vad
                 .is_voice_segment(&samples)
                 .map_err(|_| anyhow!("vad classify: frame length mismatch"))?;

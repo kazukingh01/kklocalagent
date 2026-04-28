@@ -47,6 +47,15 @@ struct Args {
     #[arg(long, env = "VAD_HANG_FRAMES")]
     hang_frames: Option<u32>,
 
+    /// Override `detector.denoise`. When true, every incoming
+    /// 20 ms frame is run through nnnoiseless (RNNoise) before VAD
+    /// classification *and* before being buffered for ASR. Cleans
+    /// steady-state background noise (fans, AC, low hum); reduces
+    /// VAD false positives and Whisper's silence-hallucination
+    /// rate ("ご視聴ありがとうございました" etc.).
+    #[arg(long, env = "VAD_DENOISE")]
+    denoise: Option<bool>,
+
     /// Shortcut for `--sink-mode asr-direct`. Kept for back-compat with
     /// the early dry-run/live split.
     #[arg(long, conflicts_with = "sink_mode")]
@@ -80,6 +89,9 @@ async fn main() -> Result<()> {
     }
     if let Some(v) = args.hang_frames {
         config.detector.hang_frames = v;
+    }
+    if let Some(v) = args.denoise {
+        config.detector.denoise = v;
     }
     if let Some(mode) = args.sink_mode {
         config.sink.mode = mode;
