@@ -106,6 +106,25 @@ async fn events(
 
     match ev.name.as_str() {
         "SpeechStarted" => {
+            // Pre-gate: drop while the assistant's own TTS is still
+            // bleeding through audio-io's playback ring. Without this,
+            // the speaker → mic loop fires VAD with the assistant's
+            // voice and we'd dispatch an echo turn. Run BEFORE the
+            // wake-machine call so a dropped event doesn't churn
+            // armed-timer state. WakeWordDetected itself is *not*
+            // gated here — the operator deliberately barging in is
+            // exactly the case the gate must let through.
+            if state.backends.in_tts_quiet_window() {
+                info!(
+                    target: "orch::events",
+                    event = "SpeechStarted",
+                    reason = "tts_quiet_window",
+                    frame_index = ?ev.frame_index,
+                    ts = ?ev.ts,
+                    "VAD event dropped: TTS playback still draining (echo-suppression window)"
+                );
+                return (StatusCode::OK, Json(json!({"ok": true})));
+            }
             // SpeechStarted is the *cancel* trigger for armed-window
             // timers (per v1.0 spec). on_speech_started() handles the
             // state transition (ArmedAfter* → Listening); here we
@@ -179,6 +198,21 @@ async fn events(
             }
         }
         "SpeechEnded" => {
+            // Same pre-gate as SpeechStarted: an SE landing inside
+            // the TTS playback tail is almost certainly the
+            // assistant's reply being captured by the mic. Drop
+            // here before the wake-machine sees it so neither phase
+            // nor permits move.
+            if state.backends.in_tts_quiet_window() {
+                info!(
+                    target: "orch::events",
+                    event = "SpeechEnded",
+                    reason = "tts_quiet_window",
+                    ts = ?ev.ts,
+                    "VAD event dropped: TTS playback still draining (echo-suppression window)"
+                );
+                return (StatusCode::OK, Json(json!({"ok": true})));
+            }
             if !ev.has_utterance_audio() {
                 warn!(
                     target: "orch::events",

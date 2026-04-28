@@ -59,6 +59,14 @@ ORCH_BASE_ENV=(
   # word" and drop. Tests want the legacy lenient dispatch so each
   # scenario asserts its own pipeline outcome explicitly.
   -e "ORCH_POST_WAKE_SE_DROPOUT_MS=0"
+  # Disable the post-TTS VAD quiet window. The strict test group
+  # runs ~20 scenarios back-to-back in the same orch process; once
+  # one scenario completes a TTS-bearing turn, the 500 ms quiet
+  # window straddles into the next scenario's first SE and drops
+  # it (manifests as "expected ASR=1, got 0" on the happy path
+  # immediately after `system_prompt_prepended`). Real deployments
+  # don't see this because the operator can't speak inside 500 ms.
+  -e "ORCH_TTS_TAIL_QUIET_MS=0"
 )
 
 cleanup() {

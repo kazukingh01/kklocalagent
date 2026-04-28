@@ -47,6 +47,13 @@ stop_url = "http://tts-streamer:7070/stop"
 # physically takes 5 s to push through audio-io.
 timeout_ms = 60000
 max_inflight = 1
+# Drop VAD events for this many ms after each turn's TTS completes.
+# Covers audio-io's playback-ring tail so the assistant's own voice
+# leaking back through the mic doesn't fire VAD and trigger an echo
+# turn. WakeWordDetected stays unaffected — the operator deliberately
+# barging in must still cut through. 0 disables (use when AEC is
+# handled upstream).
+tail_quiet_ms = 500
 
 # Wake-gating policy. v1.0 default: gate the ASR→LLM→TTS pipeline
 # on a recent WakeWordDetected event. Set `required = false` to fall

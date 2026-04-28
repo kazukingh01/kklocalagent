@@ -41,6 +41,13 @@ struct Args {
     #[arg(long, env = "ORCH_TTS_STOP_URL")]
     tts_stop_url: Option<String>,
 
+    /// Override `tts.tail_quiet_ms`. Drop VAD events for this many
+    /// extra milliseconds after each turn's TTS completes — covers
+    /// the audio-io playback-ring tail so the assistant's own voice
+    /// can't fire VAD and dispatch an echo turn. 0 disables.
+    #[arg(long, env = "ORCH_TTS_TAIL_QUIET_MS")]
+    tts_tail_quiet_ms: Option<u64>,
+
     /// Override `wake.required` (true / false).
     #[arg(long, env = "ORCH_WAKE_REQUIRED")]
     wake_required: Option<bool>,
@@ -104,6 +111,9 @@ async fn main() -> Result<()> {
     }
     if let Some(v) = args.tts_stop_url {
         config.tts.stop_url = v;
+    }
+    if let Some(v) = args.tts_tail_quiet_ms {
+        config.tts.tail_quiet_ms = v;
     }
     if let Some(v) = args.wake_required {
         config.wake.required = v;

@@ -303,6 +303,13 @@ services:
       # continuous "Hey Jarvis, …" commands (SE typically lands >1 s
       # after wake). Set to 0 in .env to disable.
       ORCH_POST_WAKE_SE_DROPOUT_MS: "${ORCH_POST_WAKE_SE_DROPOUT_MS:-800}"
+      # Drop VAD events for this many ms after each turn's TTS
+      # finishes. /speak returns when the last PCM frame hits the
+      # WebSocket, but audio-io still has 200–300 ms in its playback
+      # ring; without the quiet window the assistant's own voice
+      # leaks back through the mic and triggers an echo turn. Set to
+      # 0 to disable when AEC is handled upstream.
+      ORCH_TTS_TAIL_QUIET_MS: "${ORCH_TTS_TAIL_QUIET_MS:-500}"
     ports:
       - "7000:7000"
     depends_on:

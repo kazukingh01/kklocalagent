@@ -15,7 +15,8 @@
 //! held for the *whole turn* (across N /speak calls) so two consecutive
 //! sentences from the same turn don't race for the same slot.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -79,6 +80,12 @@ pub struct Backends {
     pub asr_inflight: Arc<Semaphore>,
     pub llm_inflight: Arc<Semaphore>,
     pub tts_inflight: Arc<Semaphore>,
+    /// Deadline before which all VAD events (SS *and* SE) are dropped
+    /// at the service.rs boundary. Set when run_turn finishes its TTS
+    /// stage so the audio-io playback-ring tail can drain without the
+    /// assistant's own voice being picked up by the mic and firing a
+    /// new turn. `None` = no quiet window currently active.
+    pub tts_quiet_until: Arc<Mutex<Option<Instant>>>,
 }
 
 impl Backends {
@@ -110,7 +117,19 @@ impl Backends {
             asr_inflight,
             llm_inflight,
             tts_inflight,
+            tts_quiet_until: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// True when the configured `tts.tail_quiet_ms` window is still
+    /// active — service.rs uses this to drop VAD events that would
+    /// otherwise be the assistant's own voice echoing back through
+    /// the mic during the audio-io playback tail.
+    pub fn in_tts_quiet_window(&self) -> bool {
+        match *self.tts_quiet_until.lock().expect("tts_quiet poisoned") {
+            Some(t) => t > Instant::now(),
+            None => false,
+        }
     }
 }
 
@@ -278,6 +297,20 @@ pub async fn run_turn(
     // while this one's tail is still pacing out).
     let _ = consumer.await;
     drop(llm_permit);
+
+    // Open the post-TTS quiet window. /speak returns as soon as the
+    // last PCM frame has been pushed to the WS, but audio-io's
+    // playback ring still has a few hundred ms of audio queued for
+    // the speaker. Without this, the assistant's own voice — leaking
+    // back into the mic during that tail — would fire VAD and
+    // dispatch an echo turn. service.rs::events checks
+    // `backends.in_tts_quiet_window()` before forwarding any
+    // SS/SE to the wake machine. Only set when TTS is actually
+    // wired up; a no-TTS run (url empty) has nothing to drain.
+    if !backends.tts.url.is_empty() && backends.tts.tail_quiet_ms > 0 {
+        let until = Instant::now() + Duration::from_millis(backends.tts.tail_quiet_ms);
+        *backends.tts_quiet_until.lock().expect("tts_quiet poisoned") = Some(until);
+    }
 
     let reply = match reply_result {
         Ok(r) => r,
