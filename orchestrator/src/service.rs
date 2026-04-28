@@ -268,6 +268,15 @@ async fn events(
                             "VAD event dropped: turn-followup window expired"
                         );
                     }
+                    DispatchOutcome::ListeningWindowExpired => {
+                        warn!(
+                            target: "orch::events",
+                            event = "SpeechEnded",
+                            reason = "listening_window_expired",
+                            ts = ?ev.ts,
+                            "VAD event dropped: SS arrived but SE didn't land within the original armed window (likely noise-driven SS while real SEs were filtered upstream)"
+                        );
+                    }
                     DispatchOutcome::DroppedTooSoonAfterWake => {
                         info!(
                             target: "orch::events",

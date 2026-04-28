@@ -34,18 +34,24 @@
 //!
 //! Two distinct windows replace v0.1's single `arm_window_ms`:
 //!   - `wake_window_ms`           — after a wake, how long to wait
-//!                                  for SpeechStarted (default 5 s)
+//!                                  for SpeechEnded (default 5 s)
 //!   - `turn_followup_window_ms`  — after a turn ends, how long to
-//!                                  wait for the next SpeechStarted
+//!                                  wait for the next SpeechEnded
 //!                                  (default 10 s)
 //!
-//! SpeechStarted is the trigger that *cancels* the timer (per v1.0
-//! spec). SpeechEnded then carries the audio for dispatch — when SE
-//! arrives in `Listening` we transition to `Processing` and run the
-//! pipeline. SE arriving directly in an `ArmedAfter*` state without
-//! a preceding SS is accepted leniently (real VAD always sends SS
-//! first; this fallback covers the harness tests that synthesise
-//! events without an SS step).
+//! SpeechStarted is a *phase-only* trigger: ArmedAfter* → Listening,
+//! but the underlying `armed_until` keeps ticking. The timer is only
+//! reset by `complete()` (i.e. an ASR-completed turn) — never by a
+//! bare SS. This stops noise-driven SSs from parking state in
+//! Listening forever when their corresponding SE is filtered upstream
+//! by VAD's RMS gate. SpeechEnded carries the audio for dispatch —
+//! when SE arrives in `Listening` *within the inherited window* we
+//! transition to `Processing` and run the pipeline; out-of-window SE
+//! returns `ListeningWindowExpired` and falls to Idle. SE arriving
+//! directly in an `ArmedAfter*` state without a preceding SS is
+//! accepted leniently (real VAD always sends SS first; this fallback
+//! covers the harness tests that synthesise events without an SS
+//! step).
 //!
 //! Always-listening mode (`required = false`) bypasses the gate
 //! entirely: every SpeechEnded triggers a pipeline run regardless of
@@ -65,8 +71,13 @@ enum Phase {
     /// turn_followup_window. Lets the operator continue a conversation
     /// without re-saying the wake word.
     ArmedAfterTurn,
-    /// SpeechStarted received; waiting for SpeechEnded. No timeout
-    /// here (VAD's max_utterance_frames bounds the utterance length).
+    /// SpeechStarted received; waiting for SpeechEnded. The armed_until
+    /// timer from the *preceding* ArmedAfter* phase keeps ticking — SS
+    /// is just a phase change, not a timer cancel. If SE doesn't arrive
+    /// within the original window, dispatch returns ListeningWindowExpired
+    /// and state falls to Idle. This guards against the failure mode where
+    /// noise-induced SS transitions stash state in Listening forever while
+    /// the corresponding SE is silently dropped by VAD's RMS gate.
     Listening,
     /// Pipeline (ASR/LLM/TTS) running.
     Processing,
@@ -160,6 +171,11 @@ pub enum DispatchOutcome {
     /// State was ArmedAfterTurn but the follow-up window had expired;
     /// SE dropped.
     TurnWindowExpired,
+    /// State was Listening but the armed_until timer (inherited from
+    /// the preceding ArmedAfter* phase) had expired before SE arrived.
+    /// State reset to Idle. Triggers when noise drove an SS but the
+    /// real SE never landed within the original 5 s / 10 s window.
+    ListeningWindowExpired,
     /// SE arrived within `post_wake_se_dropout` of the most recent
     /// WakeWordDetected — almost certainly VAD echoing the wake word's
     /// own audio rather than a real command. State is left armed (the
@@ -273,8 +289,11 @@ impl WakeMachine {
         match g.phase {
             Phase::ArmedAfterWake => match g.armed_until {
                 Some(t) if t > now => {
+                    // Preserve armed_until — only ASR-completed turns
+                    // refresh the timer (via complete()). SS is just a
+                    // phase change so noise-driven SSs can't park state
+                    // in Listening past the original window.
                     g.phase = Phase::Listening;
-                    g.armed_until = None;
                     SpeechStartedOutcome::Listening
                 }
                 _ => {
@@ -286,7 +305,6 @@ impl WakeMachine {
             Phase::ArmedAfterTurn => match g.armed_until {
                 Some(t) if t > now => {
                     g.phase = Phase::Listening;
-                    g.armed_until = None;
                     SpeechStartedOutcome::Listening
                 }
                 _ => {
@@ -354,7 +372,23 @@ impl WakeMachine {
             }
         };
         match g.phase {
-            Phase::Listening => DispatchOutcome::Run(mint_guard(&mut g)),
+            Phase::Listening => match g.armed_until {
+                // Window still open: dispatch normally. Inherited from
+                // the preceding ArmedAfter* phase via on_speech_started.
+                Some(t) if t > now => DispatchOutcome::Run(mint_guard(&mut g)),
+                // Window expired while waiting for SE. Drops the
+                // noise-driven-SS-stuck-in-Listening case to Idle so the
+                // operator must re-wake.
+                Some(_) => {
+                    g.phase = Phase::Idle;
+                    g.armed_until = None;
+                    DispatchOutcome::ListeningWindowExpired
+                }
+                // No timer ever set (shouldn't happen in normal flow,
+                // but on_wake/complete always populate armed_until).
+                // Be lenient: dispatch.
+                None => DispatchOutcome::Run(mint_guard(&mut g)),
+            },
             Phase::ArmedAfterWake => match g.armed_until {
                 Some(t) if t > now => DispatchOutcome::Run(mint_guard(&mut g)),
                 _ => {
@@ -676,6 +710,55 @@ mod tests {
         // A fresh SS now must transition through ArmedAfterWake →
         // Listening normally — confirms the state really did reset.
         assert_eq!(m.on_speech_started(), SpeechStartedOutcome::Listening);
+    }
+
+    #[test]
+    fn listening_inherits_armed_timer_and_expires() {
+        // Regression: noise-driven SS would park state in Listening
+        // and (because armed_until was cleared on SS) Listening had no
+        // timeout. Real SEs were silently dropped upstream by VAD's
+        // RMS gate, so state hung forever and the next gate-passing SE
+        // — even minutes later — dispatched. Now SS preserves the
+        // armed_until inherited from ArmedAfter*; if SE doesn't arrive
+        // before that timer expires, dispatch returns ListeningWindowExpired.
+        let m = mk(cfg(true, 50, 10_000, true));
+        m.on_wake();
+        assert_eq!(m.on_speech_started(), SpeechStartedOutcome::Listening);
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(matches!(
+            m.try_dispatch(),
+            DispatchOutcome::ListeningWindowExpired
+        ));
+        // State fell to Idle: a follow-up SE without a fresh wake must
+        // be NotArmed, not Run.
+        assert!(matches!(m.try_dispatch(), DispatchOutcome::NotArmed));
+    }
+
+    #[test]
+    fn listening_within_window_still_dispatches() {
+        // SS preserves the timer but doesn't shorten it: an SE arriving
+        // well within the original window must dispatch normally.
+        let m = mk(cfg(true, 1_000, 10_000, true));
+        m.on_wake();
+        assert_eq!(m.on_speech_started(), SpeechStartedOutcome::Listening);
+        assert!(matches!(m.try_dispatch(), DispatchOutcome::Run(_)));
+    }
+
+    #[test]
+    fn turn_followup_listening_expires_when_se_never_arrives() {
+        // Specifically the bug from the field: turn ends → ArmedAfterTurn
+        // → noise SS → Listening. Without a real SE, the original 10 s
+        // turn-followup window must still expire and reset state.
+        let m = mk(cfg(true, 1_000, 50, true));
+        m.on_wake();
+        let g = run_guard(m.try_dispatch()).unwrap();
+        drop(g); // → ArmedAfterTurn (50 ms window)
+        assert_eq!(m.on_speech_started(), SpeechStartedOutcome::Listening);
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(matches!(
+            m.try_dispatch(),
+            DispatchOutcome::ListeningWindowExpired
+        ));
     }
 
     #[test]
