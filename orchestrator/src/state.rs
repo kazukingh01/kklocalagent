@@ -4,8 +4,10 @@
 //!   ┌──────────── (window expires) ───────────┐
 //!   ▼                                          │
 //!  Idle ─Wake─► ArmedAfterWake ─SS─► Listening ─SE─► Processing
-//!                  │  ▲                                  │
-//!                  │  └────── Wake (refresh) ────────────┤
+//!                  │  ▲                  │               │
+//!                  │  └── Wake (refresh) ┤               │
+//!                  │                     │               │
+//!                  │  ◄─── Wake (restart from Listening) ┤
 //!                  │                                     │
 //!                  │     (turn ends)                     │
 //!                  │                       ◄─────────────┘
@@ -20,6 +22,15 @@
 //!                                          (so complete() goes to
 //!                                          ArmedAfterWake, not Turn)
 //! ```
+//!
+//! "Wake (restart from Listening)" is the case where the operator
+//! says the wake word *while still mid-utterance* (or wake-word
+//! detection mis-fires on their voice). State resets to
+//! ArmedAfterWake so the next SpeechStarted starts a fresh turn.
+//! The VAD's already-buffered audio is discarded by
+//! `post_wake_se_dropout` when its SE eventually arrives within the
+//! dropout window — see `try_dispatch`. Intentional behaviour:
+//! treats the second wake as "scratch that, start over".
 //!
 //! Two distinct windows replace v0.1's single `arm_window_ms`:
 //!   - `wake_window_ms`           — after a wake, how long to wait
@@ -233,7 +244,13 @@ impl WakeMachine {
             // the v1.0 spec ("Wake during follow-up window resets
             // back to a fresh wake state"). Refresh from
             // ArmedAfterWake same idea. Listening → ArmedAfterWake
-            // means "user said wake again mid-utterance, restart".
+            // means "user said the wake word mid-utterance — treat it
+            // as scratch-that-start-over". The VAD's in-progress
+            // buffer is not cleared by us (we don't own it), but its
+            // eventual SE lands inside `post_wake_se_dropout` and
+            // gets dropped; the operator's fresh utterance after the
+            // restart dispatches normally. See the state diagram at
+            // the top of this file.
             _ => {
                 g.phase = Phase::ArmedAfterWake;
                 g.armed_until = Some(until);
@@ -637,6 +654,28 @@ mod tests {
         // the dispatch proceeds. (Without the clear, every armed-
         // after-turn dispatch would race the dropout window.)
         assert!(matches!(m.try_dispatch(), DispatchOutcome::Run(_)));
+    }
+
+    #[test]
+    fn wake_during_listening_restarts_into_armed_after_wake() {
+        // "Scratch that, start over" path: operator started speaking
+        // (SS arrived → Listening) and then either says the wake word
+        // again mid-utterance, or the wake-word model mis-fires on
+        // their own voice. WakeMachine should reset to
+        // ArmedAfterWake with a fresh wake_window and a refreshed
+        // last_wake_at stamp so the in-progress utterance's
+        // eventual SE gets dropped by post_wake_se_dropout.
+        let m = mk(cfg(true, 5_000, 10_000, true));
+        m.on_wake();
+        assert_eq!(m.on_speech_started(), SpeechStartedOutcome::Listening);
+        // Mid-utterance wake — phase was Listening, expect Armed
+        // (the same outcome as a fresh wake from Idle, on purpose:
+        // callers don't need to distinguish "first wake" from
+        // "restart from Listening").
+        assert_eq!(m.on_wake(), WakeResult::Armed);
+        // A fresh SS now must transition through ArmedAfterWake →
+        // Listening normally — confirms the state really did reset.
+        assert_eq!(m.on_speech_started(), SpeechStartedOutcome::Listening);
     }
 
     #[test]

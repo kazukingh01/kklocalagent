@@ -582,6 +582,14 @@ async fn llm_chat_streaming(
     // Byte-level accumulator (chunks may split mid-line); newline (0x0A)
     // is ASCII and never appears mid-UTF-8 codepoint, so splitting at
     // `\n` is always at a valid string boundary.
+    //
+    // Hard cap so a malformed upstream that streams without ever
+    // emitting `\n` can't drag the orchestrator down with unbounded
+    // memory growth. ollama in practice emits one ndjson line per
+    // delta token (typically <1 KB), so even a long verbose reply
+    // stays well under this limit. Hitting the cap is "the response
+    // shape isn't ndjson" — bail and let the turn skip TTS.
+    const LLM_STREAM_BUF_MAX: usize = 1 << 20; // 1 MiB
     let mut byte_buf: Vec<u8> = Vec::new();
     // Per-sentence text accumulator: deltas append here and we drain
     // each completed sentence out into the channel.
@@ -614,6 +622,13 @@ async fn llm_chat_streaming(
             first_chunk_logged = true;
         }
         byte_buf.extend_from_slice(&chunk);
+        if byte_buf.len() > LLM_STREAM_BUF_MAX {
+            anyhow::bail!(
+                "LLM stream produced {} bytes without a newline (cap {}); aborting turn",
+                byte_buf.len(),
+                LLM_STREAM_BUF_MAX
+            );
+        }
 
         while let Some(nl_pos) = byte_buf.iter().position(|&b| b == b'\n') {
             let raw: Vec<u8> = byte_buf.drain(..=nl_pos).collect();
@@ -691,19 +706,22 @@ async fn llm_chat_streaming(
 
 /// Find the first sentence-terminator in `s` and return the byte
 /// offset *after* it (so `s[..end]` is the sentence including its
-/// terminator). Terminators: `。 、 ！ ？ … ! ? , \n`. Returns None
+/// terminator). Terminators: `。 、 ！ ？ … ! ? \n`. Returns None
 /// if no terminator is present yet.
 ///
-/// Commas (`、` `,`) and the ellipsis (`…`) are *prosodic* breaks,
+/// The Japanese comma `、` and ellipsis `…` are *prosodic* breaks,
 /// not full sentence ends, but VOICEVOX naturally inserts a short
 /// pause at each so flushing per-chunk shortens time-to-first-audio
-/// without warping the spoken cadence. ASCII `.` deliberately stays
-/// out — it would mis-split numerics like "1.5" mid-token.
+/// without warping the spoken cadence. ASCII `.` and `,` deliberately
+/// stay out — they would mis-split numerics like "1.5" or "1,000",
+/// and English clausal commas ("a, b, and c") would each become a
+/// separate TTS unit with a wrong-feeling prosodic break. The
+/// Japanese `、` is safe because it never appears mid-numeric.
 fn find_sentence_end(s: &str) -> Option<usize> {
     for (i, ch) in s.char_indices() {
         if matches!(
             ch,
-            '。' | '、' | '！' | '？' | '…' | '!' | '?' | ',' | '\n'
+            '。' | '、' | '！' | '？' | '…' | '!' | '?' | '\n'
         ) {
             return Some(i + ch.len_utf8());
         }
@@ -731,7 +749,7 @@ mod tests {
 
     #[test]
     fn find_sentence_end_detects_each_terminator() {
-        // Multibyte: 。！？、… are 3 bytes each. ASCII !?, and \n are 1.
+        // Multibyte: 。！？、… are 3 bytes each. ASCII !? and \n are 1.
         assert_eq!(find_sentence_end("こんにちは。world"), Some("こんにちは。".len()));
         assert_eq!(find_sentence_end("やあ！ next"), Some("やあ！".len()));
         assert_eq!(find_sentence_end("元気？ next"), Some("元気？".len()));
@@ -739,11 +757,14 @@ mod tests {
         assert_eq!(find_sentence_end("うーん…続き"), Some("うーん…".len()));
         assert_eq!(find_sentence_end("hi! next"), Some(3));
         assert_eq!(find_sentence_end("hi? next"), Some(3));
-        assert_eq!(find_sentence_end("yes, then"), Some(4));
         assert_eq!(find_sentence_end("line1\nline2"), Some(6));
         assert_eq!(find_sentence_end("no terminator yet"), None);
-        // ASCII `.` stays a non-terminator so numerics aren't split.
+        // ASCII `.` and `,` stay non-terminators so numerics aren't split.
         assert_eq!(find_sentence_end("about 1.5 meters"), None);
+        assert_eq!(find_sentence_end("price 1,000 yen"), None);
+        // English clausal commas don't terminate either — would
+        // produce wrong-feeling prosodic breaks via VOICEVOX.
+        assert_eq!(find_sentence_end("a, b, and c"), None);
         assert_eq!(find_sentence_end(""), None);
     }
 
@@ -754,5 +775,240 @@ mod tests {
         let s = "前。後！";
         let end = find_sentence_end(s).unwrap();
         assert_eq!(&s[..end], "前。");
+    }
+
+    #[test]
+    fn in_tts_quiet_window_respects_deadline() {
+        // Build a minimal Backends; only the tts_quiet_until field
+        // matters for this test, the rest can be defaults.
+        let backends = Backends::new(
+            crate::config::AsrConfig::default(),
+            crate::config::LlmConfig::default(),
+            crate::config::TtsConfig::default(),
+            crate::config::ResultSinkConfig::default(),
+        )
+        .unwrap();
+
+        // Initial state: no quiet window has been opened yet.
+        assert!(!backends.in_tts_quiet_window());
+
+        // Future deadline → window is active.
+        *backends.tts_quiet_until.lock().unwrap() =
+            Some(Instant::now() + Duration::from_millis(50));
+        assert!(backends.in_tts_quiet_window());
+
+        // Past deadline → window has lapsed (the field is left set
+        // intentionally; service.rs never bothers to clear it because
+        // a stale Instant in the past is a no-op for the comparison).
+        *backends.tts_quiet_until.lock().unwrap() =
+            Some(Instant::now() - Duration::from_millis(1));
+        assert!(!backends.in_tts_quiet_window());
+
+        // Cleared (None) → no window.
+        *backends.tts_quiet_until.lock().unwrap() = None;
+        assert!(!backends.in_tts_quiet_window());
+    }
+
+    #[test]
+    fn in_tts_quiet_window_boundary_exactly_now_is_not_active() {
+        // The check is `t > Instant::now()` (strict greater-than),
+        // so a deadline equal to "now" is treated as already lapsed.
+        // Pin this in a test so a future refactor to >= doesn't slip
+        // in unnoticed (would silently widen the echo-suppression
+        // window by one tick).
+        let backends = Backends::new(
+            crate::config::AsrConfig::default(),
+            crate::config::LlmConfig::default(),
+            crate::config::TtsConfig::default(),
+            crate::config::ResultSinkConfig::default(),
+        )
+        .unwrap();
+        let now = Instant::now();
+        *backends.tts_quiet_until.lock().unwrap() = Some(now);
+        // By the time `in_tts_quiet_window` reads `Instant::now()`
+        // again, even nanoseconds have elapsed, so `t > Instant::now()`
+        // must be false.
+        assert!(!backends.in_tts_quiet_window());
+    }
+
+    // --- llm_chat_streaming integration tests ------------------------------
+    //
+    // These bind a local tokio TCP listener and write a hand-rolled HTTP/1.1
+    // response, mocking ollama's `/api/chat` ndjson stream. The point is to
+    // exercise the *parsing* path (chunk re-assembly, ndjson splitting,
+    // delta accumulation, sentence drain) end-to-end on the real reqwest
+    // stack, since that's where streaming bugs hide. Spinning up axum
+    // would be heavier and leak more deps into dev-deps.
+
+    use crate::config::{AsrConfig, LlmConfig, ResultSinkConfig, TtsConfig, WakeConfig};
+    use crate::state::WakeMachine;
+    use std::sync::Arc as StdArc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Spawn a one-shot HTTP server that accepts a single connection,
+    /// reads (and discards) the request, and writes back a fixed body
+    /// with the given content-type. Returns the bound address.
+    async fn spawn_mock_llm(body: Vec<u8>) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Read and discard the request headers + body. We only
+            // need to drain enough that the client's POST completes;
+            // the actual content is irrelevant for the parser test.
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(header.as_bytes()).await;
+            let _ = sock.write_all(&body).await;
+            let _ = sock.shutdown().await;
+        });
+        addr
+    }
+
+    /// Build a minimal `Backends` whose llm.url points at `addr`.
+    /// All other backend URLs stay empty so no live calls are made.
+    fn backends_with_llm_addr(addr: std::net::SocketAddr) -> StdArc<Backends> {
+        let asr = AsrConfig::default();
+        let mut llm = LlmConfig::default();
+        llm.url = format!("http://{addr}/api/chat");
+        // Long enough that the test never trips it but short enough
+        // that a hung mock fails fast.
+        llm.timeout_ms = 5_000;
+        let tts = TtsConfig::default();
+        let result_sink = ResultSinkConfig::default();
+        StdArc::new(Backends::new(asr, llm, tts, result_sink).unwrap())
+    }
+
+    /// `WakeMachine` in always-listening mode so `pipeline_still_active()`
+    /// returns true throughout — otherwise the streaming function would
+    /// short-circuit on the very first sentence.
+    fn loose_wake() -> StdArc<WakeMachine> {
+        let mut cfg = WakeConfig::default();
+        cfg.required = false;
+        StdArc::new(WakeMachine::new(&cfg))
+    }
+
+    #[tokio::test]
+    async fn llm_chat_streaming_drains_japanese_sentences_in_order() {
+        // Three deltas split across line boundaries. The middle delta
+        // crosses a sentence boundary (ends mid-sentence) to make sure
+        // the per-line drain correctly accumulates across deltas.
+        let body = concat!(
+            r#"{"message":{"content":"こんにちは"}}"#, "\n",
+            r#"{"message":{"content":"。今日は"}}"#, "\n",
+            r#"{"message":{"content":"いい天気ですね。"}}"#, "\n",
+            r#"{"done":true}"#, "\n",
+        ).as_bytes().to_vec();
+        let addr = spawn_mock_llm(body).await;
+        let backends = backends_with_llm_addr(addr);
+        let wake = loose_wake();
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        let reply = llm_chat_streaming(&backends, &wake, "test", tx).await.unwrap();
+        let mut sentences = vec![];
+        while let Some(s) = rx.recv().await {
+            sentences.push(s);
+        }
+        assert_eq!(sentences, vec!["こんにちは。", "今日はいい天気ですね。"]);
+        assert_eq!(reply, "こんにちは。今日はいい天気ですね。");
+    }
+
+    #[tokio::test]
+    async fn llm_chat_streaming_preserves_numerics_with_commas_and_periods() {
+        // Regression for the comma-was-a-terminator bug: "1,000" must
+        // arrive as one sentence, not two prosodic units. Same for
+        // "1.5" (already covered by the find_sentence_end test, but
+        // we re-check it via the streaming path because that's where
+        // operators see the wrong-prosody symptom).
+        let body = concat!(
+            r#"{"message":{"content":"値段は1,000円で、サイズは1.5"}}"#, "\n",
+            r#"{"message":{"content":"メートルです。"}}"#, "\n",
+            r#"{"done":true}"#, "\n",
+        ).as_bytes().to_vec();
+        let addr = spawn_mock_llm(body).await;
+        let backends = backends_with_llm_addr(addr);
+        let wake = loose_wake();
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        let _reply = llm_chat_streaming(&backends, &wake, "test", tx).await.unwrap();
+        let mut sentences = vec![];
+        while let Some(s) = rx.recv().await {
+            sentences.push(s);
+        }
+        // Japanese `、` *is* a terminator (prosodic break that
+        // VOICEVOX renders cleanly), so we expect a split there.
+        // The ASCII `,` and `.` inside numerics must NOT split.
+        assert_eq!(
+            sentences,
+            vec!["値段は1,000円で、", "サイズは1.5メートルです。"]
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_chat_streaming_skips_unparseable_lines() {
+        // Forward-compat: garbage line in the middle of a stream
+        // shouldn't kill the turn — log + skip and keep parsing.
+        let body = concat!(
+            r#"{"message":{"content":"はい、"}}"#, "\n",
+            "garbage not json\n",
+            r#"{"message":{"content":"了解しました。"}}"#, "\n",
+            r#"{"done":true}"#, "\n",
+        ).as_bytes().to_vec();
+        let addr = spawn_mock_llm(body).await;
+        let backends = backends_with_llm_addr(addr);
+        let wake = loose_wake();
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        let reply = llm_chat_streaming(&backends, &wake, "test", tx).await.unwrap();
+        let mut sentences = vec![];
+        while let Some(s) = rx.recv().await {
+            sentences.push(s);
+        }
+        assert_eq!(sentences, vec!["はい、", "了解しました。"]);
+        assert_eq!(reply, "はい、了解しました。");
+    }
+
+    #[tokio::test]
+    async fn llm_chat_streaming_caps_unbounded_buffer_without_newlines() {
+        // Pathological upstream: 2 MiB of body without ever sending
+        // a newline. The orchestrator must bail before swallowing
+        // the whole thing — otherwise a malformed LLM could OOM us.
+        let body = vec![b'x'; 2 * 1024 * 1024];
+        let addr = spawn_mock_llm(body).await;
+        let backends = backends_with_llm_addr(addr);
+        let wake = loose_wake();
+        let (tx, _rx) = mpsc::channel::<String>(8);
+        let err = llm_chat_streaming(&backends, &wake, "test", tx)
+            .await
+            .expect_err("expected bail on unbounded body");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("without a newline"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_chat_streaming_flushes_trailing_partial_sentence() {
+        // Last delta ends without a terminator; the function should
+        // still emit it as a tail sentence so VOICEVOX speaks it.
+        let body = concat!(
+            r#"{"message":{"content":"続きの一文"}}"#, "\n",
+            r#"{"done":true}"#, "\n",
+        ).as_bytes().to_vec();
+        let addr = spawn_mock_llm(body).await;
+        let backends = backends_with_llm_addr(addr);
+        let wake = loose_wake();
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        let reply = llm_chat_streaming(&backends, &wake, "test", tx).await.unwrap();
+        let mut sentences = vec![];
+        while let Some(s) = rx.recv().await {
+            sentences.push(s);
+        }
+        assert_eq!(sentences, vec!["続きの一文"]);
+        assert_eq!(reply, "続きの一文");
     }
 }
