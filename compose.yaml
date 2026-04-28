@@ -304,14 +304,11 @@ services:
       # after wake). Set to 0 in .env to disable.
       ORCH_POST_WAKE_SE_DROPOUT_MS: "${ORCH_POST_WAKE_SE_DROPOUT_MS:-800}"
       # Small jitter margin past audio-io's drain-handshake reply.
-      # /speak now returns when the cpal ring is provably empty
+      # /speak returns when the cpal ring is provably empty
       # (audio-io fires `{"type":"drained"}` over the /spk WS once
-      # the device has consumed every sample), so the dominant cause
-      # for the legacy 500 ms tail is gone. 50 ms covers the
-      # remaining round-trip jitter between drained → orchestrator
-      # stamping the deadline. Bump back to 500 if running against
-      # an older audio-io that doesn't speak the drain protocol
-      # (tts-streamer falls back to a 200 ms fixed pad in that case).
+      # the device has consumed every sample), so 50 ms here only
+      # covers the round-trip jitter between drained → orchestrator
+      # stamping the deadline.
       ORCH_TTS_TAIL_QUIET_MS: "${ORCH_TTS_TAIL_QUIET_MS:-50}"
     ports:
       - "7000:7000"

@@ -129,28 +129,24 @@ async def push_to_spk(spk_url: str, pcm: bytes) -> int:
             await ws.send(tail)
             sent += BYTES_PER_FRAME
             await asyncio.sleep(FRAME_PERIOD)
-        # EOS + drain handshake. The trailing-silence padding loop
-        # the previous implementation used (10 × 20 ms zero frames) is
-        # gone: the drained signal does the same job more accurately.
-        # If audio-io is an old build that doesn't speak the EOS
-        # protocol, the recv() below will time out — we fall back to a
-        # short fixed wait so we don't hang forever on a version
-        # mismatch.
+        # EOS + drain handshake. Sends `{"type":"eos"}` and blocks
+        # until audio-io replies `{"type":"drained"}` — that reply
+        # fires only when the cpal output ring is empty, so the WS
+        # close below (and the /speak HTTP return that follows it)
+        # is the precise moment the speaker has stopped emitting.
+        # The trailing-silence padding the previous implementation
+        # used (10 × 20 ms zero frames) is gone: the handshake does
+        # the same job more accurately. If audio-io misbehaves and
+        # doesn't reply, this raises and /speak fails 502 — the
+        # orchestrator surfaces it instead of silently inflating
+        # latency.
         await ws.send(json.dumps({"type": "eos"}))
-        try:
-            while True:
-                raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
-                if isinstance(raw, (bytes, bytearray)):
-                    continue  # not for us
-                msg = json.loads(raw)
-                if msg.get("type") == "drained":
-                    break
-        except (asyncio.TimeoutError, json.JSONDecodeError) as e:
-            log.warning(
-                "drain handshake timed out (%s); falling back to fixed 200 ms pad",
-                type(e).__name__,
-            )
-            await asyncio.sleep(0.2)
+        while True:
+            raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+            if isinstance(raw, (bytes, bytearray)):
+                continue
+            if json.loads(raw).get("type") == "drained":
+                break
     return sent
 
 

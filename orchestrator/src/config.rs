@@ -108,19 +108,13 @@ pub struct TtsConfig {
     pub max_inflight: u32,
     /// After every successful turn's TTS completes, drop *all* VAD
     /// events (SpeechStarted and SpeechEnded) for this many extra
-    /// milliseconds. With the audio-io drain-handshake protocol,
-    /// /speak now returns precisely when the cpal output ring is
-    /// empty (audio-io fires the WS `{"type":"drained"}` reply only
-    /// after the device has consumed every sample), so the dominant
-    /// reason for this knob is gone. The remaining 50 ms default
-    /// covers the round-trip jitter between "drained" being fired
-    /// and the orchestrator stamping the deadline + VAD events
-    /// already in flight at that boundary. Set to 0 once you trust
-    /// the handshake end-to-end on your hardware. Bump higher if you
-    /// run an older audio-io build that doesn't speak the drain
-    /// protocol — its WS will close on EOS without replying and
-    /// tts-streamer falls back to a 200 ms fixed pad, so 500 ms here
-    /// restores the legacy heuristic.
+    /// milliseconds. The audio-io ↔ tts-streamer drain handshake
+    /// already makes /speak's HTTP return the precise moment the
+    /// cpal output ring is empty, so this only needs to cover the
+    /// round-trip jitter between `drained` firing and the
+    /// orchestrator stamping the deadline + any VAD events already
+    /// in flight at the boundary. Set to 0 once you trust the
+    /// handshake end-to-end on your hardware.
     pub tail_quiet_ms: u64,
 }
 
