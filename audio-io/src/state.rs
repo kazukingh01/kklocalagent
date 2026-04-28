@@ -6,13 +6,13 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 
 use crate::capture::CaptureHandle;
 use crate::config::Config;
-use crate::playback::PlaybackHandle;
+use crate::playback::{PlaybackHandle, PlaybackMessage};
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     pub mic_tx: broadcast::Sender<Bytes>,
-    pub spk_tx: Arc<Mutex<Option<mpsc::Sender<Bytes>>>>,
+    pub spk_tx: Arc<Mutex<Option<mpsc::Sender<PlaybackMessage>>>>,
     pub flush: Arc<FlushSignals>,
     pub handles: Arc<Mutex<ServiceHandles>>,
 }

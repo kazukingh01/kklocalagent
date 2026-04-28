@@ -1,8 +1,10 @@
-# Wraps the upstream ollama image, baking in a startup-time model pull.
-# Upstream's ENTRYPOINT is `/bin/ollama`; we replace it with init.sh
-# which starts `ollama serve` in the background, waits for the API to
-# come up, pulls ${LLM_MODEL}, then waits on the serve PID so container
-# signals propagate.
+# Wraps the upstream ollama image, baking in a startup-time model
+# pull *and* warm-into-VRAM. Upstream's ENTRYPOINT is `/bin/ollama`;
+# we replace it with init.sh which starts `ollama serve` in the
+# background, waits for the API, pulls ${LLM_MODEL}, fires a no-prompt
+# /api/generate to load the weights into GPU memory, touches a
+# sentinel for the HEALTHCHECK, then waits on the serve PID so
+# container signals propagate.
 #
 # Model cache lives at /root/.ollama — mount a named volume there so
 # the first-boot pull persists across `docker compose down && up`.
@@ -25,20 +27,27 @@ ENV LLM_MODEL=gemma3:4b
 COPY init.sh /usr/local/bin/init.sh
 RUN chmod +x /usr/local/bin/init.sh
 
-# Probe /api/show for the *specific* configured model — unlike /api/tags
-# (always 200 once serve is up), /api/show only returns 200 after the
-# model has been pulled into the local registry. Gating
-# `service_healthy` on this means dependents don't race the first-boot
-# pull.
+# Two gates per probe:
+#   1. /tmp/llm-warm sentinel — touched by init.sh after the post-pull
+#      warmup curl finishes (model mmap'd + uploaded to VRAM). Without
+#      this, /api/show would go 200 as soon as `ollama pull` completes
+#      and `depends_on: service_healthy` would race the warmup, leaving
+#      the orchestrator's first /api/chat to pay the cold-load tax.
+#   2. /api/show on the *specific* configured model — verifies the
+#      pull succeeded for the right name (a mismatched LLM_MODEL
+#      between this container and the orchestrator would 404 every
+#      chat).
 #
-# start_period is generous because cold-pulling gemma3:4b (~3.3 GB) can
-# take 10+ minutes on a slow link; retries*interval = ~10 min extra
-# grace if the pull stalls.
-HEALTHCHECK --interval=15s --timeout=5s --start-period=1200s --retries=40 \
-    CMD curl -sfS --connect-timeout 2 -o /dev/null -X POST \
-        -H 'Content-Type: application/json' \
-        -d "{\"name\":\"${LLM_MODEL}\"}" \
-        http://localhost:11434/api/show || exit 1
+# start_period is generous because cold-pulling gemma3:4b (~3.3 GB)
+# can take 10+ minutes on a slow link; retries*interval = ~10 min
+# extra grace if the pull stalls.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=12000s --retries=40 \
+    CMD test -f /tmp/llm-warm \
+        && curl -sfS --connect-timeout 2 -o /dev/null -X POST \
+            -H 'Content-Type: application/json' \
+            -d "{\"name\":\"${LLM_MODEL}\"}" \
+            http://localhost:11434/api/show \
+        || exit 1
 
 EXPOSE 11434
 

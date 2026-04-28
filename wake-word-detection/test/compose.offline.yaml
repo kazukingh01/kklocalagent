@@ -1,0 +1,50 @@
+# Wake-word-detection offline smoke test.
+#
+# Self-contained variant — does NOT require audio-io running on
+# Windows. The probe plays both roles a real deployment splits across
+# audio-io and the orchestrator. See compose.online.yaml for the live
+# audio-io variant.
+#
+#   probe — Python sidecar:
+#             * WS server  :9100  — streams alexa_test.wav as 20ms s16le
+#               mono 16kHz PCM frames (same format audio-io emits).
+#             * HTTP server :9200 — receives POST /events, and exits 0
+#               on the first WakeWordDetected payload.
+#   wwd   — the module under test. Connects to probe's WS, runs
+#           openWakeWord, posts events back to probe's HTTP.
+#
+# Run from this directory:
+#   sudo docker compose -f compose.offline.yaml up --build \
+#       --abort-on-container-exit --exit-code-from probe
+#
+# Tear down:
+#   sudo docker compose -f compose.offline.yaml down
+
+services:
+  probe:
+    build:
+      context: .
+      dockerfile: Dockerfile.probe
+    container_name: kklocalagent-test-wwd-probe
+    environment:
+      PROBE_WS_PORT: "9100"
+      PROBE_HTTP_PORT: "9200"
+      PROBE_TIMEOUT_SEC: "60"
+
+  wwd:
+    build:
+      context: ..
+    container_name: kklocalagent-test-wwd
+    depends_on:
+      - probe
+    environment:
+      # Point at the probe's WS / HTTP within the compose network.
+      WW_MIC_URL: ws://probe:9100
+      WW_ORCHESTRATOR_URL: http://probe:9200/events
+      WW_MODELS: alexa
+      # alexa is the most accurate bundled pre-trained model; the test
+      # WAV (alexa_test.wav, 0.625s) is from openWakeWord's own test
+      # suite so a conservative threshold is fine.
+      WW_THRESHOLD: "0.5"
+      WW_COOLDOWN_SEC: "2.0"
+      WW_INFERENCE_FRAMEWORK: tflite

@@ -1,0 +1,165 @@
+use std::path::PathBuf;
+
+use anyhow::Result;
+use clap::Parser;
+use tracing_subscriber::{fmt, EnvFilter};
+
+use orchestrator::config::Config;
+
+#[derive(Debug, Parser)]
+#[command(about = "orchestrator: receives VAD / wake-word events, drives ASR → LLM pipeline")]
+struct Args {
+    /// Path to a TOML config file.
+    #[arg(long, env = "ORCH_CONFIG")]
+    config: Option<PathBuf>,
+
+    /// Override `server.listen` (e.g. `0.0.0.0:7000`).
+    #[arg(long, env = "ORCH_LISTEN")]
+    listen: Option<String>,
+
+    /// Override `asr.url`.
+    #[arg(long, env = "ORCH_ASR_URL")]
+    asr_url: Option<String>,
+
+    /// Override `asr.hallucination_blacklist`. Pipe-separated list
+    /// of substrings; if the ASR output contains any of them, the
+    /// turn is dropped (no LLM, no TTS) just like an empty
+    /// transcription. Match is substring + case-sensitive. Pass an
+    /// empty value (`ORCH_ASR_HALLUCINATION_BLACKLIST=`) to disable
+    /// the filter entirely.
+    #[arg(long, env = "ORCH_ASR_HALLUCINATION_BLACKLIST", value_delimiter = '|')]
+    asr_hallucination_blacklist: Option<Vec<String>>,
+
+    /// Override `llm.url`.
+    #[arg(long, env = "ORCH_LLM_URL")]
+    llm_url: Option<String>,
+
+    /// Override `llm.model`.
+    #[arg(long, env = "ORCH_LLM_MODEL")]
+    llm_model: Option<String>,
+
+    /// Override `llm.system_prompt`. Empty disables the system message.
+    #[arg(long, env = "ORCH_LLM_SYSTEM_PROMPT")]
+    llm_system_prompt: Option<String>,
+
+    /// Override `tts.url`. Empty disables the TTS stage.
+    #[arg(long, env = "ORCH_TTS_URL")]
+    tts_url: Option<String>,
+
+    /// Override `tts.stop_url`. Empty disables barge-in TTS cancel.
+    #[arg(long, env = "ORCH_TTS_STOP_URL")]
+    tts_stop_url: Option<String>,
+
+    /// Override `tts.finalize_url`. POSTed once per turn after the
+    /// last per-sentence /speak completes; tts-streamer's response
+    /// is the precise speaker-silent moment used to anchor the
+    /// post-TTS VAD quiet window. Empty falls back to a pure
+    /// timeout (less precise; tail_quiet_ms must compensate).
+    #[arg(long, env = "ORCH_TTS_FINALIZE_URL")]
+    tts_finalize_url: Option<String>,
+
+    /// Override `tts.tail_quiet_ms`. Drop VAD events for this many
+    /// extra milliseconds after each turn's TTS completes — covers
+    /// the audio-io playback-ring tail so the assistant's own voice
+    /// can't fire VAD and dispatch an echo turn. 0 disables.
+    #[arg(long, env = "ORCH_TTS_TAIL_QUIET_MS")]
+    tts_tail_quiet_ms: Option<u64>,
+
+    /// Override `wake.required` (true / false).
+    #[arg(long, env = "ORCH_WAKE_REQUIRED")]
+    wake_required: Option<bool>,
+
+    /// Override `wake.wake_window_ms` (window for SpeechStarted after
+    /// a WakeWordDetected).
+    #[arg(long, env = "ORCH_WAKE_WINDOW_MS")]
+    wake_window_ms: Option<u64>,
+
+    /// Override `wake.turn_followup_window_ms` (window for the next
+    /// SpeechStarted after a Turn ends).
+    #[arg(long, env = "ORCH_TURN_FOLLOWUP_WINDOW_MS")]
+    turn_followup_window_ms: Option<u64>,
+
+    /// Override `wake.barge_in` (true / false).
+    #[arg(long, env = "ORCH_WAKE_BARGE_IN")]
+    wake_barge_in: Option<bool>,
+
+    /// Override `wake.post_wake_se_dropout_ms`. SpeechEnded events
+    /// arriving within this window after a WakeWordDetected are
+    /// dropped (defends against VAD capturing the wake word's own
+    /// audio and re-dispatching it as a turn). 0 disables.
+    #[arg(long, env = "ORCH_POST_WAKE_SE_DROPOUT_MS")]
+    post_wake_se_dropout_ms: Option<u64>,
+
+    /// Override `result_sink.url`. Empty disables forwarding.
+    #[arg(long, env = "ORCH_RESULT_SINK_URL")]
+    result_sink_url: Option<String>,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
+    let args = Args::parse();
+    let mut config = match &args.config {
+        Some(p) => Config::from_file(p)?,
+        None => Config::default(),
+    };
+    if let Some(v) = args.listen {
+        config.server.listen = v;
+    }
+    if let Some(v) = args.asr_url {
+        config.asr.url = v;
+    }
+    if let Some(v) = args.asr_hallucination_blacklist {
+        // Filter out empty strings — `ORCH_ASR_HALLUCINATION_BLACKLIST=`
+        // (deliberately empty to disable) splits to a single empty
+        // entry, which would otherwise match every ASR output via
+        // contains("").
+        config.asr.hallucination_blacklist = v.into_iter().filter(|s| !s.is_empty()).collect();
+    }
+    if let Some(v) = args.llm_url {
+        config.llm.url = v;
+    }
+    if let Some(v) = args.llm_model {
+        config.llm.model = v;
+    }
+    if let Some(v) = args.llm_system_prompt {
+        config.llm.system_prompt = v;
+    }
+    if let Some(v) = args.tts_url {
+        config.tts.url = v;
+    }
+    if let Some(v) = args.tts_stop_url {
+        config.tts.stop_url = v;
+    }
+    if let Some(v) = args.tts_finalize_url {
+        config.tts.finalize_url = v;
+    }
+    if let Some(v) = args.tts_tail_quiet_ms {
+        config.tts.tail_quiet_ms = v;
+    }
+    if let Some(v) = args.wake_required {
+        config.wake.required = v;
+    }
+    if let Some(v) = args.wake_window_ms {
+        config.wake.wake_window_ms = v;
+    }
+    if let Some(v) = args.turn_followup_window_ms {
+        config.wake.turn_followup_window_ms = v;
+    }
+    if let Some(v) = args.wake_barge_in {
+        config.wake.barge_in = v;
+    }
+    if let Some(v) = args.post_wake_se_dropout_ms {
+        config.wake.post_wake_se_dropout_ms = v;
+    }
+    if let Some(v) = args.result_sink_url {
+        config.result_sink.url = v;
+    }
+
+    orchestrator::run(config).await
+}

@@ -1,0 +1,52 @@
+# Wake-word-detection online (live-mic) test stack.
+#
+# Unlike compose.offline.yaml — which fakes audio-io with a probe that
+# replays alexa_test.wav over WS — this stack subscribes to the
+# Windows-native audio-io binary so YOUR microphone drives detection
+# in real time.
+#
+#   wwd  — wake-word-detection in dry-run sink mode. Detections are
+#          logged ("[dry-run] would POST WakeWordDetected: ...") rather
+#          than POSTed to an orchestrator (which isn't part of this
+#          stack). Switch to WW_SINK_MODE=orchestrator + a real
+#          WW_ORCHESTRATOR_URL when you wire this against the full
+#          compose.
+#
+# Prerequisites:
+#   1. audio-io.exe running on Windows with `[server] host = "0.0.0.0"`
+#      and the default port 7010. See ../../audio-io/README.md.
+#   2. WINDOWS_HOST set so the WSL2 docker network can reach the host.
+#      Default `host.docker.internal` works on Docker Desktop and on
+#      docker-ce with the WSL2 backend. Override in test/.env if not.
+#
+# Run from this directory:
+#   sudo docker compose -f compose.online.yaml up --build
+#
+# Speak "alexa" into the Windows mic; expect a line like:
+#   wwd: detected: model=alexa score=0.987
+#   wwd: [dry-run] would POST WakeWordDetected: {"name":"WakeWordDetected",...}
+#
+# Stop with Ctrl-C, then:
+#   sudo docker compose -f compose.online.yaml down
+
+services:
+  wwd:
+    build:
+      context: ..
+    container_name: kklocalagent-test-wwd-online
+    environment:
+      # Live audio source on the Windows host.
+      WW_MIC_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/mic
+      # Dry-run sink: log the detection envelope rather than POST it.
+      # Lets this stack run standalone — no orchestrator needed.
+      WW_SINK_MODE: dry-run
+      WW_MODELS: alexa
+      WW_THRESHOLD: "0.5"
+      WW_COOLDOWN_SEC: "2.0"
+      WW_INFERENCE_FRAMEWORK: tflite
+    # Plain Linux docker (non-Docker-Desktop, non-WSL2) doesn't resolve
+    # `host.docker.internal` by default. host-gateway makes it point at
+    # the docker bridge gateway = the host. Harmless on Docker Desktop /
+    # WSL2 where the resolver already exists.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

@@ -11,8 +11,11 @@ use serde::Deserialize;
 ///   utterance audio (wrapped as a WAV) to whisper.cpp's `/inference`
 ///   endpoint at `sink.asr_url`. Used for the audio-io→vad→asr smoke
 ///   test before the orchestrator exists.
-/// - `Orchestrator`: forward events to `sink.orchestrator_url`. Not yet
-///   implemented — events are dropped with a warning.
+/// - `Orchestrator`: POST the serialized event envelope to
+///   `sink.orchestrator_url`. The orchestrator handles ASR + LLM
+///   downstream. Set `log_audio_in_event = true` to include utterance
+///   PCM in `SpeechEnded` envelopes — required for orchestrator-side
+///   ASR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 #[clap(rename_all = "kebab-case")]
@@ -78,6 +81,28 @@ pub struct DetectorConfig {
     pub hang_frames: u32,
     /// Hard cap on utterance length. Forces an end event if speech runs longer.
     pub max_utterance_frames: u32,
+    /// Apply RNNoise (nnnoiseless) to every incoming frame before VAD
+    /// classification. Cleans steady-state background noise (fans,
+    /// AC, low keyboard hum) which both reduces VAD false positives
+    /// *and* gives ASR a less ambiguous signal — Whisper is prone to
+    /// hallucinating Japanese YouTube boilerplate ("ご視聴ありがとう
+    /// ございました", "(拍手)") on noisy near-silence and a denoise
+    /// pre-stage materially helps. Adds ~0.5% of one core; the
+    /// 16 k → 48 k → 16 k resampling that RNNoise needs adds one
+    /// frame (~10 ms) of pipeline latency. Off by default — flip on
+    /// when noisy mics demand it.
+    pub denoise: bool,
+    /// SpeechEnded events whose buffered utterance has a measured
+    /// RMS *strictly less than* this dBFS value are dropped before
+    /// reaching the sink. 0.0 (or any non-negative value) disables
+    /// the gate. dBFS reference: 0 = full-scale i16 (impossible for
+    /// real speech); typical normal voice is -10 to -25, far-mic
+    /// whisper is -30 to -40, room ambient with no one talking is
+    /// -50 to -60. -45 cleanly separates the bottom two without
+    /// rejecting legitimate quiet speech, and is the recommended
+    /// starting value when Whisper hallucinations on near-silence
+    /// are a problem.
+    pub min_utterance_rms_dbfs: f32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -98,9 +123,18 @@ pub struct SinkConfig {
     /// observable instead of presenting as silent timeouts. 1 = strictly
     /// serial (matches whisper-server's own single-request behaviour).
     pub asr_max_inflight: u32,
+    /// HTTP timeout for `orchestrator` POSTs, in milliseconds. The
+    /// orchestrator is just routing — it should respond fast — so 5 s
+    /// is a generous default.
+    pub orchestrator_timeout_ms: u64,
+    /// Maximum simultaneous in-flight `orchestrator` POSTs. Higher than
+    /// `asr_max_inflight` because the orchestrator does not bottleneck
+    /// on a single backend the way whisper-server does.
+    pub orchestrator_max_inflight: u32,
     /// Include base64-encoded utterance audio in the *log* JSON for each
-    /// SpeechEnded event. Independent of asr-direct, which always uploads
-    /// the audio regardless of this flag.
+    /// SpeechEnded event. Also controls whether audio is included in the
+    /// envelope POSTed to the orchestrator — required there because
+    /// without audio the orchestrator can't run ASR.
     pub log_audio_in_event: bool,
 }
 
@@ -122,6 +156,10 @@ impl Default for DetectorConfig {
             start_frames: 3,          // ~60 ms of speech
             hang_frames: 20,          // ~400 ms of silence
             max_utterance_frames: 1500, // 30 s
+            denoise: false,
+            // Disabled by default; legacy behaviour where every SE is
+            // forwarded regardless of energy.
+            min_utterance_rms_dbfs: 0.0,
         }
     }
 }
@@ -134,6 +172,8 @@ impl Default for SinkConfig {
             asr_url: "http://127.0.0.1:7040/inference".into(),
             asr_timeout_ms: 30_000,
             asr_max_inflight: 1,
+            orchestrator_timeout_ms: 5_000,
+            orchestrator_max_inflight: 4,
             log_audio_in_event: false,
         }
     }
@@ -183,6 +223,12 @@ impl Config {
         }
         if self.sink.asr_max_inflight == 0 {
             anyhow::bail!("sink.asr_max_inflight must be >= 1");
+        }
+        if self.sink.orchestrator_timeout_ms == 0 {
+            anyhow::bail!("sink.orchestrator_timeout_ms must be >= 1");
+        }
+        if self.sink.orchestrator_max_inflight == 0 {
+            anyhow::bail!("sink.orchestrator_max_inflight must be >= 1");
         }
         Ok(())
     }

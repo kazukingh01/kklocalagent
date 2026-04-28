@@ -27,6 +27,21 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["multipart", "rustls-tls"] }
+# RNNoise port (pure Rust). 480-sample @ 48 kHz frames, ML-based
+# speech enhancement that suppresses fans/AC/keyboard hum without
+# distorting voice. Default features pull `dasp` + `bin` + `hound`
+# which we don't need (no command-line wav processor here), so trim
+# to just the core lib.
+nnnoiseless = { version = "0.5", default-features = false }
+# FFT-based resampler. Needed because nnnoiseless processes at
+# 48 kHz only and our pipeline is 16 kHz — one FftFixedInOut
+# handles the 16k→48k upsample, a second handles 48k→16k.
+rubato = "0.16"  # 0.x API stable + matches the FftFixedInOut docs we coded against
+# Shared 44-byte WAV header helper. The orchestrator owns the
+# canonical implementation in `../wav-utils/`; both crates depend on
+# it via path so a future change to the WAV envelope (e.g. adopting
+# WAVEFORMATEXTENSIBLE) lands in one place.
+wav-utils = { path = "../wav-utils" }
 
 [profile.release]
 lto = "thin"

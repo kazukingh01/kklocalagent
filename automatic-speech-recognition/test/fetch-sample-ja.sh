@@ -47,7 +47,7 @@ fi
 echo "synthesizing → $DEST"
 echo "          text: $TEXT"
 
-docker run --rm \
+sudo docker run --rm \
     -v "$SAMPLES_DIR":/out \
     -e TEXT="$TEXT" \
     --entrypoint sh \

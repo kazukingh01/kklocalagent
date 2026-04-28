@@ -23,7 +23,10 @@
 services:
   voice-activity-detection:
     build:
-      context: ../../voice-activity-detection
+      # Repo-root context so the VAD Dockerfile can resolve its
+      # path-dependency on the shared `wav-utils` crate.
+      context: ../..
+      dockerfile: voice-activity-detection/Dockerfile
     container_name: kklocalagent-test-vad-online
     environment:
       RUST_LOG: info,vad=info,voice_activity_detection=info

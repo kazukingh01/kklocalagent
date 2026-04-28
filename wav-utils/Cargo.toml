@@ -1,0 +1,13 @@
+[package]
+name = "wav-utils"
+version = "0.1.0"
+edition = "2021"
+description = "Shared WAV helpers for kklocalagent Rust crates (orchestrator + voice-activity-detection)"
+license = "MIT"
+
+# Keep the dep tree empty so pulling this crate in doesn't drag any
+# extra compile time into orchestrator / VAD.
+
+[lib]
+name = "wav_utils"
+path = "src/lib.rs"

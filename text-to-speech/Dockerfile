@@ -10,13 +10,17 @@ ARG VOICEVOX_VARIANT=cpu-latest
 
 FROM voicevox/voicevox_engine:${VOICEVOX_VARIANT}
 
-# Probe /version via the curl already bundled in the upstream image.
-# The engine binary is PyInstaller-packed so there's no system python3 —
-# curl is the only HTTP client present. /version is the cheapest endpoint
-# that requires the engine to be fully initialized (returns engine semver).
-# start-period is generous because first boot lazy-mmaps the .onnx voice
-# models. retries*interval = ~2 min total before unhealthy.
+# Probe via a bare TCP connect to :50021 rather than `curl /version`.
+# The HTTP variant works but uvicorn (inside the upstream image) logs
+# every request at INFO, so a 5 s healthcheck spams a `GET /version
+# 200 OK` line every 5 s into production logs. Bash's built-in
+# /dev/tcp opens the socket and closes it without sending any HTTP
+# bytes, so uvicorn's access logger never fires. Liveness check is
+# equivalent — uvicorn only binds the port once the engine is fully
+# initialised (after lazy-mmap of the .onnx voice models).
+# start-period is generous for that first-boot mmap.
+# retries * interval = ~2 min total before unhealthy.
 HEALTHCHECK --interval=5s --timeout=3s --start-period=60s --retries=24 \
-    CMD curl -sfS --connect-timeout 2 -o /dev/null http://localhost:50021/version || exit 1
+    CMD bash -c 'exec 3<>/dev/tcp/127.0.0.1/50021' || exit 1
 
 EXPOSE 50021

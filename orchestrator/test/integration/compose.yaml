@@ -1,0 +1,246 @@
+# Full-pipeline integration smoke for the orchestrator.
+#
+# Wires every module on the WSL2 side of #4 §5 (everything except
+# audio-io, which is Windows-native) and verifies a single request
+# flowing through:
+#
+#   mic-stub ──WS /mic──► VAD ────────────POST /events──► orchestrator
+#                       ──WS /mic──► wake-word-detection ─POST /events──┘
+#
+#   orchestrator ──POST /inference──► automatic-speech-recognition
+#                ──POST /api/chat───► llm
+#                ──POST /speak─────► tts-streamer ──► VOICEVOX ──► spk-sink (/spk WS)
+#                ──POST /sink───────► assert (test driver)
+#
+# The fixture stream contains:
+#   silence (1.5 s) → alexa_test.wav (0.6 s) → silence (1.5 s) → jfk.wav (~11 s) → silence (3 s)
+#
+# Wake-word-detection should fire on "alexa" and post WakeWordDetected.
+# VAD should emit a SpeechEnded for jfk.wav (and likely also for
+# "alexa", since v0.1 doesn't gate on wake yet) → orchestrator → ASR →
+# LLM → TTS → /spk push to spk-sink. The assert service exits 0 once
+# WakeWordDetected, TurnCompleted, AND non-silent bytes on spk-sink
+# have all been observed within ASSERT_TIMEOUT_SEC.
+#
+# Models are deliberately the lightest CPU-friendly tier:
+#   ASR: ggml-small-q8_0.bin (whisper.cpp; ~252 MB)
+#   LLM: gemma3:1b           (ollama;       ~815 MB)
+#   WW : alexa               (openWakeWord; bundled in image)
+#   TTS: VOICEVOX cpu-latest (ONNX models bundled in upstream image)
+#
+# Run from this directory:
+#   docker compose up --build --abort-on-container-exit --exit-code-from assert
+#
+# Tear down (keep model caches):
+#   docker compose down
+# Tear down and wipe caches:
+#   docker compose down -v
+
+services:
+  # --- model bootstrap -------------------------------------------------
+
+  asr-models:
+    # Init service: fetches the whisper model into a shared volume on
+    # first run, no-ops thereafter. After the fetch, idles indefinitely
+    # — exiting here would trip `--abort-on-container-exit` (implied by
+    # --exit-code-from) and tear the smoke down before the assert
+    # service has a chance to verify anything. Downstream waits via the
+    # healthcheck below, which flips to healthy the moment the model
+    # file exists.
+    image: alpine:3
+    container_name: kklocalagent-test-int-asr-models
+    volumes:
+      - asr-models:/models
+    entrypoint:
+      - sh
+      - -ec
+      - |
+        if [ ! -f /models/ggml-small-q8_0.bin ]; then
+          apk add --no-cache curl ca-certificates >/dev/null
+          echo "fetching ggml-small-q8_0.bin (~252 MB)..."
+          curl -L --fail --progress-bar \
+            -o /models/ggml-small-q8_0.bin \
+            https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q8_0.bin
+          echo "fetched."
+        else
+          echo "ggml-small-q8_0.bin already cached, skipping."
+        fi
+        exec sleep infinity
+    healthcheck:
+      test: ["CMD-SHELL", "[ -f /models/ggml-small-q8_0.bin ]"]
+      interval: 5s
+      timeout: 2s
+      retries: 60
+      start_period: 5s
+
+  # --- backends --------------------------------------------------------
+
+  automatic-speech-recognition:
+    build:
+      context: ../../../automatic-speech-recognition
+    container_name: kklocalagent-test-int-asr
+    depends_on:
+      asr-models:
+        condition: service_healthy
+    volumes:
+      - asr-models:/models:ro
+    environment:
+      WHISPER_MODEL: ggml-small-q8_0.bin
+      # Override from the asr-test default of "ja" — fixtures here are
+      # English (alexa, JFK) so let whisper auto-detect / pin to en.
+      WHISPER_LANGUAGE: en
+
+  llm:
+    build:
+      context: ../../../llm
+    container_name: kklocalagent-test-int-llm
+    environment:
+      # Same lightweight model as the llm module's own smoke.
+      LLM_MODEL: gemma3:1b
+      # Pin weights so the second turn doesn't pay the cold-load tax,
+      # and so the assert window doesn't overlap with re-load.
+      OLLAMA_KEEP_ALIVE: "-1"
+    volumes:
+      - ollama-data:/root/.ollama
+
+  text-to-speech:
+    build:
+      context: ../../../text-to-speech
+    container_name: kklocalagent-test-int-tts
+
+  tts-streamer:
+    build:
+      context: ../../../tts-streamer
+    container_name: kklocalagent-test-int-tts-streamer
+    environment:
+      VOICEVOX_URL: http://text-to-speech:50021
+      VOICEVOX_SPEAKER: "3"
+      # Compose-internal /spk receiver — replaces audio-io for the smoke.
+      SPK_URL: ws://spk-sink:7010/spk
+      AUDIO_IO_BASE: http://spk-sink:7011
+    depends_on:
+      text-to-speech:
+        condition: service_healthy
+      spk-sink:
+        condition: service_healthy
+
+  # --- audio source / sink (mock audio-io) -----------------------------
+
+  mic-stub:
+    build:
+      # Build context = repo root so the Dockerfile can COPY fixtures
+      # from sibling modules (alexa_test.wav from wake-word-detection,
+      # stub.py from automatic-speech-recognition).
+      context: ../../..
+      dockerfile: orchestrator/test/integration/mic-stub/Dockerfile
+    container_name: kklocalagent-test-int-mic-stub
+
+  spk-sink:
+    build:
+      context: ./spk-sink
+    container_name: kklocalagent-test-int-spk-sink
+
+  # --- producers (VAD + wake-word) ------------------------------------
+
+  voice-activity-detection:
+    build:
+      # Repo-root context so the VAD Dockerfile can resolve its
+      # path-dependency on the shared `wav-utils` crate.
+      context: ../../..
+      dockerfile: voice-activity-detection/Dockerfile
+    container_name: kklocalagent-test-int-vad
+    environment:
+      RUST_LOG: info,voice_activity_detection=info
+      # Drive everything via env overrides — no TOML config mount,
+      # which keeps the smoke independent of the host filesystem
+      # (bind mounts are unreliable across Docker-in-Docker setups).
+      VAD_MIC_URL: ws://mic-stub:7010/mic
+      VAD_SINK_MODE: orchestrator
+      VAD_ORCHESTRATOR_URL: http://orchestrator:7000/events
+      # The orchestrator can't run ASR without the utterance PCM, so
+      # turn audio inclusion on (off by default for dry-run/asr-direct).
+      VAD_LOG_AUDIO_IN_EVENT: "true"
+    depends_on:
+      mic-stub:
+        condition: service_started
+      orchestrator:
+        condition: service_healthy
+
+  wake-word-detection:
+    build:
+      context: ../../../wake-word-detection
+    container_name: kklocalagent-test-int-wwd
+    environment:
+      WW_MIC_URL: ws://mic-stub:7010/mic
+      WW_ORCHESTRATOR_URL: http://orchestrator:7000/events
+      WW_MODELS: alexa
+      WW_THRESHOLD: "0.5"
+    depends_on:
+      mic-stub:
+        condition: service_started
+      orchestrator:
+        condition: service_healthy
+
+  # --- system under test ----------------------------------------------
+
+  orchestrator:
+    build:
+      # Repo-root context so the orchestrator Dockerfile can COPY the
+      # shared `wav-utils` crate alongside `orchestrator/`. Three
+      # levels up from this file (`orchestrator/test/integration/`)
+      # lands at the repo root.
+      context: ../../..
+      dockerfile: orchestrator/Dockerfile
+    container_name: kklocalagent-test-int-orch
+    environment:
+      RUST_LOG: info,orchestrator=info
+      ORCH_ASR_URL: http://automatic-speech-recognition:8080/inference
+      ORCH_LLM_URL: http://llm:11434/api/chat
+      ORCH_LLM_MODEL: gemma3:1b
+      ORCH_TTS_URL: http://tts-streamer:7070/speak
+      ORCH_TTS_STOP_URL: http://tts-streamer:7070/stop
+      # v1.0 wake gating: the fixture stream contains "alexa" before
+      # the JFK utterance, so wake-word-detection arms the orchestrator
+      # before VAD's SpeechEnded for the JFK segment. Generous arm
+      # window so a slow first cold whisper load doesn't expire the
+      # window between the alexa wake and the alexa SpeechEnded.
+      ORCH_WAKE_REQUIRED: "true"
+      # Long windows for the integration test: cold whisper / gemma3
+      # load can take ~30 s, so a short wake_window would expire
+      # between the alexa wake event and the JFK SpeechEnded.
+      ORCH_WAKE_WINDOW_MS: "30000"
+      ORCH_TURN_FOLLOWUP_WINDOW_MS: "30000"
+      ORCH_WAKE_BARGE_IN: "true"
+      ORCH_RESULT_SINK_URL: http://assert:9300/sink
+    depends_on:
+      automatic-speech-recognition:
+        condition: service_healthy
+      llm:
+        condition: service_healthy
+      tts-streamer:
+        condition: service_healthy
+      assert:
+        condition: service_started
+
+  # --- test driver / sink ---------------------------------------------
+
+  assert:
+    build:
+      context: ./assert
+    container_name: kklocalagent-test-int-assert
+    environment:
+      ASSERT_PORT: "9300"
+      # Generous: cold whisper-server load + first cold gemma3:1b
+      # response + first cold VOICEVOX synth can take a few minutes
+      # combined on CPU. The probe still exits 0 the moment all three
+      # signals (wake / turn / spk-bytes) arrive — this is the *upper*
+      # bound for failure.
+      ASSERT_TIMEOUT_SEC: "300"
+      SPK_SINK_URL: http://spk-sink:7011/stats
+    depends_on:
+      spk-sink:
+        condition: service_healthy
+
+volumes:
+  asr-models:
+  ollama-data:

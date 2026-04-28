@@ -1,0 +1,376 @@
+# kklocalagent production stack.
+#
+# Wires every WSL2-side module. audio-io is Windows-native and runs
+# OUTSIDE compose — VAD and wake-word-detection subscribe to its WS
+# /mic endpoint over the LAN, the same way the *-online smoke tests
+# do. The default WINDOWS_HOST resolves to the WSL2 host gateway;
+# override with a literal IP if your setup needs it.
+#
+# Prerequisites:
+#   1. audio-io.exe running on Windows with `[server] host = "0.0.0.0"`
+#      and the default port 7010. See audio-io/README.md.
+#   2. NVIDIA Container Toolkit + WSL2 GPU support if you want LLM /
+#      TTS on the GPU. Comment out the `deploy:` blocks below to fall
+#      back to CPU.
+#
+# Run from the repo root:
+#   docker compose up -d --build
+#
+#   # override the model at boot:
+#   LLM_MODEL='hf.co/mmnga-o/llm-jp-4-8b-thinking-gguf:Q8_0' \
+#       docker compose up -d --build
+#
+# Tear down (keep model caches):
+#   docker compose down
+# Tear down and wipe caches:
+#   docker compose down -v
+
+# Single source of truth for the LLM model — fed to both the `llm`
+# service (what to pull at startup) and `orchestrator` (what to chat
+# against). YAML anchors don't expand env vars themselves, so we route
+# through `${...}` and reuse the resulting string via the anchor.
+x-llm-model: &llm-model "${LLM_MODEL:-gemma3:4b}"
+# medium-q8_0 (~824 MB) trades a small Japanese-accuracy hit for
+# ~100–200 ms shorter inference vs large-v3-turbo on short voice-
+# agent prompts. Override with `ASR_MODEL=ggml-large-v3-turbo-q8_0.bin`
+# in .env to switch back when accuracy beats latency for the use case.
+x-asr-model: &asr-model "${ASR_MODEL:-ggml-medium-q8_0.bin}"
+
+services:
+  # --- model bootstrap -----------------------------------------------
+
+  asr-models:
+    # First-run only: fetches the whisper model into the asr-models
+    # volume, then idles. Subsequent runs are no-ops. Idling (rather
+    # than exiting) keeps the dependency healthcheck stable for the
+    # lifetime of the stack.
+    image: alpine:3
+    container_name: kklocalagent-asr-models
+    restart: unless-stopped
+    volumes:
+      - asr-models:/models
+    environment:
+      ASR_MODEL: *asr-model
+    entrypoint:
+      # `$$ASR_MODEL` escapes compose's own ${...} interpolation so the
+      # shell inside the container expands it from the env above. Bare
+      # ${ASR_MODEL} would be substituted at compose-parse time and end
+      # up empty unless the operator also exports it on the host.
+      #
+      # Download to a `.tmp` and atomic-rename only on curl success so
+      # an interrupted run (Ctrl-C, OOM, network drop) leaves no
+      # partial file masquerading as a complete model. whisper.cpp
+      # silently truncates a partial GGML and then bails at load time
+      # with "not all tensors loaded" — which surfaces as an unhealthy
+      # `automatic-speech-recognition` container, not as an obvious
+      # download error. A sibling `.tmp` is harmless on the next run
+      # because the existence check below is on the *final* path.
+      - sh
+      - -ec
+      - |
+        FINAL="/models/$$ASR_MODEL"
+        TMP="$$FINAL.tmp"
+        if [ ! -f "$$FINAL" ]; then
+          apk add --no-cache curl ca-certificates >/dev/null
+          echo "fetching $$ASR_MODEL..."
+          rm -f "$$TMP"
+          curl -L --fail --progress-bar \
+            -o "$$TMP" \
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$$ASR_MODEL"
+          mv "$$TMP" "$$FINAL"
+          echo "fetched."
+        else
+          echo "$$ASR_MODEL already cached, skipping."
+        fi
+        exec sleep infinity
+    healthcheck:
+      # Same-name escaping: $$ASR_MODEL expands inside the container.
+      # The atomic rename above guarantees that file existence ⇒ the
+      # full file is present.
+      test: ["CMD-SHELL", "[ -f \"/models/$$ASR_MODEL\" ]"]
+      interval: 5s
+      timeout: 2s
+      retries: 60
+      start_period: 5s
+
+  # --- backends ------------------------------------------------------
+
+  automatic-speech-recognition:
+    build:
+      context: ./automatic-speech-recognition
+      args:
+        # CUDA build of whisper.cpp. Upstream publishes one image per
+        # backend (`main`, `main-cuda`, `main-musa`, `main-intel`); we
+        # pick at build time. The CPU override flips this back to
+        # `main` so the image runs on hosts without an nvidia driver.
+        WHISPER_VARIANT: main-cuda
+    container_name: kklocalagent-asr
+    restart: unless-stopped
+    depends_on:
+      asr-models:
+        condition: service_healthy
+    volumes:
+      - asr-models:/models:ro
+    environment:
+      WHISPER_MODEL: *asr-model
+      WHISPER_LANGUAGE: ja
+      # Tell nvidia-container-toolkit what driver libs to mount.
+      # Ollama's image presets these internally; whisper.cpp's upstream
+      # `main-cuda` image does not, and recent toolkit versions skip
+      # mounting libcuda/libnvidia-ml when these are unset — leading
+      # to `ggml_cuda_init: no CUDA-capable device is detected` even
+      # though `deploy.resources` did request a GPU.
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    ports:
+      - "7040:8080"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  llm:
+    build:
+      context: ./llm
+    container_name: kklocalagent-llm
+    restart: unless-stopped
+    environment:
+      LLM_MODEL: *llm-model
+      # Pin weights in memory so each turn doesn't pay the cold-load
+      # tax (~10 s for an 8B Q8_0 on CPU).
+      OLLAMA_KEEP_ALIVE: "-1"
+      # Flash Attention: faster + lower-VRAM attention path. Required
+      # for OLLAMA_KV_CACHE_TYPE != f16. CUDA/Metal only — disabled in
+      # the CPU override.
+      OLLAMA_FLASH_ATTENTION: "1"
+      # Quantise the KV cache to q8 — roughly halves VRAM for the
+      # cache vs the f16 default at negligible quality loss. Needs
+      # OLLAMA_FLASH_ATTENTION=1.
+      OLLAMA_KV_CACHE_TYPE: "q8_0"
+      # Pin context to 4096 tokens. Ollama 0.6+ defaults here too,
+      # but making it explicit keeps VRAM budgeting predictable when
+      # we later add conversation memory.
+      OLLAMA_CONTEXT_LENGTH: "4096"
+      # One inference at a time — the orchestrator already serialises
+      # turns at max_inflight=1, so allowing parallel slots would only
+      # split the KV cache and hurt single-turn latency.
+      OLLAMA_NUM_PARALLEL: "1"
+      # Don't let a stray /api/show or warm-pull hold a second model
+      # resident: voice agent only needs the one configured weight.
+      OLLAMA_MAX_LOADED_MODELS: "1"
+    volumes:
+      - ollama-data:/root/.ollama
+    ports:
+      - "7050:11434"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  text-to-speech:
+    # VOICEVOX engine. Driven by `tts-streamer` (below); the orchestrator
+    # does not call this directly. Port 7060 is published so manual
+    # /audio_query + /synthesis calls from the host still work.
+    build:
+      context: ./text-to-speech
+    container_name: kklocalagent-tts
+    restart: unless-stopped
+    ports:
+      - "7060:50021"
+
+  tts-streamer:
+    # HTTP shim: orchestrator POSTs `{"text":...}` here on every turn,
+    # this service synthesizes via VOICEVOX, resamples to 16 kHz s16le
+    # mono, and streams the frames over WS to audio-io's /spk endpoint
+    # on the Windows host.
+    build:
+      context: ./tts-streamer
+    container_name: kklocalagent-tts-streamer
+    restart: unless-stopped
+    environment:
+      VOICEVOX_URL: http://text-to-speech:50021
+      VOICEVOX_SPEAKER: "3"
+      # VOICEVOX speech speed multiplier. 1.0 = engine default;
+      # 1.5 = 50% faster (brisker voice agent). Range ~0.5–2.0.
+      VOICEVOX_SPEED_SCALE: "${VOICEVOX_SPEED_SCALE:-1.0}"
+      SPK_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/spk
+      AUDIO_IO_BASE: http://${WINDOWS_HOST:-host.docker.internal}:7010
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "7070:7070"
+    depends_on:
+      text-to-speech:
+        condition: service_healthy
+
+  # --- producers (subscribe to Windows audio-io /mic over the LAN) ---
+
+  voice-activity-detection:
+    build:
+      # Repo-root context so the Dockerfile can `COPY wav-utils ./` —
+      # the VAD crate has a path-dependency on the shared `wav-utils`
+      # crate that lives one level up.
+      context: .
+      dockerfile: voice-activity-detection/Dockerfile
+    container_name: kklocalagent-vad
+    restart: unless-stopped
+    environment:
+      RUST_LOG: info,voice_activity_detection=info
+      VAD_MIC_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/mic
+      VAD_SINK_MODE: orchestrator
+      VAD_ORCHESTRATOR_URL: http://orchestrator:7000/events
+      # Required so the orchestrator receives utterance PCM and can
+      # run ASR. Off by default in the VAD config because it bloats
+      # dry-run/asr-direct logs — necessary here.
+      VAD_LOG_AUDIO_IN_EVENT: "true"
+      # Silence hangover before SpeechEnded fires, in 20 ms frames.
+      # 10 ≈ 200 ms (this default) — tuned for short voice-agent
+      # commands where SE-to-ASR latency dominates time-to-response.
+      # The library default (20 = 400 ms) is safer for natural
+      # speech with mid-sentence pauses but doubles this latency.
+      # Override in .env if you say "えーと、…" mid-utterance and
+      # find the agent cutting you off prematurely.
+      VAD_HANG_FRAMES: "${VAD_HANG_FRAMES:-10}"
+      # Consecutive voiced 20 ms frames before SS fires. 3 ≈ 60 ms
+      # (default) is permissive — short impulse noise like a single
+      # clap (~80–120 ms) crosses it and dispatches a turn. Bump to
+      # 5 (100 ms) or 7 (140 ms) to filter those, at the cost of
+      # eating the first frames of very fast utterance starts.
+      VAD_START_FRAMES: "${VAD_START_FRAMES:-3}"
+      # webrtc-vad internal aggressiveness 0..=3. 2 = balanced
+      # default; 3 = stricter, drops more borderline / noisy frames
+      # (helpful in noisy mics, slightly more chance of cutting
+      # quiet speech).
+      VAD_AGGRESSIVENESS: "${VAD_AGGRESSIVENESS:-2}"
+      # RNNoise (nnnoiseless) pre-stage. On = denoise every 20 ms
+      # frame before VAD classification AND before ASR receives the
+      # utterance buffer. Cleans steady-state background (fans, AC,
+      # hum), reduces VAD false positives, and noticeably cuts
+      # Whisper's silence-hallucination rate ("ご視聴ありがとう
+      # ございました" / "(拍手)") on noisy near-silence. Adds
+      # ~0.5% of one core + ~10 ms pipeline latency. Off by default.
+      VAD_DENOISE: "${VAD_DENOISE:-false}"
+      # Drop SpeechEnded events whose buffered audio is quieter
+      # than this RMS threshold (dBFS). Real voice is typically
+      # -10..-25 dBFS, near-silence with ambient noise is -50..-60,
+      # so -45 cleanly separates them. Cuts the "VAD spuriously
+      # armed → empty buffer to ASR → Whisper hallucinates
+      # 'ご視聴ありがとうございました'" loop. Set to 0 to disable.
+      VAD_MIN_UTTERANCE_RMS_DBFS: "${VAD_MIN_UTTERANCE_RMS_DBFS:--45}"
+    extra_hosts:
+      # Plain Linux docker (non-Docker-Desktop, non-WSL2) doesn't
+      # resolve `host.docker.internal` by default. host-gateway makes
+      # it point at the docker bridge gateway = the host. Harmless on
+      # Docker Desktop / WSL2 where the resolver already exists.
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+
+  wake-word-detection:
+    build:
+      context: ./wake-word-detection
+    container_name: kklocalagent-wwd
+    restart: unless-stopped
+    environment:
+      WW_MIC_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/mic
+      WW_SINK_MODE: orchestrator
+      WW_ORCHESTRATOR_URL: http://orchestrator:7000/events
+      WW_MODELS: "${WW_MODELS:-hey_jarvis}"
+      WW_THRESHOLD: "${WW_THRESHOLD:-0.5}"
+      WW_COOLDOWN_SEC: "2.0"
+      WW_INFERENCE_FRAMEWORK: tflite
+      # Diagnostic: when > 0, log the peak score seen in each window
+      # so the operator can tune WW_THRESHOLD. Off (0) by default.
+      # Set to e.g. 5.0 in .env to see "what scores my voice is
+      # producing" without changing the source code.
+      WW_PEAK_LOG_INTERVAL_SEC: "${WW_PEAK_LOG_INTERVAL_SEC:-0}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+
+  # --- system under test ---------------------------------------------
+
+  orchestrator:
+    build:
+      # Repo-root context so the Dockerfile can `COPY wav-utils ./` —
+      # orchestrator depends on the shared `wav-utils` crate via path
+      # for the s16le-mono WAV header helper used by ASR multipart.
+      context: .
+      dockerfile: orchestrator/Dockerfile
+    container_name: kklocalagent-orch
+    restart: unless-stopped
+    environment:
+      RUST_LOG: info,orchestrator=info
+      ORCH_LISTEN: 0.0.0.0:7000
+      ORCH_ASR_URL: http://automatic-speech-recognition:8080/inference
+      ORCH_LLM_URL: http://llm:11434/api/chat
+      ORCH_LLM_MODEL: *llm-model
+      # Voice-assistant persona — prepended to every chat as
+      # {role:"system"}. Tells the model its replies are spoken aloud
+      # (no markdown / lists), to keep responses short, default to
+      # Japanese, and maintain conversational rhythm. Override at
+      # boot via ORCH_LLM_SYSTEM_PROMPT in .env if the deployment
+      # wants a different persona / language.
+      ORCH_LLM_SYSTEM_PROMPT: "${ORCH_LLM_SYSTEM_PROMPT:-You are a voice assistant; your replies are spoken aloud, so write the way people speak — no markdown, no lists, no code blocks. Keep every response to one or two short sentences. Default to Japanese (日本語) unless the user clearly speaks another language. Maintain a brisk, natural conversational rhythm.}"
+      ORCH_TTS_URL: http://tts-streamer:7070/speak
+      ORCH_TTS_STOP_URL: http://tts-streamer:7070/stop
+      # Drain handshake target. Called once per turn after the last
+      # /speak — tts-streamer's response is the precise speaker-
+      # silent moment used to anchor the post-TTS VAD quiet window.
+      ORCH_TTS_FINALIZE_URL: http://tts-streamer:7070/finalize
+      # v1.0 wake gating. Override via .env (`ORCH_WAKE_REQUIRED=false`)
+      # to fall back to v0.1 always-listening behaviour for debugging.
+      ORCH_WAKE_REQUIRED: "${ORCH_WAKE_REQUIRED:-true}"
+      # Two distinct windows: post-wake (5 s for SpeechStarted) and
+      # post-turn (10 s for follow-up SpeechStarted). Either expires
+      # → state returns to Idle and operator must re-wake.
+      ORCH_WAKE_WINDOW_MS: "${ORCH_WAKE_WINDOW_MS:-5000}"
+      ORCH_TURN_FOLLOWUP_WINDOW_MS: "${ORCH_TURN_FOLLOWUP_WINDOW_MS:-10000}"
+      ORCH_WAKE_BARGE_IN: "${ORCH_WAKE_BARGE_IN:-true}"
+      # Drop SpeechEnded events that land within this window after a
+      # WakeWordDetected. Defends against VAD capturing the wake
+      # word's own audio and dispatching a turn whose ASR text is
+      # just "Jervis"/"Alexa"/etc. 800 ms covers the wake-word-only
+      # case (VAD silence hangover ~300 ms) without interfering with
+      # continuous "Hey Jarvis, …" commands (SE typically lands >1 s
+      # after wake). Set to 0 in .env to disable.
+      ORCH_POST_WAKE_SE_DROPOUT_MS: "${ORCH_POST_WAKE_SE_DROPOUT_MS:-800}"
+      # Post-TTS VAD quiet window. With /finalize giving us the
+      # precise speaker-silent moment, this only has to cover VAD's
+      # silence hangover (~200 ms for VAD_HANG_FRAMES=10) — VAD will
+      # always fire SE that long after the audio actually stopped, and
+      # without dropping that SE the orchestrator dispatches an echo
+      # turn whose ASR text is the tail of the assistant's reply.
+      # Bump higher in .env if you've raised VAD_HANG_FRAMES.
+      ORCH_TTS_TAIL_QUIET_MS: "${ORCH_TTS_TAIL_QUIET_MS:-400}"
+      # Pipe-separated substring blacklist for known Whisper
+      # hallucinations. ASR outputs containing any of these are
+      # treated as empty (no LLM, no TTS). Whisper fills ambiguous
+      # near-silence with stock YouTube boilerplate that's never a
+      # real voice command. Override (or set to empty to disable)
+      # via .env. The defaults baked into config.rs already include
+      # the common ones; this lets the operator add domain-specific
+      # extras without recompiling.
+      ORCH_ASR_HALLUCINATION_BLACKLIST: "${ORCH_ASR_HALLUCINATION_BLACKLIST:-ご視聴ありがとう|(拍手)|(笑)|Thanks for watching|Subscribe to my channel}"
+    ports:
+      - "7000:7000"
+    depends_on:
+      automatic-speech-recognition:
+        condition: service_healthy
+      llm:
+        condition: service_healthy
+      tts-streamer:
+        condition: service_healthy
+
+volumes:
+  asr-models:
+  ollama-data:

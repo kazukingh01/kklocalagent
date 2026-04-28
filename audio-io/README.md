@@ -35,17 +35,6 @@ cd audio-io
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
-### Windows (native)
-
-Install the MSVC C++ build tools (via Visual Studio Installer or the
-standalone "Build Tools for Visual Studio"). No extra audio SDK needed —
-cpal uses WASAPI which ships with Windows.
-
-### macOS
-
-No extra packages needed; cpal uses CoreAudio from the SDK bundled with
-Xcode Command Line Tools (`xcode-select --install`).
-
 ## Run
 
 ### Start process

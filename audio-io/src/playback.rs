@@ -1,29 +1,48 @@
 use std::sync::atomic::Ordering;
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
-use ringbuf::traits::{Consumer, Producer, Split};
+use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
-use tokio::sync::mpsc;
+use std::time::Instant;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
 use crate::config::AudioConfig;
 use crate::framer::PlaybackFramer;
 use crate::state::FlushSignals;
 
+/// One unit of work for the playback producer task.
+///
+/// `Frame` is the existing path: a 20 ms s16le PCM payload to push at
+/// the cpal output ring. `Eos` is the drain-handshake added so the
+/// upstream (tts-streamer over the /spk WS) can know exactly when the
+/// last sample has actually been consumed by the device — instead of
+/// guessing with a tail timeout. The producer task keeps draining the
+/// ring after Eos arrives and then fires `drain_done` so the WS
+/// handler can echo `{"type":"drained"}` back at the client. Frames
+/// queued *after* Eos (e.g. a barge-in starting a new utterance
+/// immediately) are processed normally — Eos is per-message, not a
+/// permanent terminator.
+pub enum PlaybackMessage {
+    Frame(Bytes),
+    Eos { drain_done: oneshot::Sender<()> },
+}
+
 pub struct PlaybackHandle {
     thread_shutdown: std_mpsc::SyncSender<()>,
     thread: Option<std::thread::JoinHandle<()>>,
     task: Option<tokio::task::JoinHandle<()>>,
-    spk_tx: mpsc::Sender<Bytes>,
+    spk_tx: mpsc::Sender<PlaybackMessage>,
 }
 
 impl PlaybackHandle {
-    pub fn sender(&self) -> mpsc::Sender<Bytes> {
+    pub fn sender(&self) -> mpsc::Sender<PlaybackMessage> {
         self.spk_tx.clone()
     }
 }
@@ -83,7 +102,7 @@ pub fn start_playback(
     // 32 frames ≈ 640 ms at 20 ms/frame — a small multiple of the
     // playback ring so backpressure hits the WebSocket well before a
     // multi-second backlog can accumulate (important for barge-in).
-    let (spk_tx, spk_rx) = mpsc::channel::<Bytes>(32);
+    let (spk_tx, spk_rx) = mpsc::channel::<PlaybackMessage>(32);
     let task = tokio::spawn(playback_producer_task(
         spk_rx,
         ready.producer,
@@ -225,7 +244,7 @@ fn run_playback(
 }
 
 async fn playback_producer_task(
-    mut spk_rx: mpsc::Receiver<Bytes>,
+    mut spk_rx: mpsc::Receiver<PlaybackMessage>,
     mut producer: HeapProd<f32>,
     source_rate: u32,
     native_rate: u32,
@@ -239,37 +258,76 @@ async fn playback_producer_task(
             return;
         }
     };
+    let ring_capacity = producer.capacity().get();
     let mut total_dropped: u64 = 0;
     let mut drops_since_log: u32 = 0;
-    while let Some(bytes) = spk_rx.recv().await {
+    while let Some(msg) = spk_rx.recv().await {
         if flush.producer.swap(false, Ordering::Relaxed) {
-            while spk_rx.try_recv().is_ok() {}
+            // Cancellation (barge-in) — drain everything queued and
+            // reset the framer. Any in-flight Eos requests get their
+            // drain_done fired immediately because the cancel itself
+            // is the "no more audio is coming" signal that the
+            // upstream is waiting for.
+            while let Ok(pending) = spk_rx.try_recv() {
+                if let PlaybackMessage::Eos { drain_done } = pending {
+                    let _ = drain_done.send(());
+                }
+            }
             framer.flush();
+            if let PlaybackMessage::Eos { drain_done } = msg {
+                let _ = drain_done.send(());
+            }
             continue;
         }
-        let samples = framer.push_s16le(&bytes);
-        let mut overflow = false;
-        let mut dropped_this_batch: usize = 0;
-        for s in samples {
-            if overflow {
-                dropped_this_batch += 1;
-                continue;
+        match msg {
+            PlaybackMessage::Frame(bytes) => {
+                let samples = framer.push_s16le(&bytes);
+                let mut overflow = false;
+                let mut dropped_this_batch: usize = 0;
+                for s in samples {
+                    if overflow {
+                        dropped_this_batch += 1;
+                        continue;
+                    }
+                    if producer.try_push(s).is_err() {
+                        overflow = true;
+                        dropped_this_batch += 1;
+                    }
+                }
+                if dropped_this_batch > 0 {
+                    total_dropped = total_dropped.saturating_add(dropped_this_batch as u64);
+                    drops_since_log += 1;
+                    // Rate-limit: roughly once per ~1s at 20ms/frame.
+                    if drops_since_log >= 50 {
+                        warn!(
+                            total_dropped,
+                            "playback ring buffer full; dropping samples (consumer slower than producer)"
+                        );
+                        drops_since_log = 0;
+                    }
+                }
             }
-            if producer.try_push(s).is_err() {
-                overflow = true;
-                dropped_this_batch += 1;
-            }
-        }
-        if dropped_this_batch > 0 {
-            total_dropped = total_dropped.saturating_add(dropped_this_batch as u64);
-            drops_since_log += 1;
-            // Rate-limit: roughly once per ~1s at 20ms/frame.
-            if drops_since_log >= 50 {
-                warn!(
-                    total_dropped,
-                    "playback ring buffer full; dropping samples (consumer slower than producer)"
-                );
-                drops_since_log = 0;
+            PlaybackMessage::Eos { drain_done } => {
+                // Wait for the cpal output thread to consume every
+                // sample we've pushed. Polling vacant_len from the
+                // producer side reads how much room is available; when
+                // it equals capacity, the ring is empty and the cpal
+                // callback has just emitted (or is about to emit) its
+                // last non-zero sample. 5 ms granularity is well below
+                // a 20 ms frame so the upstream sees the drained
+                // signal within ~one cpal callback of true silence.
+                // A flush mid-wait is treated as "drained now" — the
+                // cancel path drained the ring on our behalf.
+                let drain_start = Instant::now();
+                while producer.vacant_len() < ring_capacity {
+                    if flush.producer.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                let drain_ms = drain_start.elapsed().as_millis();
+                info!(drain_ms, "playback ring drained, signaling client");
+                let _ = drain_done.send(());
             }
         }
     }

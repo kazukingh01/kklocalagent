@@ -1,0 +1,4 @@
+openwakeword==0.6.0
+websockets>=12.0,<14
+aiohttp>=3.9,<4
+numpy<2

@@ -1,0 +1,78 @@
+# CPU-only override on top of compose.yaml.
+#
+# Strips the LLM's GPU reservation (so the stack starts on hosts
+# without an NVIDIA driver) and swaps the LLM to a 1B parameter
+# variant that fits comfortably in CPU RAM and responds in 1–2 s
+# per turn on a typical 8-core x86_64 box. ASR (whisper.cpp small
+# q8_0, ~252 MB) is already CPU-friendly so it stays put.
+#
+# Run as:
+#   docker compose -f compose.yaml -f compose.cpu.yaml up -d --build
+#
+# Or pin in .env so plain `docker compose up -d` picks it up:
+#   COMPOSE_FILE=compose.yaml:compose.cpu.yaml
+#
+# Override another model on top of either default:
+#   LLM_MODEL='hf.co/mmnga-o/llm-jp-4-8b-thinking-gguf:Q8_0' \
+#       docker compose -f compose.yaml -f compose.cpu.yaml up -d --build
+
+services:
+  # First-run model bootstrap: the GPU default would download
+  # `large-v3-turbo` (~1.6 GB) which is wasted weight on a CPU host
+  # the user picked specifically because it can't run that. Override
+  # the *fallback* here so plain CPU runs grab the lighter
+  # small-q8_0 (~244 MB) instead. `ASR_MODEL=...` on the host still
+  # wins over both flavors.
+  asr-models:
+    environment:
+      ASR_MODEL: "${ASR_MODEL:-ggml-small-q8_0.bin}"
+
+  automatic-speech-recognition:
+    build:
+      # CPU build of whisper.cpp (no CUDA). Upstream publishes one
+      # image per backend; the GPU base picks `main-cuda`, we flip
+      # back to `main` so the image runs on hosts without an nvidia
+      # driver.
+      context: ./automatic-speech-recognition
+      args:
+        WHISPER_VARIANT: main
+    environment:
+      # Must agree with `asr-models.environment.ASR_MODEL` above —
+      # whisper-server names the model file when loading, so a
+      # mismatch here would fail to mmap (or load the wrong weights).
+      # `WHISPER_MODEL` is what the runtime container reads; the
+      # bootstrap volume is shared, so both must resolve to the same
+      # filename.
+      WHISPER_MODEL: "${ASR_MODEL:-ggml-small-q8_0.bin}"
+    # Drop the GPU reservation from the merged config — same `!reset`
+    # pattern as `llm` below; without it the container won't start
+    # on hosts without an nvidia runtime.
+    deploy: !reset null
+
+  llm:
+    environment:
+      # Lighter default for CPU. Same env knob as the GPU base, so
+      # `LLM_MODEL=...` still wins over both — only the *fallback*
+      # changes between flavors. The orchestrator's ORCH_LLM_MODEL
+      # below tracks this so they don't drift.
+      LLM_MODEL: "${LLM_MODEL:-gemma3:1b}"
+      # GPU-only knobs from the base compose are dropped here:
+      # OLLAMA_FLASH_ATTENTION + OLLAMA_KV_CACHE_TYPE both require a
+      # CUDA / Metal backend and are no-ops (or warn) on the CPU
+      # build. The general scheduling knobs still apply.
+      OLLAMA_FLASH_ATTENTION: ""
+      OLLAMA_KV_CACHE_TYPE: ""
+    # Compose-spec `!reset` clears the entire `deploy` block from
+    # the merged config — required because compose merges nested
+    # maps recursively, so dropping just `devices: []` would still
+    # leave a reservation/limits frame around. Without this, docker
+    # refuses to start on hosts where the nvidia driver isn't
+    # installed.
+    deploy: !reset null
+
+  orchestrator:
+    environment:
+      # Must match `llm.environment.LLM_MODEL` above — the
+      # orchestrator names the model when calling /api/chat, so a
+      # mismatch here would 404 ollama.
+      ORCH_LLM_MODEL: "${LLM_MODEL:-gemma3:1b}"
