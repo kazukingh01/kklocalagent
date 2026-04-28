@@ -573,10 +573,12 @@ async def strict_barge_in_during_asr_aborts(
 ) -> None:
     """A wake event arriving while ASR is in flight must abort the
     rest of the turn — no LLM call, no sink TurnCompleted forward,
-    no TTS speak. The original ASR HTTP request still completes (we
-    don't cancel awaits mid-request), so asr_calls counts 1, but
-    everything downstream gets zero. Verifies the post-ASR
-    `wake.is_in_turn()` check in run_turn."""
+    no TTS speak. asr_calls still counts 1 because the mock records
+    the call at request entry, before its release-event await; the
+    orchestrator drops the HTTP connection when it aborts the
+    inflight task, but by then `asr_calls.append()` has already
+    fired. Verifies that `WakeResult::BargeIn`'s task abort tears
+    down the run_turn future before any downstream stage starts."""
     mocks.reset()
     mocks.asr_blocks = True
 
@@ -609,7 +611,9 @@ async def strict_barge_in_during_llm_aborts(
     """Same as the ASR variant but the wake fires while the LLM is
     in flight. ASR has already completed, so asr_calls=1 and
     llm_calls=1, but TTS and the TurnCompleted sink forward are both
-    skipped — the post-LLM `wake.is_in_turn()` check catches it."""
+    skipped — the run_turn task abort cancels the streaming /api/chat
+    response (closing the connection so ollama would stop generating
+    in production) before any sentence reaches the TTS consumer."""
     mocks.reset()
     mocks.llm_blocks = True
 

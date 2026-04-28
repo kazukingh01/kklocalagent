@@ -72,6 +72,13 @@ struct Inner {
     /// `ArmedAfterWake` (5 s) instead of `ArmedAfterTurn` (10 s),
     /// honouring the wake the operator pressed mid-reply.
     pending_wake_after_turn: bool,
+    /// Monotonic id of the *current* turn — bumped on every transition
+    /// into `Processing`. ProcessingGuard records the id at creation;
+    /// `complete()` no-ops if the id has moved on, so a turn that was
+    /// aborted by barge-in (and whose JoinHandle::abort() runs Drop on
+    /// its guard) can't accidentally roll back the next turn's state
+    /// from Processing → ArmedAfterTurn.
+    turn_generation: u64,
 }
 
 pub struct WakeMachine {
@@ -136,13 +143,18 @@ pub enum DispatchOutcome {
 /// to one of {ArmedAfterTurn, ArmedAfterWake} so the operator can
 /// follow up without (or with) a fresh wake. Never observed
 /// directly by callers — moved into the spawned pipeline task.
+///
+/// Guards carry the `turn_generation` they were minted under so a
+/// dropped-after-abort guard can detect that a *different* turn now
+/// owns the Processing phase and refuses to mutate state.
 pub struct ProcessingGuard {
     machine: Arc<WakeMachine>,
+    generation: u64,
 }
 
 impl Drop for ProcessingGuard {
     fn drop(&mut self) {
-        self.machine.complete();
+        self.machine.complete(self.generation);
     }
 }
 
@@ -157,6 +169,7 @@ impl WakeMachine {
                 phase: Phase::Idle,
                 armed_until: None,
                 pending_wake_after_turn: false,
+                turn_generation: 0,
             }),
         }
     }
@@ -253,22 +266,33 @@ impl WakeMachine {
     /// without a SpeechStarted step. Real VAD always sends SS first.
     pub fn try_dispatch(self: &Arc<Self>) -> DispatchOutcome {
         if !self.required {
-            return DispatchOutcome::Run(ProcessingGuard { machine: self.clone() });
+            // Loose mode never bumps generation — there's no Processing
+            // phase to guard against, so the id stays at its initial 0
+            // and complete() is a no-op anyway (early-return on
+            // !self.required). The guard still records 0 for symmetry.
+            return DispatchOutcome::Run(ProcessingGuard {
+                machine: self.clone(),
+                generation: 0,
+            });
         }
         let mut g = self.inner.lock().expect("wake state poisoned");
         let now = Instant::now();
-        match g.phase {
-            Phase::Listening => {
-                g.phase = Phase::Processing;
-                g.armed_until = None;
-                DispatchOutcome::Run(ProcessingGuard { machine: self.clone() })
+        // Mint a fresh generation on every Processing transition. Any
+        // guard from a previously-aborted turn carries a stale id and
+        // will no-op when its Drop fires after we've already moved on.
+        let mint_guard = |g: &mut Inner| {
+            g.phase = Phase::Processing;
+            g.armed_until = None;
+            g.turn_generation = g.turn_generation.wrapping_add(1);
+            ProcessingGuard {
+                machine: self.clone(),
+                generation: g.turn_generation,
             }
+        };
+        match g.phase {
+            Phase::Listening => DispatchOutcome::Run(mint_guard(&mut g)),
             Phase::ArmedAfterWake => match g.armed_until {
-                Some(t) if t > now => {
-                    g.phase = Phase::Processing;
-                    g.armed_until = None;
-                    DispatchOutcome::Run(ProcessingGuard { machine: self.clone() })
-                }
+                Some(t) if t > now => DispatchOutcome::Run(mint_guard(&mut g)),
                 _ => {
                     g.phase = Phase::Idle;
                     g.armed_until = None;
@@ -276,11 +300,7 @@ impl WakeMachine {
                 }
             },
             Phase::ArmedAfterTurn => match g.armed_until {
-                Some(t) if t > now => {
-                    g.phase = Phase::Processing;
-                    g.armed_until = None;
-                    DispatchOutcome::Run(ProcessingGuard { machine: self.clone() })
-                }
+                Some(t) if t > now => DispatchOutcome::Run(mint_guard(&mut g)),
                 _ => {
                     g.phase = Phase::Idle;
                     g.armed_until = None;
@@ -297,11 +317,19 @@ impl WakeMachine {
     /// landed mid-turn). If barge-in already promoted state to
     /// ArmedAfterWake, complete() is a no-op (the wake's window
     /// owns the state now).
-    fn complete(&self) {
+    ///
+    /// `gen` is the guard's recorded generation. If barge-in aborted
+    /// the previous turn and a *new* turn has already advanced to
+    /// Processing, `gen` will be stale and we skip — otherwise the
+    /// aborted turn's late drop would clobber the live one's phase.
+    fn complete(&self, gen: u64) {
         if !self.required {
             return;
         }
         let mut g = self.inner.lock().expect("wake state poisoned");
+        if g.turn_generation != gen {
+            return;
+        }
         if g.phase == Phase::Processing {
             let now = Instant::now();
             if g.pending_wake_after_turn {
@@ -490,5 +518,28 @@ mod tests {
         assert!(m.is_in_turn());
         drop(g);
         assert!(!m.is_in_turn()); // Now ArmedAfterTurn, not Processing
+    }
+
+    #[test]
+    fn stale_guard_drop_does_not_disturb_new_turn() {
+        // Regression: barge-in aborts the old turn but its
+        // ProcessingGuard's Drop runs *after* a new turn has already
+        // moved phase back to Processing. Without generation tracking,
+        // the stale Drop would call complete() and roll the new turn's
+        // phase back to ArmedAfterTurn, breaking it. With tracking, the
+        // stale Drop is a no-op.
+        let m = mk(cfg(true, 1000, 1000, true));
+        m.on_wake();
+        let old_guard = run_guard(m.try_dispatch()).unwrap();
+        // Barge-in: state goes Processing → ArmedAfterWake.
+        assert_eq!(m.on_wake(), WakeResult::BargeIn);
+        // New turn dispatched within the wake window — bumps generation.
+        let _new_guard = run_guard(m.try_dispatch()).unwrap();
+        assert!(m.is_in_turn());
+        // Old turn's late drop fires now (simulating
+        // JoinHandle::abort()'s drop chain landing after the new
+        // dispatch). Must not change phase: the new turn is mid-flight.
+        drop(old_guard);
+        assert!(m.is_in_turn(), "stale guard's drop must not roll back the live turn");
     }
 }

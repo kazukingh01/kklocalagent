@@ -152,14 +152,18 @@ pub async fn forward_to_result_sink(backends: &Backends, payload: &serde_json::V
 /// assistant reply on success; logs and swallows errors at each stage
 /// so one bad utterance can't bring the service down.
 ///
-/// Barge-in: between every stage, check `wake.pipeline_still_active()`. If a
-/// `WakeWordDetected` arrived mid-turn, on_wake() will have flipped
-/// the state from Processing → Armed, and we abort here — no further
-/// HTTP is sent to the downstream modules. The in-flight HTTP call
-/// of the *current* stage still completes (we don't cancel awaits
-/// mid-request), but the next module never sees the request. This
-/// satisfies the v1.0 spec: "after barge-in, downstream modules from
-/// the detection point onward receive no HTTP".
+/// Barge-in (`WakeWordDetected` mid-turn with `barge_in=true`) is
+/// driven from `service.rs`: it calls `JoinHandle::abort()` on this
+/// task's spawn, which immediately cancels every await below — the
+/// in-flight ASR/LLM/TTS HTTP responses are dropped (closing the
+/// connection so the upstream stops producing), the mpsc sentence
+/// channel is closed (so the consumer task exits and releases the
+/// turn-scoped TTS permit), and the ASR/LLM permits drop with the
+/// run_turn locals. The polling `wake.pipeline_still_active()`
+/// checks below remain as belt-and-braces for the no-barge_in path
+/// (where the running turn must finish but downstream stages can
+/// still notice and skip), and to short-circuit cleanly if abort
+/// hasn't landed yet at a stage boundary.
 pub async fn run_turn(
     backends: Arc<Backends>,
     wake: Arc<WakeMachine>,

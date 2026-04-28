@@ -11,7 +11,7 @@
 //! recent `WakeWordDetected`. Set `wake.required = false` to fall
 //! back to v0.1 always-listening behaviour.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -23,6 +23,7 @@ use axum::{
 };
 use serde_json::json;
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::config::Config;
@@ -34,6 +35,14 @@ use crate::state::{DispatchOutcome, SpeechStartedOutcome, WakeMachine, WakeResul
 struct AppState {
     backends: Arc<Backends>,
     wake: Arc<WakeMachine>,
+    /// Handle to the spawned `run_turn` task for the in-flight turn.
+    /// `WakeResult::BargeIn` calls `abort()` on this so every await
+    /// inside run_turn (in-flight ASR/LLM/TTS HTTP, mpsc sentence
+    /// channel, consumer JoinHandle) tears down immediately instead
+    /// of polling between stages and leaving the trailing work to
+    /// drain by itself. Set on dispatch, taken-and-cleared by
+    /// barge-in or by the task itself when it finishes naturally.
+    inflight_turn: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 pub async fn run(config: Config) -> Result<()> {
@@ -44,7 +53,11 @@ pub async fn run(config: Config) -> Result<()> {
         config.result_sink.clone(),
     )?);
     let wake = Arc::new(WakeMachine::new(&config.wake));
-    let state = AppState { backends, wake };
+    let state = AppState {
+        backends,
+        wake,
+        inflight_turn: Arc::new(Mutex::new(None)),
+    };
 
     let app = Router::new()
         .route("/health", get(health))
@@ -269,8 +282,32 @@ async fn events(
                         target: "orch::events",
                         model = ?ev.model,
                         score = ?ev.score,
-                        "wake word detected mid-turn: barge-in — cancelling current TTS"
+                        "wake word detected mid-turn: barge-in — cancelling current TTS and aborting turn"
                     );
+                    // Abort the in-flight run_turn task. This drops
+                    // every await inside it: in-flight ASR/LLM/TTS
+                    // HTTP responses are dropped (closing the
+                    // connection so ollama/whisper-server stop
+                    // generating), the mpsc sentence channel's sender
+                    // is dropped (so the consumer task unblocks on
+                    // recv() == None and exits, releasing the
+                    // turn-scoped TTS permit), and the run_turn
+                    // local's drop chain releases the ASR/LLM
+                    // semaphore permits. None of this leaves residual
+                    // work for the next turn to fight over. The
+                    // aborted turn's ProcessingGuard::drop also runs
+                    // — generation-checking in WakeMachine::complete
+                    // makes it a no-op so it can't roll back the
+                    // post-barge-in ArmedAfterWake phase.
+                    if let Some(h) = state.inflight_turn.lock().expect("inflight poisoned").take() {
+                        h.abort();
+                    }
+                    // Then the TTS-side cleanup. tts_stop POSTs /stop
+                    // to the streamer (which cancels speak_one and
+                    // POSTs /spk/stop to audio-io to drain its
+                    // playback ring). Spawn so the events handler
+                    // returns 200 quickly even if the streamer is
+                    // slow.
                     let backends_for_stop = state.backends.clone();
                     tokio::spawn(async move {
                         tts_stop(&backends_for_stop).await;
@@ -308,10 +345,30 @@ fn dispatch_utterance(
     // state to Armed and the next stage's HTTP is skipped.
     let backends = state.backends.clone();
     let wake = state.wake.clone();
-    tokio::spawn(async move {
+    let inflight_slot = state.inflight_turn.clone();
+    let handle = tokio::spawn(async move {
         pipeline::run_turn(backends, wake, pcm, sample_rate).await;
         drop(guard);
+        // Self-clear so a barge-in arriving *after* this turn finished
+        // naturally doesn't try to abort an already-completed handle.
+        // Race-safe: if barge-in's `take()` ran first the slot is
+        // already None; if ours runs first a later barge-in finds None
+        // and treats it as "no in-flight turn", which is correct.
+        let _ = inflight_slot.lock().expect("inflight poisoned").take();
     });
+    // Replacing an existing handle would mean a previous turn was
+    // still in flight — try_dispatch returned Run only when phase was
+    // Listening / ArmedAfter*, never Processing, so this slot must be
+    // empty. Aborting an unexpected old handle is the safe fallback.
+    if let Some(old) = state
+        .inflight_turn
+        .lock()
+        .expect("inflight poisoned")
+        .replace(handle)
+    {
+        warn!(target: "orch::events", "dispatch displaced an unexpected in-flight handle");
+        old.abort();
+    }
     Ok(())
 }
 
