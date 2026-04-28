@@ -38,6 +38,15 @@ struct Args {
     #[arg(long, env = "VAD_LOG_AUDIO_IN_EVENT")]
     log_audio_in_event: Option<bool>,
 
+    /// Override `detector.hang_frames` (consecutive silent 20 ms
+    /// frames before SpeechEnded fires). Each frame is `frame_ms`
+    /// (default 20 ms), so 10 ≈ 200 ms of silence, 20 ≈ 400 ms
+    /// (the legacy default). Lower values shave end-of-utterance
+    /// latency at the cost of cutting off natural mid-utterance
+    /// pauses.
+    #[arg(long, env = "VAD_HANG_FRAMES")]
+    hang_frames: Option<u32>,
+
     /// Shortcut for `--sink-mode asr-direct`. Kept for back-compat with
     /// the early dry-run/live split.
     #[arg(long, conflicts_with = "sink_mode")]
@@ -68,6 +77,9 @@ async fn main() -> Result<()> {
     }
     if let Some(v) = args.log_audio_in_event {
         config.sink.log_audio_in_event = v;
+    }
+    if let Some(v) = args.hang_frames {
+        config.detector.hang_frames = v;
     }
     if let Some(mode) = args.sink_mode {
         config.sink.mode = mode;

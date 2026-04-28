@@ -30,7 +30,11 @@
 # against). YAML anchors don't expand env vars themselves, so we route
 # through `${...}` and reuse the resulting string via the anchor.
 x-llm-model: &llm-model "${LLM_MODEL:-gemma3:4b}"
-x-asr-model: &asr-model "${ASR_MODEL:-ggml-large-v3-turbo-q8_0.bin}"
+# medium-q8_0 (~824 MB) trades a small Japanese-accuracy hit for
+# ~100–200 ms shorter inference vs large-v3-turbo on short voice-
+# agent prompts. Override with `ASR_MODEL=ggml-large-v3-turbo-q8_0.bin`
+# in .env to switch back when accuracy beats latency for the use case.
+x-asr-model: &asr-model "${ASR_MODEL:-ggml-medium-q8_0.bin}"
 
 services:
   # --- model bootstrap -----------------------------------------------
@@ -218,6 +222,14 @@ services:
       # run ASR. Off by default in the VAD config because it bloats
       # dry-run/asr-direct logs — necessary here.
       VAD_LOG_AUDIO_IN_EVENT: "true"
+      # Silence hangover before SpeechEnded fires, in 20 ms frames.
+      # 10 ≈ 200 ms (this default) — tuned for short voice-agent
+      # commands where SE-to-ASR latency dominates time-to-response.
+      # The library default (20 = 400 ms) is safer for natural
+      # speech with mid-sentence pauses but doubles this latency.
+      # Override in .env if you say "えーと、…" mid-utterance and
+      # find the agent cutting you off prematurely.
+      VAD_HANG_FRAMES: "${VAD_HANG_FRAMES:-10}"
     extra_hosts:
       # Plain Linux docker (non-Docker-Desktop, non-WSL2) doesn't
       # resolve `host.docker.internal` by default. host-gateway makes
