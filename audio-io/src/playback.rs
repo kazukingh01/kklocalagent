@@ -9,6 +9,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
+use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
@@ -317,12 +318,15 @@ async fn playback_producer_task(
                 // signal within ~one cpal callback of true silence.
                 // A flush mid-wait is treated as "drained now" — the
                 // cancel path drained the ring on our behalf.
+                let drain_start = Instant::now();
                 while producer.vacant_len() < ring_capacity {
                     if flush.producer.load(Ordering::Relaxed) {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
+                let drain_ms = drain_start.elapsed().as_millis();
+                info!(drain_ms, "playback ring drained, signaling client");
                 let _ = drain_done.send(());
             }
         }

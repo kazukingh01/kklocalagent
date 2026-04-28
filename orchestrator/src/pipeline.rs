@@ -292,24 +292,37 @@ pub async fn run_turn(
 
     let reply_result = llm_chat_streaming(&backends, &wake, &text, sentence_tx).await;
     // Sender dropped here → channel closes once consumer drains;
-    // awaiting the consumer ensures the last /speak finishes before
-    // we return (so the next turn's run_turn can't open a new /speak
-    // while this one's tail is still pacing out).
+    // awaiting the consumer ensures every /speak HTTP has returned
+    // before we move on (so the next turn's run_turn can't open a
+    // new /speak while this one is still pushing PCM frames).
     let _ = consumer.await;
     drop(llm_permit);
 
-    // Open the post-TTS quiet window. /speak returns as soon as the
-    // last PCM frame has been pushed to the WS, but audio-io's
-    // playback ring still has a few hundred ms of audio queued for
-    // the speaker. Without this, the assistant's own voice — leaking
-    // back into the mic during that tail — would fire VAD and
-    // dispatch an echo turn. service.rs::events checks
-    // `backends.in_tts_quiet_window()` before forwarding any
-    // SS/SE to the wake machine. Only set when TTS is actually
-    // wired up; a no-TTS run (url empty) has nothing to drain.
+    // Convert "we sent the last PCM frame to the WS" into "the
+    // speaker actually fell silent" by asking tts-streamer to do the
+    // EOS/drained handshake against audio-io. /finalize's response
+    // is the precise silent moment. Skipped when finalize_url is
+    // empty (tail_quiet_ms then has to absorb audio-io's playback
+    // ring drain time as well).
+    if !backends.tts.finalize_url.is_empty() {
+        tts_finalize(&backends).await;
+    }
+
+    // Open the post-TTS VAD quiet window. With the drain handshake
+    // above, this only needs to cover VAD's silence hangover (~200 ms
+    // for hang_frames=10) plus a propagation safety margin — VAD will
+    // fire SE that long after the audio actually ended, and that SE
+    // would otherwise dispatch an echo turn. service.rs::events
+    // checks `backends.in_tts_quiet_window()` before forwarding any
+    // SS/SE to the wake machine.
     if !backends.tts.url.is_empty() && backends.tts.tail_quiet_ms > 0 {
         let until = Instant::now() + Duration::from_millis(backends.tts.tail_quiet_ms);
         *backends.tts_quiet_until.lock().expect("tts_quiet poisoned") = Some(until);
+        info!(
+            target: "orch::pipeline",
+            quiet_ms = backends.tts.tail_quiet_ms,
+            "TTS drained; opening VAD quiet window"
+        );
     }
 
     let reply = match reply_result {
@@ -405,6 +418,53 @@ async fn tts_speak_inner(backends: &Backends, text: &str) {
             }
         }
         Err(e) => warn!(target: "orch::pipeline", "TTS POST failed: {e:#}"),
+    }
+}
+
+/// POST `tts.finalize_url` to wait for tts-streamer's drain
+/// handshake with audio-io. Returns when audio-io reports its
+/// playback ring is empty (= the speaker fell silent). Caller
+/// should have already drained every per-sentence /speak before
+/// calling this. Failures are logged but never propagate — the
+/// quiet window will still be opened immediately afterward, just
+/// without the precise silent-moment anchor.
+pub async fn tts_finalize(backends: &Backends) {
+    if backends.tts.finalize_url.is_empty() {
+        return;
+    }
+    let started = Instant::now();
+    let res = backends
+        .http
+        .post(&backends.tts.finalize_url)
+        .timeout(std::time::Duration::from_millis(backends.tts.timeout_ms))
+        .send()
+        .await;
+    let elapsed_ms = started.elapsed().as_millis();
+    match res {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.is_success() {
+                info!(
+                    target: "orch::pipeline",
+                    elapsed_ms,
+                    "TTS /finalize ok ({status})"
+                );
+            } else {
+                let body = resp.text().await.unwrap_or_default();
+                warn!(
+                    target: "orch::pipeline",
+                    elapsed_ms,
+                    "TTS /finalize responded {}: {}",
+                    status,
+                    body.chars().take(200).collect::<String>()
+                );
+            }
+        }
+        Err(e) => warn!(
+            target: "orch::pipeline",
+            elapsed_ms,
+            "TTS /finalize POST failed: {e:#}"
+        ),
     }
 }
 
@@ -509,6 +569,7 @@ async fn llm_chat_streaming(
         messages,
         stream: true,
     };
+    let llm_started = Instant::now();
     let mut resp = backends
         .http
         .post(&backends.llm.url)
@@ -531,6 +592,14 @@ async fn llm_chat_streaming(
     // each completed sentence out into the channel.
     let mut sentence_buf = String::new();
     let mut full_reply = String::new();
+    // Diagnostic timing for the streaming path. TTFB = time to first
+    // body chunk (covers prompt eval). TTFS = time to first sentence
+    // boundary (covers prompt eval + token generation up to the first
+    // terminator). Together they pinpoint whether a slow turn is the
+    // model warming up vs. the model generating verbose preamble
+    // before any sentence break.
+    let mut first_chunk_logged = false;
+    let mut first_sentence_logged = false;
 
     'outer: loop {
         let chunk = resp
@@ -541,6 +610,14 @@ async fn llm_chat_streaming(
             Some(c) => c,
             None => break, // EOF without explicit done:true — flush below.
         };
+        if !first_chunk_logged {
+            info!(
+                target: "orch::pipeline",
+                ttfb_ms = llm_started.elapsed().as_millis(),
+                "LLM first chunk received"
+            );
+            first_chunk_logged = true;
+        }
         byte_buf.extend_from_slice(&chunk);
 
         while let Some(nl_pos) = byte_buf.iter().position(|&b| b == b'\n') {
@@ -583,6 +660,14 @@ async fn llm_chat_streaming(
                         // ollama stops generating. No further
                         // sentences emitted.
                         return Ok(full_reply);
+                    }
+                    if !first_sentence_logged {
+                        info!(
+                            target: "orch::pipeline",
+                            ttfs_ms = llm_started.elapsed().as_millis(),
+                            "LLM first sentence emitted"
+                        );
+                        first_sentence_logged = true;
                     }
                     if sentence_tx.send(sentence).await.is_err() {
                         // Consumer gone — abandon stream.

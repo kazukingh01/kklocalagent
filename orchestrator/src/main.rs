@@ -41,6 +41,14 @@ struct Args {
     #[arg(long, env = "ORCH_TTS_STOP_URL")]
     tts_stop_url: Option<String>,
 
+    /// Override `tts.finalize_url`. POSTed once per turn after the
+    /// last per-sentence /speak completes; tts-streamer's response
+    /// is the precise speaker-silent moment used to anchor the
+    /// post-TTS VAD quiet window. Empty falls back to a pure
+    /// timeout (less precise; tail_quiet_ms must compensate).
+    #[arg(long, env = "ORCH_TTS_FINALIZE_URL")]
+    tts_finalize_url: Option<String>,
+
     /// Override `tts.tail_quiet_ms`. Drop VAD events for this many
     /// extra milliseconds after each turn's TTS completes — covers
     /// the audio-io playback-ring tail so the assistant's own voice
@@ -111,6 +119,9 @@ async fn main() -> Result<()> {
     }
     if let Some(v) = args.tts_stop_url {
         config.tts.stop_url = v;
+    }
+    if let Some(v) = args.tts_finalize_url {
+        config.tts.finalize_url = v;
     }
     if let Some(v) = args.tts_tail_quiet_ms {
         config.tts.tail_quiet_ms = v;

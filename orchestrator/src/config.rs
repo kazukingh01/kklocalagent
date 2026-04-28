@@ -97,6 +97,16 @@ pub struct TtsConfig {
     /// the cancel side-effect (any new turn still queues normally
     /// behind the streamer's serial speak).
     pub stop_url: String,
+    /// `tts-streamer` `/finalize` URL. POSTed once per turn after the
+    /// last per-sentence /speak completes; tts-streamer opens a fresh
+    /// /spk WS, sends EOS, and awaits audio-io's drained reply, so
+    /// the HTTP response is the precise moment the speaker fell
+    /// silent. Empty skips the call — fine when TTS is unconfigured
+    /// or when running against a tts-streamer build that doesn't
+    /// have /finalize, but echo-suppression then has to be a pure
+    /// timeout (`tail_quiet_ms` must cover audio-io's playback ring
+    /// drain time *and* VAD's hangover, not just the latter).
+    pub finalize_url: String,
     /// HTTP timeout per speak POST, in milliseconds. Generous because
     /// the upstream call covers VOICEVOX synthesis + WS streaming the
     /// frames at real time — a 5-second utterance physically takes 5 s
@@ -108,13 +118,16 @@ pub struct TtsConfig {
     pub max_inflight: u32,
     /// After every successful turn's TTS completes, drop *all* VAD
     /// events (SpeechStarted and SpeechEnded) for this many extra
-    /// milliseconds. The audio-io ↔ tts-streamer drain handshake
-    /// already makes /speak's HTTP return the precise moment the
-    /// cpal output ring is empty, so this only needs to cover the
-    /// round-trip jitter between `drained` firing and the
-    /// orchestrator stamping the deadline + any VAD events already
-    /// in flight at the boundary. Set to 0 once you trust the
-    /// handshake end-to-end on your hardware.
+    /// milliseconds. With the audio-io ↔ tts-streamer drain
+    /// handshake (`finalize_url`), the speaker-silent moment is
+    /// known to within a few ms — but VAD itself has a silence
+    /// hangover (default 200 ms via VAD_HANG_FRAMES=10) that fires
+    /// SE *that long* after the audio actually stopped. So this
+    /// window has to cover the VAD hangover + a small propagation
+    /// margin to suppress the echo SE that always trails real
+    /// speech. 400 ms covers VAD hang_frames up to ~15 (300 ms);
+    /// bump higher if you've raised hang_frames to 20+ in .env.
+    /// 0 disables, only safe with upstream AEC.
     pub tail_quiet_ms: u64,
 }
 
@@ -210,9 +223,10 @@ impl Default for TtsConfig {
             // so the pipeline still completes without trying to speak.
             url: String::new(),
             stop_url: String::new(),
+            finalize_url: String::new(),
             timeout_ms: 60_000,
             max_inflight: 1,
-            tail_quiet_ms: 50,
+            tail_quiet_ms: 400,
         }
     }
 }

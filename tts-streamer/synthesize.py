@@ -103,19 +103,15 @@ def to_pcm_16k_mono(wav_bytes: bytes) -> bytes:
 async def push_to_spk(spk_url: str, pcm: bytes) -> int:
     """Stream `pcm` to audio-io's /spk WS in 20 ms frames, paced.
 
-    After the last PCM frame (plus a brief trailing-silence padding to
-    push the tail through any 16-bit-boundary requantisation),
-    sends a `{"type":"eos"}` text control frame and waits for the
-    matching `{"type":"drained"}` reply from audio-io. That reply is
-    fired only when audio-io's cpal output ring has been fully
-    consumed by the device — i.e. when the speaker has actually
-    stopped emitting samples. So /speak's HTTP return is the precise
-    moment of silence, not "I sent the last byte to the WS" plus a
-    timing guess. The orchestrator then doesn't need a tail_quiet_ms
-    heuristic to suppress echo turns.
-
-    Returns total PCM bytes sent (excluding the trailing-silence
-    padding and the EOS handshake).
+    Returns when the last frame has been sent — does NOT wait for
+    audio-io's playback ring to drain. The drain handshake is
+    factored out into the separate /finalize endpoint so an
+    intermediate sentence in a multi-sentence turn (e.g. "はい、")
+    doesn't block the next /speak: audio-io's ring continues
+    feeding the cpal callback while the next sentence's PCM is
+    being pushed in, so the speaker hears continuous audio with no
+    inter-sentence silence gaps. The orchestrator calls /finalize
+    once after the last sentence's /speak.
     """
     sent = 0
     async with websockets.connect(spk_url) as ws:
@@ -129,24 +125,6 @@ async def push_to_spk(spk_url: str, pcm: bytes) -> int:
             await ws.send(tail)
             sent += BYTES_PER_FRAME
             await asyncio.sleep(FRAME_PERIOD)
-        # EOS + drain handshake. Sends `{"type":"eos"}` and blocks
-        # until audio-io replies `{"type":"drained"}` — that reply
-        # fires only when the cpal output ring is empty, so the WS
-        # close below (and the /speak HTTP return that follows it)
-        # is the precise moment the speaker has stopped emitting.
-        # The trailing-silence padding the previous implementation
-        # used (10 × 20 ms zero frames) is gone: the handshake does
-        # the same job more accurately. If audio-io misbehaves and
-        # doesn't reply, this raises and /speak fails 502 — the
-        # orchestrator surfaces it instead of silently inflating
-        # latency.
-        await ws.send(json.dumps({"type": "eos"}))
-        while True:
-            raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
-            if isinstance(raw, (bytes, bytearray)):
-                continue
-            if json.loads(raw).get("type") == "drained":
-                break
     return sent
 
 
@@ -225,6 +203,41 @@ async def speak(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": str(e)}, status=502)
 
 
+async def finalize(_: web.Request) -> web.Response:
+    """Wait for audio-io's playback ring to fully drain.
+
+    Called by the orchestrator once after all per-sentence /speak
+    posts for a turn have completed. Opens a fresh WS to /spk,
+    sends `{"type":"eos"}`, and awaits the matching
+    `{"type":"drained"}` reply from audio-io — that reply fires
+    only when audio-io's cpal output ring has been fully consumed
+    by the device, so /finalize's HTTP return is the precise
+    moment the speaker fell silent. The orchestrator uses this
+    boundary to open its post-TTS VAD quiet window without
+    inheriting audio-io's playback_buffer_ms as a guess.
+    """
+    if not SPK_URL:
+        return web.json_response(
+            {"ok": False, "error": "SPK_URL not configured"}, status=500
+        )
+    start = asyncio.get_event_loop().time()
+    try:
+        async with websockets.connect(SPK_URL) as ws:
+            await ws.send(json.dumps({"type": "eos"}))
+            while True:
+                raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                if isinstance(raw, (bytes, bytearray)):
+                    continue
+                if json.loads(raw).get("type") == "drained":
+                    break
+    except Exception as e:  # noqa: BLE001
+        log.error("finalize failed: %s", e)
+        return web.json_response({"ok": False, "error": str(e)}, status=502)
+    elapsed_ms = (asyncio.get_event_loop().time() - start) * 1000
+    log.info("finalize: drained after %.0f ms", elapsed_ms)
+    return web.json_response({"ok": True, "drained_ms": round(elapsed_ms, 1)})
+
+
 async def stop(_: web.Request) -> web.Response:
     """Cancel any in-flight /speak task and tell audio-io to drop
     pending playback. Idempotent — safe to call when nothing is
@@ -261,6 +274,7 @@ def main() -> None:
     app = web.Application()
     app.router.add_get("/health", health)
     app.router.add_post("/speak", speak)
+    app.router.add_post("/finalize", finalize)
     app.router.add_post("/stop", stop)
     # access_log=None suppresses aiohttp's per-request INFO line. The
     # Dockerfile HEALTHCHECK pings GET /health every 10 s; without

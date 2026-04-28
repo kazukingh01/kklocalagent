@@ -42,6 +42,13 @@ url = "http://tts-streamer:7070/speak"
 # TTS reply when the operator says the wake word again. Empty
 # disables the cancel side-effect.
 stop_url = "http://tts-streamer:7070/stop"
+# Drain handshake target. POSTed once per turn after the last
+# /speak — tts-streamer opens a fresh /spk WS, sends EOS, awaits
+# audio-io's drained reply, and returns. The HTTP response is the
+# precise speaker-silent moment used to anchor the post-TTS VAD
+# quiet window. Empty skips the call (tail_quiet_ms then has to
+# absorb audio-io's playback ring drain time as well).
+finalize_url = "http://tts-streamer:7070/finalize"
 # Generous because the streamer's response covers VOICEVOX synthesis
 # *and* WS-streaming the frames at real time — a 5 s utterance
 # physically takes 5 s to push through audio-io.
@@ -53,7 +60,7 @@ max_inflight = 1
 # turn. WakeWordDetected stays unaffected — the operator deliberately
 # barging in must still cut through. 0 disables (use when AEC is
 # handled upstream).
-tail_quiet_ms = 50
+tail_quiet_ms = 400
 
 # Wake-gating policy. v1.0 default: gate the ASR→LLM→TTS pipeline
 # on a recent WakeWordDetected event. Set `required = false` to fall

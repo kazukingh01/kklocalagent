@@ -286,6 +286,10 @@ services:
       ORCH_LLM_SYSTEM_PROMPT: "${ORCH_LLM_SYSTEM_PROMPT:-You are a voice assistant; your replies are spoken aloud, so write the way people speak — no markdown, no lists, no code blocks. Keep every response to one or two short sentences. Default to Japanese (日本語) unless the user clearly speaks another language. Maintain a brisk, natural conversational rhythm.}"
       ORCH_TTS_URL: http://tts-streamer:7070/speak
       ORCH_TTS_STOP_URL: http://tts-streamer:7070/stop
+      # Drain handshake target. Called once per turn after the last
+      # /speak — tts-streamer's response is the precise speaker-
+      # silent moment used to anchor the post-TTS VAD quiet window.
+      ORCH_TTS_FINALIZE_URL: http://tts-streamer:7070/finalize
       # v1.0 wake gating. Override via .env (`ORCH_WAKE_REQUIRED=false`)
       # to fall back to v0.1 always-listening behaviour for debugging.
       ORCH_WAKE_REQUIRED: "${ORCH_WAKE_REQUIRED:-true}"
@@ -303,13 +307,14 @@ services:
       # continuous "Hey Jarvis, …" commands (SE typically lands >1 s
       # after wake). Set to 0 in .env to disable.
       ORCH_POST_WAKE_SE_DROPOUT_MS: "${ORCH_POST_WAKE_SE_DROPOUT_MS:-800}"
-      # Small jitter margin past audio-io's drain-handshake reply.
-      # /speak returns when the cpal ring is provably empty
-      # (audio-io fires `{"type":"drained"}` over the /spk WS once
-      # the device has consumed every sample), so 50 ms here only
-      # covers the round-trip jitter between drained → orchestrator
-      # stamping the deadline.
-      ORCH_TTS_TAIL_QUIET_MS: "${ORCH_TTS_TAIL_QUIET_MS:-50}"
+      # Post-TTS VAD quiet window. With /finalize giving us the
+      # precise speaker-silent moment, this only has to cover VAD's
+      # silence hangover (~200 ms for VAD_HANG_FRAMES=10) — VAD will
+      # always fire SE that long after the audio actually stopped, and
+      # without dropping that SE the orchestrator dispatches an echo
+      # turn whose ASR text is the tail of the assistant's reply.
+      # Bump higher in .env if you've raised VAD_HANG_FRAMES.
+      ORCH_TTS_TAIL_QUIET_MS: "${ORCH_TTS_TAIL_QUIET_MS:-400}"
     ports:
       - "7000:7000"
     depends_on:
