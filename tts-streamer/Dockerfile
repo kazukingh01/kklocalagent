@@ -2,16 +2,17 @@
 # orchestrator into VOICEVOX synthesis + audio-io playback streaming.
 #
 # The orchestrator POSTs `{"text": "..."}` to /speak after each turn;
-# this image handles the engine handshake, the 24 kHz → 16 kHz resample,
-# and the framed WS push to audio-io's /spk endpoint (which lives
-# outside compose, on the Windows host, in the production stack).
+# this image handles the engine handshake and the framed WS push to
+# audio-io's /spk endpoint (which lives outside compose, on the Windows
+# host, in the production stack). Resampling is offloaded to VOICEVOX
+# itself by setting `outputSamplingRate=16000` and
+# `outputStereoToMono=true` in the AudioQuery JSON, so we no longer
+# need ffmpeg or any client-side DSP.
 
 FROM python:3.12-slim
 
-# ffmpeg is for the 24 kHz → 16 kHz mono s16le resample. Pinned to the
-# slim image's apt to keep the layer reasonable.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg curl \
+    && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir \

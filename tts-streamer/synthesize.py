@@ -16,20 +16,27 @@ Env (compose-friendly):
     HOST / PORT     bind address (default 0.0.0.0:7070)
 
 Concurrency:
-    /speak is serialised behind an asyncio.Lock so two overlapping turns
-    don't interleave their PCM frames on the same /spk channel. Excess
-    requests block until the previous synth+stream finishes — matches
-    the orchestrator's max_inflight=1 semantics on the LLM side.
+    "Newest wins" — at most one speak task runs at a time, and a fresh
+    /speak cancels the in-flight one before starting (TASK_LOCK guards
+    the cancel→replace, not the body). Matches the barge-in case where
+    the orchestrator prefers the new utterance over the old reply: the
+    cancelled task surfaces as 499 Client Closed Request so the caller
+    can distinguish "interrupted" from synth/network errors. The
+    orchestrator's per-turn TTS permit normally prevents overlapping
+    /speak in the no-barge-in path, so this cancel-on-overlap mostly
+    fires during /stop or barge-in.
 """
 
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
-import subprocess
+import struct
 import sys
+import wave
 from typing import Optional
 
 import httpx
@@ -68,14 +75,23 @@ TASK_LOCK = asyncio.Lock()
 async def synthesize(client: httpx.AsyncClient, text: str, speaker: int) -> bytes:
     q = await client.post("/audio_query", params={"text": text, "speaker": speaker})
     q.raise_for_status()
-    body = q.content
+    # /audio_query's response is the canonical input to /synthesis.
+    # We mutate three fields and leave every other key untouched so a
+    # future VOICEVOX schema change doesn't trip us up:
+    #   - speedScale: env-controlled "brisker / slower" voice agent.
+    #   - outputSamplingRate: ask VOICEVOX to render at 16 kHz so we
+    #     don't have to resample on the wire (audio-io expects 16 k).
+    #   - outputStereoToMono: belt-and-braces; VOICEVOX is mono today
+    #     but explicit beats implicit when the downstream WS is mono.
+    # Together these eliminate the previous ffmpeg pipe stage —
+    # synthesis output is already exactly the format /spk wants and
+    # we just strip the WAV header.
+    params = json.loads(q.content)
+    params["outputSamplingRate"] = SAMPLE_RATE
+    params["outputStereoToMono"] = True
     if VOICEVOX_SPEED_SCALE != 1.0:
-        # /audio_query's response is the canonical input to /synthesis.
-        # Override speedScale; leave every other field untouched so we
-        # don't accidentally break a future VOICEVOX schema change.
-        params = json.loads(body)
         params["speedScale"] = VOICEVOX_SPEED_SCALE
-        body = json.dumps(params).encode()
+    body = json.dumps(params).encode()
     r = await client.post(
         "/synthesis",
         params={"speaker": speaker},
@@ -87,30 +103,39 @@ async def synthesize(client: httpx.AsyncClient, text: str, speaker: int) -> byte
 
 
 def to_pcm_16k_mono(wav_bytes: bytes) -> bytes:
-    """Decode arbitrary WAV → raw s16le 16 kHz mono via an ffmpeg pipe.
+    """Strip the WAV header from a 16 kHz mono s16le payload returned
+    by VOICEVOX's /synthesis (with outputSamplingRate / outputStereoToMono
+    set in the AudioQuery JSON — see ``synthesize`` above).
 
-    Spawned per-call rather than kept alive: the call cost is dwarfed by
-    the synthesis time and ffmpeg's own startup is ~10 ms.
+    Validates the WAV header against the expected (16 kHz, mono, s16le)
+    shape so a future VOICEVOX upgrade that silently drops support for
+    `outputSamplingRate` doesn't ship subtly-wrong audio downstream:
+    we'd rather error loudly than play 24 kHz audio at 16 kHz speed.
     """
-    p = subprocess.run(
-        [
-            "ffmpeg", "-loglevel", "error", "-y",
-            "-i", "pipe:0",
-            "-ar", str(SAMPLE_RATE), "-ac", "1", "-sample_fmt", "s16",
-            "-f", "s16le", "pipe:1",
-        ],
-        input=wav_bytes,
-        capture_output=True,
-        check=False,
-    )
-    if p.returncode != 0:
-        # Common cause: VOICEVOX returned a JSON error body (e.g. unknown
-        # speaker id) instead of WAV. Surface ffmpeg's diagnostic so the
-        # actual cause is visible without per-step printf debugging.
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as w:
+            sr = w.getframerate()
+            ch = w.getnchannels()
+            sw = w.getsampwidth()
+            n_frames = w.getnframes()
+            if sr != SAMPLE_RATE or ch != 1 or sw != 2:
+                raise RuntimeError(
+                    f"VOICEVOX returned unexpected WAV: rate={sr} channels={ch} "
+                    f"sample_width={sw} (expected {SAMPLE_RATE}/1/2). "
+                    "The engine may have ignored outputSamplingRate / "
+                    "outputStereoToMono in the AudioQuery — check the "
+                    "VOICEVOX engine version."
+                )
+            return w.readframes(n_frames)
+    except (wave.Error, EOFError, struct.error) as e:
+        # VOICEVOX returns a JSON error body (e.g. unknown speaker id)
+        # with content-type audio/wav, so the wave parser fails cleanly.
+        # Surface a useful diagnostic instead of a low-level struct error.
+        head = wav_bytes[:200].decode(errors="replace") if wav_bytes else "(empty)"
         raise RuntimeError(
-            f"ffmpeg rc={p.returncode}: {p.stderr.decode(errors='replace').strip()}"
-        )
-    return p.stdout
+            f"failed to parse VOICEVOX response as WAV ({e}); "
+            f"head={head!r}"
+        ) from e
 
 
 async def push_to_spk(spk_url: str, pcm: bytes) -> int:
@@ -150,9 +175,10 @@ async def speak_one(text: str) -> dict:
     async with httpx.AsyncClient(base_url=VOICEVOX_URL, timeout=60.0) as engine:
         wav = await synthesize(engine, text, VOICEVOX_SPEAKER)
 
-    # ffmpeg is sync; offload so we don't block the event loop while
-    # resampling several seconds of audio.
-    pcm = await asyncio.to_thread(to_pcm_16k_mono, wav)
+    # WAV header parsing only — VOICEVOX already returned 16 kHz mono
+    # s16le, so this is a header-strip + length validation, not a
+    # resample. Cheap enough to run on the event loop directly.
+    pcm = to_pcm_16k_mono(wav)
     duration_s = len(pcm) / (SAMPLE_RATE * 2)
     log.info("synthesized: wav=%dB → pcm=%dB (%.2fs)", len(wav), len(pcm), duration_s)
 
