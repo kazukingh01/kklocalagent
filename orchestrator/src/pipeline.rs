@@ -578,11 +578,20 @@ async fn llm_chat_streaming(
 
 /// Find the first sentence-terminator in `s` and return the byte
 /// offset *after* it (so `s[..end]` is the sentence including its
-/// terminator). Terminators: `。 ！ ？ ! ? \n`. Returns None if no
-/// terminator is present yet.
+/// terminator). Terminators: `。 、 ！ ？ … ! ? , \n`. Returns None
+/// if no terminator is present yet.
+///
+/// Commas (`、` `,`) and the ellipsis (`…`) are *prosodic* breaks,
+/// not full sentence ends, but VOICEVOX naturally inserts a short
+/// pause at each so flushing per-chunk shortens time-to-first-audio
+/// without warping the spoken cadence. ASCII `.` deliberately stays
+/// out — it would mis-split numerics like "1.5" mid-token.
 fn find_sentence_end(s: &str) -> Option<usize> {
     for (i, ch) in s.char_indices() {
-        if matches!(ch, '。' | '！' | '？' | '!' | '?' | '\n') {
+        if matches!(
+            ch,
+            '。' | '、' | '！' | '？' | '…' | '!' | '?' | ',' | '\n'
+        ) {
             return Some(i + ch.len_utf8());
         }
     }
@@ -620,14 +629,19 @@ mod tests {
 
     #[test]
     fn find_sentence_end_detects_each_terminator() {
-        // 。 (3 bytes), ！ (3 bytes), ？ (3 bytes), ! and ? (1 byte), \n (1 byte).
+        // Multibyte: 。！？、… are 3 bytes each. ASCII !?, and \n are 1.
         assert_eq!(find_sentence_end("こんにちは。world"), Some("こんにちは。".len()));
         assert_eq!(find_sentence_end("やあ！ next"), Some("やあ！".len()));
         assert_eq!(find_sentence_end("元気？ next"), Some("元気？".len()));
+        assert_eq!(find_sentence_end("えーと、それで"), Some("えーと、".len()));
+        assert_eq!(find_sentence_end("うーん…続き"), Some("うーん…".len()));
         assert_eq!(find_sentence_end("hi! next"), Some(3));
         assert_eq!(find_sentence_end("hi? next"), Some(3));
+        assert_eq!(find_sentence_end("yes, then"), Some(4));
         assert_eq!(find_sentence_end("line1\nline2"), Some(6));
         assert_eq!(find_sentence_end("no terminator yet"), None);
+        // ASCII `.` stays a non-terminator so numerics aren't split.
+        assert_eq!(find_sentence_end("about 1.5 meters"), None);
         assert_eq!(find_sentence_end(""), None);
     }
 
