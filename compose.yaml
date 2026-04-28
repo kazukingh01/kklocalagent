@@ -233,6 +233,17 @@ services:
       # Override in .env if you say "えーと、…" mid-utterance and
       # find the agent cutting you off prematurely.
       VAD_HANG_FRAMES: "${VAD_HANG_FRAMES:-10}"
+      # Consecutive voiced 20 ms frames before SS fires. 3 ≈ 60 ms
+      # (default) is permissive — short impulse noise like a single
+      # clap (~80–120 ms) crosses it and dispatches a turn. Bump to
+      # 5 (100 ms) or 7 (140 ms) to filter those, at the cost of
+      # eating the first frames of very fast utterance starts.
+      VAD_START_FRAMES: "${VAD_START_FRAMES:-3}"
+      # webrtc-vad internal aggressiveness 0..=3. 2 = balanced
+      # default; 3 = stricter, drops more borderline / noisy frames
+      # (helpful in noisy mics, slightly more chance of cutting
+      # quiet speech).
+      VAD_AGGRESSIVENESS: "${VAD_AGGRESSIVENESS:-2}"
       # RNNoise (nnnoiseless) pre-stage. On = denoise every 20 ms
       # frame before VAD classification AND before ASR receives the
       # utterance buffer. Cleans steady-state background (fans, AC,

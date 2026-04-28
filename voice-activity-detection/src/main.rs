@@ -47,6 +47,23 @@ struct Args {
     #[arg(long, env = "VAD_HANG_FRAMES")]
     hang_frames: Option<u32>,
 
+    /// Override `detector.start_frames` (consecutive voiced 20 ms
+    /// frames before SpeechStarted fires). Default 3 ≈ 60 ms.
+    /// Bump to 5–7 (100–140 ms) to filter out short impulse noise
+    /// (single claps, taps, mouse clicks) that webrtc-vad would
+    /// otherwise mis-classify as speech onset. Trade-off: very
+    /// fast utterance starts ("はい") get their first frames eaten.
+    #[arg(long, env = "VAD_START_FRAMES")]
+    start_frames: Option<u32>,
+
+    /// Override `detector.aggressiveness` (0..=3). webrtc-vad
+    /// internal strictness: 0 = Quality (most permissive),
+    /// 3 = VeryAggressive (strictest, most false-negatives on
+    /// quiet speech but cuts impulse / borderline noise hardest).
+    /// Default 2.
+    #[arg(long, env = "VAD_AGGRESSIVENESS")]
+    aggressiveness: Option<u8>,
+
     /// Override `detector.denoise`. When true, every incoming
     /// 20 ms frame is run through nnnoiseless (RNNoise) before VAD
     /// classification *and* before being buffered for ASR. Cleans
@@ -89,6 +106,12 @@ async fn main() -> Result<()> {
     }
     if let Some(v) = args.hang_frames {
         config.detector.hang_frames = v;
+    }
+    if let Some(v) = args.start_frames {
+        config.detector.start_frames = v;
+    }
+    if let Some(v) = args.aggressiveness {
+        config.detector.aggressiveness = v;
     }
     if let Some(v) = args.denoise {
         config.detector.denoise = v;
