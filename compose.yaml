@@ -252,6 +252,13 @@ services:
       # ございました" / "(拍手)") on noisy near-silence. Adds
       # ~0.5% of one core + ~10 ms pipeline latency. Off by default.
       VAD_DENOISE: "${VAD_DENOISE:-false}"
+      # Drop SpeechEnded events whose buffered audio is quieter
+      # than this RMS threshold (dBFS). Real voice is typically
+      # -10..-25 dBFS, near-silence with ambient noise is -50..-60,
+      # so -45 cleanly separates them. Cuts the "VAD spuriously
+      # armed → empty buffer to ASR → Whisper hallucinates
+      # 'ご視聴ありがとうございました'" loop. Set to 0 to disable.
+      VAD_MIN_UTTERANCE_RMS_DBFS: "${VAD_MIN_UTTERANCE_RMS_DBFS:--45}"
     extra_hosts:
       # Plain Linux docker (non-Docker-Desktop, non-WSL2) doesn't
       # resolve `host.docker.internal` by default. host-gateway makes
@@ -337,6 +344,15 @@ services:
       # turn whose ASR text is the tail of the assistant's reply.
       # Bump higher in .env if you've raised VAD_HANG_FRAMES.
       ORCH_TTS_TAIL_QUIET_MS: "${ORCH_TTS_TAIL_QUIET_MS:-400}"
+      # Pipe-separated substring blacklist for known Whisper
+      # hallucinations. ASR outputs containing any of these are
+      # treated as empty (no LLM, no TTS). Whisper fills ambiguous
+      # near-silence with stock YouTube boilerplate that's never a
+      # real voice command. Override (or set to empty to disable)
+      # via .env. The defaults baked into config.rs already include
+      # the common ones; this lets the operator add domain-specific
+      # extras without recompiling.
+      ORCH_ASR_HALLUCINATION_BLACKLIST: "${ORCH_ASR_HALLUCINATION_BLACKLIST:-ご視聴ありがとう|(拍手)|(笑)|Thanks for watching|Subscribe to my channel}"
     ports:
       - "7000:7000"
     depends_on:

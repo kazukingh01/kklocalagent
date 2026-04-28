@@ -59,6 +59,17 @@ pub struct AsrConfig {
     /// whisper-server's own single-request behaviour; raise only if the
     /// backend was compiled with request batching.
     pub max_inflight: u32,
+    /// Substring blacklist for known Whisper hallucinations on
+    /// near-silence / noise. If the transcribed text contains *any*
+    /// of these strings the turn is dropped exactly like an
+    /// empty-text transcription — no LLM, no TTS, no sink forward.
+    /// Whisper was trained on a lot of YouTube audio and tends to
+    /// fill ambiguous quiet input with stock end-of-video phrases
+    /// ("ご視聴ありがとうございました", "(拍手)", "Thanks for
+    /// watching", "Subscribe to my channel"); none of those are
+    /// plausible voice-agent commands so blocking them is safe.
+    /// Match is case-sensitive substring; empty list disables.
+    pub hallucination_blacklist: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -199,6 +210,17 @@ impl Default for AsrConfig {
             url: "http://automatic-speech-recognition:8080/inference".into(),
             timeout_ms: 60_000,
             max_inflight: 1,
+            // Substring matches; covers both bare and punctuated
+            // variants ("ご視聴ありがとうございました!", etc.) without
+            // having to enumerate every form. None of these are
+            // plausible voice-command inputs.
+            hallucination_blacklist: vec![
+                "ご視聴ありがとう".into(),
+                "(拍手)".into(),
+                "(笑)".into(),
+                "Thanks for watching".into(),
+                "Subscribe to my channel".into(),
+            ],
         }
     }
 }

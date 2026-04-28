@@ -73,6 +73,14 @@ struct Args {
     #[arg(long, env = "VAD_DENOISE")]
     denoise: Option<bool>,
 
+    /// Override `detector.min_utterance_rms_dbfs`. SpeechEnded
+    /// events whose buffered audio has RMS below this dBFS value
+    /// are dropped before reaching the sink. 0 (or any non-
+    /// negative value) disables the gate. Recommended starting
+    /// point for hallucination-suppression: -45.
+    #[arg(long, env = "VAD_MIN_UTTERANCE_RMS_DBFS")]
+    min_utterance_rms_dbfs: Option<f32>,
+
     /// Shortcut for `--sink-mode asr-direct`. Kept for back-compat with
     /// the early dry-run/live split.
     #[arg(long, conflicts_with = "sink_mode")]
@@ -115,6 +123,9 @@ async fn main() -> Result<()> {
     }
     if let Some(v) = args.denoise {
         config.detector.denoise = v;
+    }
+    if let Some(v) = args.min_utterance_rms_dbfs {
+        config.detector.min_utterance_rms_dbfs = v;
     }
     if let Some(mode) = args.sink_mode {
         config.sink.mode = mode;

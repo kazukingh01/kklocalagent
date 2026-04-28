@@ -92,6 +92,17 @@ pub struct DetectorConfig {
     /// frame (~10 ms) of pipeline latency. Off by default — flip on
     /// when noisy mics demand it.
     pub denoise: bool,
+    /// SpeechEnded events whose buffered utterance has a measured
+    /// RMS *strictly less than* this dBFS value are dropped before
+    /// reaching the sink. 0.0 (or any non-negative value) disables
+    /// the gate. dBFS reference: 0 = full-scale i16 (impossible for
+    /// real speech); typical normal voice is -10 to -25, far-mic
+    /// whisper is -30 to -40, room ambient with no one talking is
+    /// -50 to -60. -45 cleanly separates the bottom two without
+    /// rejecting legitimate quiet speech, and is the recommended
+    /// starting value when Whisper hallucinations on near-silence
+    /// are a problem.
+    pub min_utterance_rms_dbfs: f32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -146,6 +157,9 @@ impl Default for DetectorConfig {
             hang_frames: 20,          // ~400 ms of silence
             max_utterance_frames: 1500, // 30 s
             denoise: false,
+            // Disabled by default; legacy behaviour where every SE is
+            // forwarded regardless of energy.
+            min_utterance_rms_dbfs: 0.0,
         }
     }
 }

@@ -217,6 +217,33 @@ async fn connect_and_run(
                 .map_err(|_| anyhow!("vad classify: frame length mismatch"))?;
             diag.record(&samples, is_speech);
             if let Some(event) = fsm.push_frame(&frame, is_speech) {
+                // RMS-energy gate on SpeechEnded: drop utterances
+                // whose buffered audio is below `min_utterance_rms_dbfs`
+                // (negative dBFS, threshold disabled when >= 0). The
+                // typical hallucination trigger is "VAD spuriously
+                // armed on near-silence + sent the empty buffer to
+                // ASR + Whisper filled the void with `(拍手)` /
+                // `ご視聴ありがとうございました`". Gating below e.g.
+                // -45 dBFS catches that without rejecting legitimate
+                // quiet speech (real voice is typically -10..-25).
+                if cfg.detector.min_utterance_rms_dbfs < 0.0 {
+                    if let Event::SpeechEnded { .. } = &event {
+                        let buf = fsm.utterance_buffer();
+                        let r = rms_dbfs_i16le(buf);
+                        if r < cfg.detector.min_utterance_rms_dbfs {
+                            warn!(
+                                target: "vad::sink",
+                                event = "SpeechEnded",
+                                reason = "below_rms_gate",
+                                rms_dbfs = r,
+                                threshold = cfg.detector.min_utterance_rms_dbfs,
+                                bytes = buf.len(),
+                                "dropped utterance: too quiet (likely ambient noise → would trigger Whisper hallucination)"
+                            );
+                            continue;
+                        }
+                    }
+                }
                 handle_event(
                     &event,
                     fsm.utterance_buffer(),
@@ -235,6 +262,28 @@ async fn connect_and_run(
         }
     }
     Ok(())
+}
+
+/// Compute RMS dBFS of a little-endian s16 PCM buffer. 0 dBFS =
+/// full-scale i16; real voice is typically -10..-25, room ambient
+/// is -50..-60. Returns `f32::NEG_INFINITY` on empty input or true
+/// digital silence. ~1 µs per 320-sample (20 ms) frame so calling
+/// it once per SpeechEnded is free.
+fn rms_dbfs_i16le(buf: &[u8]) -> f32 {
+    let n = buf.len() / 2;
+    if n == 0 {
+        return f32::NEG_INFINITY;
+    }
+    let mut sum_sq: f64 = 0.0;
+    for chunk in buf.chunks_exact(2) {
+        let s = i16::from_le_bytes([chunk[0], chunk[1]]) as f64 / 32768.0;
+        sum_sq += s * s;
+    }
+    let mean_sq = sum_sq / n as f64;
+    if mean_sq <= 0.0 {
+        return f32::NEG_INFINITY;
+    }
+    20.0 * (mean_sq.sqrt() as f32).log10()
 }
 
 fn make_vad(aggressiveness: u8, sample_rate: u32) -> Result<Vad> {
@@ -492,6 +541,43 @@ mod tests {
             audio_base64,
         };
         serde_json::to_string(&env).unwrap()
+    }
+
+    #[test]
+    fn rms_dbfs_silence_is_neg_infinity() {
+        let zeros = vec![0u8; 320 * 2];
+        assert_eq!(rms_dbfs_i16le(&zeros), f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn rms_dbfs_full_scale_sine_is_near_minus_three() {
+        // A sine that swings to ±i16::MAX has RMS = peak / sqrt(2),
+        // which in dBFS is -3.01. 320 samples at 16 kHz = 20 ms; one
+        // 440 Hz cycle is ~36 samples so the buffer averages cleanly
+        // to the analytical RMS.
+        let mut buf = Vec::with_capacity(320 * 2);
+        for i in 0..320 {
+            let s = ((i as f32 * 440.0 * 2.0 * std::f32::consts::PI / 16_000.0).sin()
+                * (i16::MAX as f32)) as i16;
+            buf.extend_from_slice(&s.to_le_bytes());
+        }
+        let r = rms_dbfs_i16le(&buf);
+        assert!(
+            (r - (-3.01)).abs() < 0.5,
+            "rms={r} expected ~-3.01 dBFS for full-scale sine"
+        );
+    }
+
+    #[test]
+    fn rms_dbfs_quiet_noise_below_minus_forty() {
+        // ±100 LSB pseudo-random "ambient noise". -100/32768 ≈ -50 dBFS.
+        let mut buf = Vec::with_capacity(320 * 2);
+        for i in 0..320 {
+            let s = (((i * 73) % 200) as i16) - 100;
+            buf.extend_from_slice(&s.to_le_bytes());
+        }
+        let r = rms_dbfs_i16le(&buf);
+        assert!(r < -40.0 && r > -60.0, "rms={r} expected -40..-60 dBFS");
     }
 
     #[test]

@@ -21,6 +21,15 @@ struct Args {
     #[arg(long, env = "ORCH_ASR_URL")]
     asr_url: Option<String>,
 
+    /// Override `asr.hallucination_blacklist`. Pipe-separated list
+    /// of substrings; if the ASR output contains any of them, the
+    /// turn is dropped (no LLM, no TTS) just like an empty
+    /// transcription. Match is substring + case-sensitive. Pass an
+    /// empty value (`ORCH_ASR_HALLUCINATION_BLACKLIST=`) to disable
+    /// the filter entirely.
+    #[arg(long, env = "ORCH_ASR_HALLUCINATION_BLACKLIST", value_delimiter = '|')]
+    asr_hallucination_blacklist: Option<Vec<String>>,
+
     /// Override `llm.url`.
     #[arg(long, env = "ORCH_LLM_URL")]
     llm_url: Option<String>,
@@ -104,6 +113,13 @@ async fn main() -> Result<()> {
     }
     if let Some(v) = args.asr_url {
         config.asr.url = v;
+    }
+    if let Some(v) = args.asr_hallucination_blacklist {
+        // Filter out empty strings — `ORCH_ASR_HALLUCINATION_BLACKLIST=`
+        // (deliberately empty to disable) splits to a single empty
+        // entry, which would otherwise match every ASR output via
+        // contains("").
+        config.asr.hallucination_blacklist = v.into_iter().filter(|s| !s.is_empty()).collect();
     }
     if let Some(v) = args.llm_url {
         config.llm.url = v;

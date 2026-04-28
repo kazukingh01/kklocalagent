@@ -229,6 +229,27 @@ pub async fn run_turn(
         info!(target: "orch::pipeline", "ASR returned empty text; skipping LLM");
         return;
     }
+    // Whisper hallucination guard. Whisper fills ambiguous near-
+    // silence with stock YouTube end-of-video phrases ("ご視聴あり
+    // がとうございました", "(拍手)", "Thanks for watching", etc.) —
+    // none of which are plausible voice-agent inputs. Treat as an
+    // empty transcription so the LLM never sees them and TTS doesn't
+    // speak a response to nothing the operator said. Substring match
+    // catches punctuated and trailing-text variants in one rule each.
+    if let Some(matched) = backends
+        .asr
+        .hallucination_blacklist
+        .iter()
+        .find(|p| text.contains(p.as_str()))
+    {
+        info!(
+            target: "orch::pipeline",
+            text = %text,
+            matched = %matched,
+            "ASR returned a known whisper hallucination; skipping LLM"
+        );
+        return;
+    }
     info!(target: "orch::pipeline", text = %text, "transcribed");
 
     // LLM stage (streaming).
