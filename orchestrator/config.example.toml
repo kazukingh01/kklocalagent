@@ -53,7 +53,7 @@ max_inflight = 1
 # turn. WakeWordDetected stays unaffected — the operator deliberately
 # barging in must still cut through. 0 disables (use when AEC is
 # handled upstream).
-tail_quiet_ms = 500
+tail_quiet_ms = 50
 
 # Wake-gating policy. v1.0 default: gate the ASR→LLM→TTS pipeline
 # on a recent WakeWordDetected event. Set `required = false` to fall

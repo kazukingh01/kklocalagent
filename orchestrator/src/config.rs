@@ -108,15 +108,19 @@ pub struct TtsConfig {
     pub max_inflight: u32,
     /// After every successful turn's TTS completes, drop *all* VAD
     /// events (SpeechStarted and SpeechEnded) for this many extra
-    /// milliseconds. Targets the audio-io playback ring tail: the
-    /// orchestrator's run_turn returns as soon as the last /speak
-    /// POST does, but audio-io has a few hundred ms of PCM still
-    /// queued in its output device. Without the quiet window, the
-    /// assistant's own voice — picked up by the mic during that
-    /// trailing playback — would fire VAD and dispatch an echo turn.
-    /// 500 ms covers the typical 200 ms trailing-silence padding plus
-    /// device + jitter buffer; bump higher if your speaker has more
-    /// output latency. Set to 0 to disable.
+    /// milliseconds. With the audio-io drain-handshake protocol,
+    /// /speak now returns precisely when the cpal output ring is
+    /// empty (audio-io fires the WS `{"type":"drained"}` reply only
+    /// after the device has consumed every sample), so the dominant
+    /// reason for this knob is gone. The remaining 50 ms default
+    /// covers the round-trip jitter between "drained" being fired
+    /// and the orchestrator stamping the deadline + VAD events
+    /// already in flight at that boundary. Set to 0 once you trust
+    /// the handshake end-to-end on your hardware. Bump higher if you
+    /// run an older audio-io build that doesn't speak the drain
+    /// protocol — its WS will close on EOS without replying and
+    /// tts-streamer falls back to a 200 ms fixed pad, so 500 ms here
+    /// restores the legacy heuristic.
     pub tail_quiet_ms: u64,
 }
 
@@ -214,7 +218,7 @@ impl Default for TtsConfig {
             stop_url: String::new(),
             timeout_ms: 60_000,
             max_inflight: 1,
-            tail_quiet_ms: 500,
+            tail_quiet_ms: 50,
         }
     }
 }

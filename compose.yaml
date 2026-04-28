@@ -303,13 +303,16 @@ services:
       # continuous "Hey Jarvis, …" commands (SE typically lands >1 s
       # after wake). Set to 0 in .env to disable.
       ORCH_POST_WAKE_SE_DROPOUT_MS: "${ORCH_POST_WAKE_SE_DROPOUT_MS:-800}"
-      # Drop VAD events for this many ms after each turn's TTS
-      # finishes. /speak returns when the last PCM frame hits the
-      # WebSocket, but audio-io still has 200–300 ms in its playback
-      # ring; without the quiet window the assistant's own voice
-      # leaks back through the mic and triggers an echo turn. Set to
-      # 0 to disable when AEC is handled upstream.
-      ORCH_TTS_TAIL_QUIET_MS: "${ORCH_TTS_TAIL_QUIET_MS:-500}"
+      # Small jitter margin past audio-io's drain-handshake reply.
+      # /speak now returns when the cpal ring is provably empty
+      # (audio-io fires `{"type":"drained"}` over the /spk WS once
+      # the device has consumed every sample), so the dominant cause
+      # for the legacy 500 ms tail is gone. 50 ms covers the
+      # remaining round-trip jitter between drained → orchestrator
+      # stamping the deadline. Bump back to 500 if running against
+      # an older audio-io that doesn't speak the drain protocol
+      # (tts-streamer falls back to a 200 ms fixed pad in that case).
+      ORCH_TTS_TAIL_QUIET_MS: "${ORCH_TTS_TAIL_QUIET_MS:-50}"
     ports:
       - "7000:7000"
     depends_on:

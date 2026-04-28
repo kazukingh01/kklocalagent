@@ -4,9 +4,12 @@ use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpg
 use axum::extract::State;
 use axum::response::IntoResponse;
 use bytes::Bytes;
+use serde_json::{json, Value};
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
+use crate::playback::PlaybackMessage;
 use crate::state::AppState;
 
 pub async fn ws_mic(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
@@ -81,8 +84,62 @@ async fn handle_spk(mut socket: WebSocket, state: AppState) {
                         .await;
                     break;
                 }
-                if spk_tx.send(Bytes::from(data)).await.is_err() {
+                if spk_tx
+                    .send(PlaybackMessage::Frame(Bytes::from(data)))
+                    .await
+                    .is_err()
+                {
                     warn!("spk ws: playback task gone; closing");
+                    break;
+                }
+            }
+            Ok(Message::Text(text)) => {
+                // EOS/drain handshake. Client sends `{"type":"eos"}`
+                // after the last PCM frame; we forward an Eos marker
+                // through the producer task, wait for it to confirm
+                // the cpal ring is empty, then echo
+                // `{"type":"drained"}` back so the client knows the
+                // speaker has *actually* finished. Lets the
+                // orchestrator stop guessing the audio-tail with a
+                // tail_quiet_ms timeout and trust the WS handshake
+                // as the precise boundary instead.
+                //
+                // Unknown types are logged + ignored — keeps the
+                // protocol forward-compatible if we add other control
+                // messages later (e.g. mid-stream priority hints).
+                let parsed: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(text = %text, err = %e, "spk ws: ignoring non-json text frame");
+                        continue;
+                    }
+                };
+                let kind = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if kind != "eos" {
+                    debug!(kind = %kind, "spk ws: ignoring unknown control message");
+                    continue;
+                }
+                let (drain_done_tx, drain_done_rx) = oneshot::channel::<()>();
+                if spk_tx
+                    .send(PlaybackMessage::Eos {
+                        drain_done: drain_done_tx,
+                    })
+                    .await
+                    .is_err()
+                {
+                    warn!("spk ws: playback task gone before drain handshake; closing");
+                    break;
+                }
+                // The producer task fires drain_done either when the
+                // ring is empty (normal path) or when /spk/stop's
+                // flush yanked everything (cancellation). RecvError
+                // on the oneshot means the producer task itself
+                // exited — treat it the same as a successful drain
+                // so the client doesn't hang on the WS forever.
+                let _ = drain_done_rx.await;
+                let payload = json!({"type": "drained"}).to_string();
+                if socket.send(Message::Text(payload)).await.is_err() {
+                    debug!("spk ws: client closed before drained reply");
                     break;
                 }
             }

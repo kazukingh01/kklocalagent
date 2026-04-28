@@ -25,6 +25,7 @@ Concurrency:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import subprocess
@@ -102,10 +103,19 @@ def to_pcm_16k_mono(wav_bytes: bytes) -> bytes:
 async def push_to_spk(spk_url: str, pcm: bytes) -> int:
     """Stream `pcm` to audio-io's /spk WS in 20 ms frames, paced.
 
-    Returns total bytes sent (including the trailing zero-pad if any but
-    excluding the post-utterance silence). Pacing matches FRAME_MS so
-    audio-io's playback ring drains naturally rather than buffering the
-    whole utterance.
+    After the last PCM frame (plus a brief trailing-silence padding to
+    push the tail through any 16-bit-boundary requantisation),
+    sends a `{"type":"eos"}` text control frame and waits for the
+    matching `{"type":"drained"}` reply from audio-io. That reply is
+    fired only when audio-io's cpal output ring has been fully
+    consumed by the device — i.e. when the speaker has actually
+    stopped emitting samples. So /speak's HTTP return is the precise
+    moment of silence, not "I sent the last byte to the WS" plus a
+    timing guess. The orchestrator then doesn't need a tail_quiet_ms
+    heuristic to suppress echo turns.
+
+    Returns total PCM bytes sent (excluding the trailing-silence
+    padding and the EOS handshake).
     """
     sent = 0
     async with websockets.connect(spk_url) as ws:
@@ -119,11 +129,28 @@ async def push_to_spk(spk_url: str, pcm: bytes) -> int:
             await ws.send(tail)
             sent += BYTES_PER_FRAME
             await asyncio.sleep(FRAME_PERIOD)
-        # Brief trailing silence so the device buffer flushes the last
-        # samples before the WS close.
-        for _ in range(10):
-            await ws.send(b"\x00" * BYTES_PER_FRAME)
-            await asyncio.sleep(FRAME_PERIOD)
+        # EOS + drain handshake. The trailing-silence padding loop
+        # the previous implementation used (10 × 20 ms zero frames) is
+        # gone: the drained signal does the same job more accurately.
+        # If audio-io is an old build that doesn't speak the EOS
+        # protocol, the recv() below will time out — we fall back to a
+        # short fixed wait so we don't hang forever on a version
+        # mismatch.
+        await ws.send(json.dumps({"type": "eos"}))
+        try:
+            while True:
+                raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                if isinstance(raw, (bytes, bytearray)):
+                    continue  # not for us
+                msg = json.loads(raw)
+                if msg.get("type") == "drained":
+                    break
+        except (asyncio.TimeoutError, json.JSONDecodeError) as e:
+            log.warning(
+                "drain handshake timed out (%s); falling back to fixed 200 ms pad",
+                type(e).__name__,
+            )
+            await asyncio.sleep(0.2)
     return sent
 
 
