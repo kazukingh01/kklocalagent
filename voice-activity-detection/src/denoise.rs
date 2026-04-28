@@ -36,6 +36,12 @@ const DST_RATE: usize = 48_000;
 
 /// Stateful per-stream denoiser. Hold one of these alongside the
 /// VAD instance and feed every 20 ms i16 frame through `process`.
+///
+/// All scratch buffers are allocated once in `new` and reused on
+/// every call: rubato's `process_into_buffer` writes directly into
+/// pre-sized `Vec<f32>` channels (no per-frame `clone`s, no per-frame
+/// output-Vec allocation by the resampler). At 50 fps that turns
+/// "a few MB/s of throwaway allocation" into zero.
 pub struct Denoiser {
     upsampler: FftFixedInOut<f32>,
     downsampler: FftFixedInOut<f32>,
@@ -43,9 +49,17 @@ pub struct Denoiser {
     /// few KB) and `nnnoiseless::DenoiseState::new()` returns it
     /// pre-boxed for that reason.
     rnnoise: Box<DenoiseState<'static>>,
-    /// Reusable scratch buffers, sized once at construction.
-    src_f32: Vec<f32>,
-    dst_f32: Vec<f32>,
+    /// Single-channel input wrapper for the upsampler. Length 1
+    /// outer Vec, inner Vec sized to `frame_samples` (320 @ 16k).
+    /// Mutated in place each frame; the outer Vec header is reused.
+    in_16k: Vec<Vec<f32>>,
+    /// Single-channel buffer that doubles as the upsampler's output
+    /// and the downsampler's input. Length 1 outer Vec, inner Vec
+    /// sized to `frame_samples * 3` (960 @ 48k).
+    mid_48k: Vec<Vec<f32>>,
+    /// Single-channel output wrapper for the downsampler. Length 1
+    /// outer Vec, inner Vec sized to `frame_samples` (320 @ 16k).
+    out_16k: Vec<Vec<f32>>,
     rnn_in: Vec<f32>,
     rnn_out: Vec<f32>,
 }
@@ -70,8 +84,9 @@ impl Denoiser {
             upsampler,
             downsampler,
             rnnoise: DenoiseState::new(),
-            src_f32: vec![0.0; frame_samples],
-            dst_f32: vec![0.0; frame_samples * 3],
+            in_16k: vec![vec![0.0; frame_samples]],
+            mid_48k: vec![vec![0.0; frame_samples * 3]],
+            out_16k: vec![vec![0.0; frame_samples]],
             rnn_in: vec![0.0; RNNOISE_FRAME],
             rnn_out: vec![0.0; RNNOISE_FRAME],
         })
@@ -88,27 +103,27 @@ impl Denoiser {
         // the conversion to/from is symmetric so we keep one
         // representation throughout: scale up before the RNNoise
         // call, scale down after.
-        for (dst, src) in self.src_f32.iter_mut().zip(samples.iter()) {
+        let in_16k = &mut self.in_16k[0];
+        for (dst, src) in in_16k.iter_mut().zip(samples.iter()) {
             *dst = *src as f32 / 32768.0;
         }
 
-        // 16 k → 48 k. FftFixedInOut::process takes &[Vec<f32>] (one
-        // vec per channel) and returns Vec<Vec<f32>>. We're mono so
-        // a single-element wrapper is fine.
-        let upsampled = self
-            .upsampler
-            .process(&[self.src_f32.clone()], None)
+        // 16 k → 48 k. process_into_buffer writes directly into
+        // mid_48k's pre-allocated inner Vec, no allocation.
+        self.upsampler
+            .process_into_buffer(&self.in_16k, &mut self.mid_48k, None)
             .context("upsample 16→48")?;
-        let mono_48 = &upsampled[0];
 
         // RNNoise: 2× 480-sample frames per VAD frame (960 = 20 ms
         // at 48 k). DenoiseFeatures expects the input scaled to
         // ±32768 (signed-16 range as f32), so undo the rubato
-        // normalisation at this boundary.
-        debug_assert_eq!(mono_48.len(), RNNOISE_FRAME * 2);
+        // normalisation at this boundary. Operate on mid_48k in
+        // place — its content becomes the downsampler's input.
+        let mid = &mut self.mid_48k[0];
+        debug_assert_eq!(mid.len(), RNNOISE_FRAME * 2);
         for chunk_idx in 0..2 {
             let off = chunk_idx * RNNOISE_FRAME;
-            for (i, s) in mono_48[off..off + RNNOISE_FRAME].iter().enumerate() {
+            for (i, s) in mid[off..off + RNNOISE_FRAME].iter().enumerate() {
                 self.rnn_in[i] = s * 32768.0;
             }
             // process_frame returns the model's voice-activity
@@ -117,22 +132,22 @@ impl Denoiser {
             // of truth for SS/SE).
             self.rnnoise.process_frame(&mut self.rnn_out, &self.rnn_in);
             for (i, s) in self.rnn_out.iter().enumerate() {
-                self.dst_f32[off + i] = s / 32768.0;
+                mid[off + i] = s / 32768.0;
             }
         }
 
-        // 48 k → 16 k.
-        let downsampled = self
-            .downsampler
-            .process(&[self.dst_f32.clone()], None)
+        // 48 k → 16 k. process_into_buffer writes directly into
+        // out_16k's pre-allocated inner Vec.
+        self.downsampler
+            .process_into_buffer(&self.mid_48k, &mut self.out_16k, None)
             .context("downsample 48→16")?;
-        let mono_16 = &downsampled[0];
 
         // f32 → i16 with saturation. RNNoise should keep amplitudes
         // bounded, but a clipped voice frame after gain is still
         // possible with very loud input — saturate cleanly to avoid
         // i16-cast wraparound (which would manifest as a loud click).
-        for (dst, src) in samples.iter_mut().zip(mono_16.iter()) {
+        let out = &self.out_16k[0];
+        for (dst, src) in samples.iter_mut().zip(out.iter()) {
             *dst = (src * 32768.0).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
         }
         Ok(())
