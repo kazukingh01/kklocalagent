@@ -39,4 +39,26 @@ echo "[init] pulling model: ${MODEL}"
 ollama pull "${MODEL}"
 echo "[init] model ready: ${MODEL}"
 
+# Warm the model into VRAM so the first /api/chat from the
+# orchestrator doesn't pay a 5–15 s cold-load tax (model load shows up
+# in `runner started ... loading model ... ggml_cuda_init` in the
+# llm logs and visibly stalls the first turn). Ollama's "load a model
+# into memory" endpoint is /api/generate with `model` set and no
+# prompt; the request blocks until the weights are mmap'd + uploaded
+# to GPU. With `OLLAMA_KEEP_ALIVE=-1` set in compose.yaml, the model
+# then sticks for the lifetime of the container.
+#
+# Sentinel file gates the HEALTHCHECK below. /api/show alone goes 200
+# as soon as `ollama pull` completes (model present in the local
+# registry — not necessarily resident in VRAM), which would let
+# `depends_on: service_healthy` race the warmup. Touching this only
+# after the warmup curl succeeds keeps the orchestrator from sending
+# its first /api/chat until the model is actually hot.
+echo "[init] warming model into VRAM"
+curl -sfS -X POST http://127.0.0.1:11434/api/generate \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"${MODEL}\"}" -o /dev/null
+touch /tmp/llm-warm
+echo "[init] model warmed"
+
 wait "${SERVE_PID}"
