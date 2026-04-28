@@ -70,9 +70,19 @@ services:
     # installed.
     deploy: !reset null
 
+  agent:
+    environment:
+      # Must match `llm.environment.LLM_MODEL` above — agent names the
+      # model when invoking ChatOllama, which forwards to ollama's
+      # /api/chat. A mismatch produces a 404 with "model '<name>' not
+      # found" because the llm container only pulled the CPU model.
+      AGENT_MODEL: "${LLM_MODEL:-gemma3:1b}"
+
   orchestrator:
     environment:
-      # Must match `llm.environment.LLM_MODEL` above — the
-      # orchestrator names the model when calling /api/chat, so a
-      # mismatch here would 404 ollama.
+      # Tracked alongside agent above. The orchestrator no longer
+      # talks to ollama directly (it POSTs to agent), so this only
+      # affects the field echoed in logs / TurnCompleted payloads —
+      # but keeping the three model envs in sync prevents future
+      # confusion when reading logs.
       ORCH_LLM_MODEL: "${LLM_MODEL:-gemma3:1b}"
