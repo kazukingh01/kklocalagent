@@ -196,6 +196,9 @@ services:
     environment:
       VOICEVOX_URL: http://text-to-speech:50021
       VOICEVOX_SPEAKER: "3"
+      # VOICEVOX speech speed multiplier. 1.0 = engine default;
+      # 1.5 = 50% faster (brisker voice agent). Range ~0.5–2.0.
+      VOICEVOX_SPEED_SCALE: "${VOICEVOX_SPEED_SCALE:-1.0}"
       SPK_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/spk
       AUDIO_IO_BASE: http://${WINDOWS_HOST:-host.docker.internal}:7010
     extra_hosts:

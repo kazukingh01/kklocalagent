@@ -38,6 +38,11 @@ from aiohttp import web
 
 VOICEVOX_URL = os.environ.get("VOICEVOX_URL", "http://text-to-speech:50021")
 VOICEVOX_SPEAKER = int(os.environ.get("VOICEVOX_SPEAKER", "3"))
+# Multiplier applied to the AudioQuery's `speedScale` between
+# /audio_query and /synthesis. 1.0 = VOICEVOX default; 1.5 = 50%
+# faster ("brisker, less patient" voice agent); 0.8 = slower /
+# clearer for accessibility. VOICEVOX accepts roughly 0.5–2.0.
+VOICEVOX_SPEED_SCALE = float(os.environ.get("VOICEVOX_SPEED_SCALE", "1.0"))
 SPK_URL = os.environ.get("SPK_URL", "")
 AUDIO_IO_BASE = os.environ.get("AUDIO_IO_BASE", "")
 HOST = os.environ.get("HOST", "0.0.0.0")
@@ -63,10 +68,18 @@ TASK_LOCK = asyncio.Lock()
 async def synthesize(client: httpx.AsyncClient, text: str, speaker: int) -> bytes:
     q = await client.post("/audio_query", params={"text": text, "speaker": speaker})
     q.raise_for_status()
+    body = q.content
+    if VOICEVOX_SPEED_SCALE != 1.0:
+        # /audio_query's response is the canonical input to /synthesis.
+        # Override speedScale; leave every other field untouched so we
+        # don't accidentally break a future VOICEVOX schema change.
+        params = json.loads(body)
+        params["speedScale"] = VOICEVOX_SPEED_SCALE
+        body = json.dumps(params).encode()
     r = await client.post(
         "/synthesis",
         params={"speaker": speaker},
-        content=q.content,
+        content=body,
         headers={"Content-Type": "application/json"},
     )
     r.raise_for_status()
