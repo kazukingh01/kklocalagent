@@ -213,7 +213,11 @@ services:
 
   voice-activity-detection:
     build:
-      context: ./voice-activity-detection
+      # Repo-root context so the Dockerfile can `COPY wav-utils ./` —
+      # the VAD crate has a path-dependency on the shared `wav-utils`
+      # crate that lives one level up.
+      context: .
+      dockerfile: voice-activity-detection/Dockerfile
     container_name: kklocalagent-vad
     restart: unless-stopped
     environment:
@@ -297,7 +301,11 @@ services:
 
   orchestrator:
     build:
-      context: ./orchestrator
+      # Repo-root context so the Dockerfile can `COPY wav-utils ./` —
+      # orchestrator depends on the shared `wav-utils` crate via path
+      # for the s16le-mono WAV header helper used by ASR multipart.
+      context: .
+      dockerfile: orchestrator/Dockerfile
     container_name: kklocalagent-orch
     restart: unless-stopped
     environment:

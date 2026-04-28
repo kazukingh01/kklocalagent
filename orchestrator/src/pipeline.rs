@@ -28,33 +28,7 @@ use tracing::{info, warn};
 
 use crate::config::{AsrConfig, LlmConfig, ResultSinkConfig, TtsConfig};
 use crate::state::WakeMachine;
-
-/// Wrap a raw little-endian 16-bit mono PCM buffer in a 44-byte WAV
-/// header. Duplicated from voice-activity-detection's helper — the two
-/// modules are small enough that sharing a crate isn't worth the
-/// workspace churn yet.
-fn wav_from_pcm_s16le_mono(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
-    let byte_rate = sample_rate * 2;
-    let data_size = pcm.len() as u32;
-    let chunk_size = 36 + data_size;
-
-    let mut wav = Vec::with_capacity(44 + pcm.len());
-    wav.extend_from_slice(b"RIFF");
-    wav.extend_from_slice(&chunk_size.to_le_bytes());
-    wav.extend_from_slice(b"WAVE");
-    wav.extend_from_slice(b"fmt ");
-    wav.extend_from_slice(&16u32.to_le_bytes()); // PCM subchunk size
-    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM format
-    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
-    wav.extend_from_slice(&sample_rate.to_le_bytes());
-    wav.extend_from_slice(&byte_rate.to_le_bytes());
-    wav.extend_from_slice(&2u16.to_le_bytes()); // block align
-    wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
-    wav.extend_from_slice(b"data");
-    wav.extend_from_slice(&data_size.to_le_bytes());
-    wav.extend_from_slice(pcm);
-    wav
-}
+use wav_utils::wav_from_pcm_s16le_mono;
 
 /// LLM chat request body for ollama's `/api/chat`.
 #[derive(Serialize)]
@@ -747,17 +721,6 @@ pub fn decode_audio(b64: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn wav_header_is_44_bytes_plus_data() {
-        let pcm = vec![0u8; 320];
-        let wav = wav_from_pcm_s16le_mono(&pcm, 16000);
-        assert_eq!(wav.len(), 44 + 320);
-        assert_eq!(&wav[0..4], b"RIFF");
-        assert_eq!(&wav[8..12], b"WAVE");
-        // Data chunk marker at offset 36.
-        assert_eq!(&wav[36..40], b"data");
-    }
 
     #[test]
     fn decode_audio_roundtrip() {

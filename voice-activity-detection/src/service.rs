@@ -12,6 +12,7 @@ use webrtc_vad::{SampleRate, Vad, VadMode};
 
 use crate::config::{Config, DiagConfig, SinkMode};
 use crate::detector::{Event, SpeechFsm};
+use wav_utils::wav_from_pcm_s16le_mono;
 
 /// Accumulates RMS energy and speech_ratio over a window of frames and logs
 /// a summary line each time the window fills. Enabled only in debug mode so
@@ -416,33 +417,6 @@ fn handle_event(
     }
 }
 
-/// Wrap a raw little-endian 16-bit mono PCM buffer in a 44-byte WAV header.
-/// whisper.cpp's `/inference` endpoint accepts WAV uploads via multipart.
-fn wav_from_pcm_s16le_mono(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
-    let data_len = pcm.len() as u32;
-    let chunk_size = 36 + data_len;
-    let byte_rate = sample_rate * 2; // mono * 2 bytes
-    let block_align: u16 = 2;
-    let bits_per_sample: u16 = 16;
-
-    let mut wav = Vec::with_capacity(44 + pcm.len());
-    wav.extend_from_slice(b"RIFF");
-    wav.extend_from_slice(&chunk_size.to_le_bytes());
-    wav.extend_from_slice(b"WAVE");
-    wav.extend_from_slice(b"fmt ");
-    wav.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
-    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM format
-    wav.extend_from_slice(&1u16.to_le_bytes()); // channels
-    wav.extend_from_slice(&sample_rate.to_le_bytes());
-    wav.extend_from_slice(&byte_rate.to_le_bytes());
-    wav.extend_from_slice(&block_align.to_le_bytes());
-    wav.extend_from_slice(&bits_per_sample.to_le_bytes());
-    wav.extend_from_slice(b"data");
-    wav.extend_from_slice(&data_len.to_le_bytes());
-    wav.extend_from_slice(pcm);
-    wav
-}
-
 async fn post_wav_to_asr(
     client: &reqwest::Client,
     url: &str,
@@ -617,32 +591,7 @@ mod tests {
         assert_eq!(v["audio_base64"], "AAAA");
     }
 
-    #[test]
-    fn wav_header_layout() {
-        let pcm = vec![0u8; 6400]; // 200 ms @ 16 kHz s16 mono
-        let wav = wav_from_pcm_s16le_mono(&pcm, 16000);
-        assert_eq!(&wav[0..4], b"RIFF");
-        assert_eq!(&wav[8..12], b"WAVE");
-        assert_eq!(&wav[12..16], b"fmt ");
-        // fmt chunk size = 16
-        assert_eq!(u32::from_le_bytes(wav[16..20].try_into().unwrap()), 16);
-        // PCM format
-        assert_eq!(u16::from_le_bytes(wav[20..22].try_into().unwrap()), 1);
-        // mono
-        assert_eq!(u16::from_le_bytes(wav[22..24].try_into().unwrap()), 1);
-        // sample rate
-        assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 16_000);
-        // byte rate = sample_rate * channels * bytes_per_sample
-        assert_eq!(u32::from_le_bytes(wav[28..32].try_into().unwrap()), 32_000);
-        // block align
-        assert_eq!(u16::from_le_bytes(wav[32..34].try_into().unwrap()), 2);
-        // bits per sample
-        assert_eq!(u16::from_le_bytes(wav[34..36].try_into().unwrap()), 16);
-        assert_eq!(&wav[36..40], b"data");
-        assert_eq!(
-            u32::from_le_bytes(wav[40..44].try_into().unwrap()),
-            pcm.len() as u32
-        );
-        assert_eq!(wav.len(), 44 + pcm.len());
-    }
+    // wav_header_layout — moved to `wav-utils/src/lib.rs::tests` along
+    // with the function it covered. No need for a duplicate assertion
+    // here now that VAD imports the shared crate.
 }

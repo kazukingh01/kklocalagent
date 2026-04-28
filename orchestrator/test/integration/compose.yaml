@@ -144,7 +144,10 @@ services:
 
   voice-activity-detection:
     build:
-      context: ../../../voice-activity-detection
+      # Repo-root context so the VAD Dockerfile can resolve its
+      # path-dependency on the shared `wav-utils` crate.
+      context: ../../..
+      dockerfile: voice-activity-detection/Dockerfile
     container_name: kklocalagent-test-int-vad
     environment:
       RUST_LOG: info,voice_activity_detection=info
@@ -182,7 +185,12 @@ services:
 
   orchestrator:
     build:
-      context: ../..
+      # Repo-root context so the orchestrator Dockerfile can COPY the
+      # shared `wav-utils` crate alongside `orchestrator/`. Three
+      # levels up from this file (`orchestrator/test/integration/`)
+      # lands at the repo root.
+      context: ../../..
+      dockerfile: orchestrator/Dockerfile
     container_name: kklocalagent-test-int-orch
     environment:
       RUST_LOG: info,orchestrator=info

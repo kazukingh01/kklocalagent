@@ -24,7 +24,11 @@
 services:
   orch:
     build:
-      context: ..
+      # Repo-root context (`..` from this file = orchestrator/, then
+      # one more `..` = repo root) so the orchestrator Dockerfile can
+      # COPY the shared `wav-utils` crate alongside `orchestrator/`.
+      context: ../..
+      dockerfile: orchestrator/Dockerfile
     container_name: kklocalagent-test-orch
     environment:
       # Point each stage at the probe's mock server on the compose network.

@@ -8,17 +8,23 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends pkg-config build-essential \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
+# Build context is the repo root (see compose.yaml `build.context: .`)
+# so the orchestrator's Cargo.toml path-dependency on `../wav-utils`
+# resolves at compile time. Layout under /src mirrors the repo
+# layout: /src/wav-utils/, /src/orchestrator/. Cargo runs from inside
+# orchestrator/ which keeps its own Cargo.lock independent.
+COPY wav-utils ./wav-utils
+COPY orchestrator/Cargo.toml orchestrator/Cargo.lock ./orchestrator/
+COPY orchestrator/src ./orchestrator/src
 # rustls-tls means no system openssl needed; pkg-config + build-essential
 # still cover any transitive C deps.
-RUN cargo build --release --bin orchestrator
+RUN cargo build --release --manifest-path orchestrator/Cargo.toml --bin orchestrator
 
 FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /src/target/release/orchestrator \
+COPY --from=builder /src/orchestrator/target/release/orchestrator \
     /usr/local/bin/orchestrator
 
 EXPOSE 7000
