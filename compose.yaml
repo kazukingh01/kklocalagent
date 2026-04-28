@@ -297,6 +297,43 @@ services:
       orchestrator:
         condition: service_healthy
 
+  agent:
+    # ollama-compatible /api/chat shim backed by LangGraph + a SQLite
+    # checkpointer. The orchestrator POSTs the same body it used to
+    # send to `llm` (see ORCH_LLM_URL below); this service unwraps the
+    # user turn, threads it into LangGraph keyed by an internally
+    # rotated session_id, and streams ndjson back. Conversation memory
+    # lives in /data/agent.sqlite (named volume `agent-data`).
+    #
+    # The system prompt moves *here* from ORCH_LLM_SYSTEM_PROMPT now
+    # that the agent owns chat context — orchestrator no longer
+    # injects a {role:"system"} of its own.
+    build:
+      context: ./agent
+    container_name: kklocalagent-agent
+    restart: unless-stopped
+    environment:
+      AGENT_OLLAMA_URL: http://llm:11434
+      AGENT_MODEL: *llm-model
+      # Voice-assistant persona — prepended at invoke time on every
+      # turn (not persisted in graph state, so changing the prompt
+      # and restarting the agent takes effect on existing sessions'
+      # next turn). Single-line in .env; for multi-paragraph
+      # instructions edit this YAML directly (supports literal blocks).
+      AGENT_SYSTEM_PROMPT: "${AGENT_SYSTEM_PROMPT:-You are a voice assistant; your replies are spoken aloud, so write the way people speak — no markdown, no lists, no code blocks. Keep every response to one or two short sentences. Default to Japanese (日本語) unless the user clearly speaks another language. Maintain a brisk, natural conversational rhythm.}"
+      # Rotate the LangGraph thread_id (= conversation memory key)
+      # after this many seconds without /api/chat traffic. Voice agent
+      # assumes one operator per process, so going idle = "the
+      # operator walked away" → next turn is a fresh conversation.
+      AGENT_SESSION_IDLE_SEC: "${AGENT_SESSION_IDLE_SEC:-600}"
+    volumes:
+      - agent-data:/data
+    ports:
+      - "7080:7080"
+    depends_on:
+      llm:
+        condition: service_healthy
+
   # --- system under test ---------------------------------------------
 
   orchestrator:
@@ -312,15 +349,19 @@ services:
       RUST_LOG: info,orchestrator=info
       ORCH_LISTEN: 0.0.0.0:7000
       ORCH_ASR_URL: http://automatic-speech-recognition:8080/inference
-      ORCH_LLM_URL: http://llm:11434/api/chat
+      # Routes through the `agent` service (LangGraph) instead of
+      # talking to ollama directly — agent owns the system prompt,
+      # conversation memory (SQLite checkpoint), and (future) tool
+      # calls / MCP / approval. The wire format is still ollama's
+      # /api/chat ndjson stream, so pipeline.rs::llm_chat_streaming
+      # is unchanged.
+      ORCH_LLM_URL: http://agent:7080/api/chat
       ORCH_LLM_MODEL: *llm-model
-      # Voice-assistant persona — prepended to every chat as
-      # {role:"system"}. Tells the model its replies are spoken aloud
-      # (no markdown / lists), to keep responses short, default to
-      # Japanese, and maintain conversational rhythm. Override at
-      # boot via ORCH_LLM_SYSTEM_PROMPT in .env if the deployment
-      # wants a different persona / language.
-      ORCH_LLM_SYSTEM_PROMPT: "${ORCH_LLM_SYSTEM_PROMPT:-You are a voice assistant; your replies are spoken aloud, so write the way people speak — no markdown, no lists, no code blocks. Keep every response to one or two short sentences. Default to Japanese (日本語) unless the user clearly speaks another language. Maintain a brisk, natural conversational rhythm.}"
+      # System prompt has moved to AGENT_SYSTEM_PROMPT on the agent
+      # service. Force empty here so the orchestrator doesn't double-
+      # inject one; agent ignores the orchestrator's system role
+      # anyway, but keeping this empty makes the contract explicit.
+      ORCH_LLM_SYSTEM_PROMPT: ""
       ORCH_TTS_URL: http://tts-streamer:7070/speak
       ORCH_TTS_STOP_URL: http://tts-streamer:7070/stop
       # Drain handshake target. Called once per turn after the last
@@ -366,7 +407,7 @@ services:
     depends_on:
       automatic-speech-recognition:
         condition: service_healthy
-      llm:
+      agent:
         condition: service_healthy
       tts-streamer:
         condition: service_healthy
@@ -374,3 +415,4 @@ services:
 volumes:
   asr-models:
   ollama-data:
+  agent-data:
