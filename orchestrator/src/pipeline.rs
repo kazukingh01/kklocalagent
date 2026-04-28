@@ -160,7 +160,7 @@ pub async fn forward_to_result_sink(backends: &Backends, payload: &serde_json::V
 pub async fn run_turn(
     backends: Arc<Backends>,
     wake: Arc<WakeMachine>,
-    pcm: Vec<u8>,
+    mut pcm: Vec<u8>,
     sample_rate: u32,
 ) {
     // ASR stage
@@ -175,6 +175,27 @@ pub async fn run_turn(
             return;
         }
     };
+
+    // Whisper rejects inputs <1000 ms outright ("input is too short"),
+    // so a fast utterance like "聞こえる" gets dropped before
+    // transcription starts. Pad with silence to clear the threshold
+    // — whisper handles trailing zeros without hallucinating since it
+    // already does internal mel padding. 1200 ms gives a safety margin
+    // over the 1000 ms hard floor without meaningfully extending
+    // inference time (whisper segments are 30 s anyway).
+    const MIN_ASR_MS: usize = 1200;
+    let min_bytes = (sample_rate as usize) * 2 * MIN_ASR_MS / 1000;
+    if pcm.len() < min_bytes {
+        let pad = min_bytes - pcm.len();
+        pcm.resize(min_bytes, 0);
+        info!(
+            target: "orch::pipeline",
+            pad_bytes = pad,
+            original_ms = pcm.len().saturating_sub(pad) * 1000 / (sample_rate as usize * 2),
+            "padded utterance to {}ms (whisper rejects <1000ms inputs)",
+            MIN_ASR_MS,
+        );
+    }
 
     let wav = wav_from_pcm_s16le_mono(&pcm, sample_rate);
     info!(
