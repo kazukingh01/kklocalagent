@@ -29,12 +29,13 @@
 # service (what to pull at startup) and `orchestrator` (what to chat
 # against). YAML anchors don't expand env vars themselves, so we route
 # through `${...}` and reuse the resulting string via the anchor.
-x-llm-model: &llm-model "${LLM_MODEL:-gemma3:4b}"
-# medium-q8_0 (~824 MB) trades a small Japanese-accuracy hit for
-# ~100–200 ms shorter inference vs large-v3-turbo on short voice-
-# agent prompts. Override with `ASR_MODEL=ggml-large-v3-turbo-q8_0.bin`
-# in .env to switch back when accuracy beats latency for the use case.
-x-asr-model: &asr-model "${ASR_MODEL:-ggml-medium-q8_0.bin}"
+x-llm-model: &llm-model "${LLM_MODEL:-gemma4:e4b}"
+# large-v3-turbo-q8_0 (~874 MB) — top-tier Japanese accuracy with
+# Whisper's "turbo" decoder (4 decoder layers vs large-v3's 32). The
+# accuracy/latency trade vs medium-q8_0 favours turbo for short voice-
+# agent prompts. Override with `ASR_MODEL=ggml-medium-q8_0.bin` in
+# .env if a heavier latency budget pushes you back to medium.
+x-asr-model: &asr-model "${ASR_MODEL:-ggml-large-v3-turbo-q8_0.bin}"
 
 services:
   # --- model bootstrap -----------------------------------------------
@@ -150,10 +151,12 @@ services:
       # cache vs the f16 default at negligible quality loss. Needs
       # OLLAMA_FLASH_ATTENTION=1.
       OLLAMA_KV_CACHE_TYPE: "q8_0"
-      # Pin context to 4096 tokens. Ollama 0.6+ defaults here too,
-      # but making it explicit keeps VRAM budgeting predictable when
-      # we later add conversation memory.
-      OLLAMA_CONTEXT_LENGTH: "4096"
+      # Context window. Voice multi-turn benefits from a longer
+      # window so the agent's checkpointed history isn't truncated
+      # after a handful of turns. 32k at q8_0 KV ≈ ~1 GiB of cache —
+      # well inside the 4090-Laptop's headroom (gemma4:e4b weights
+      # are ~9 GiB, leaving ~3 GiB free at 4096; 32k still fits).
+      OLLAMA_CONTEXT_LENGTH: "${OLLAMA_CONTEXT_LENGTH:-32768}"
       # One inference at a time — the orchestrator already serialises
       # turns at max_inflight=1, so allowing parallel slots would only
       # split the KV cache and hurt single-turn latency.
@@ -320,7 +323,7 @@ services:
       # and restarting the agent takes effect on existing sessions'
       # next turn). Single-line in .env; for multi-paragraph
       # instructions edit this YAML directly (supports literal blocks).
-      AGENT_SYSTEM_PROMPT: "${AGENT_SYSTEM_PROMPT:-You are a voice assistant; your replies are spoken aloud, so write the way people speak — no markdown, no lists, no code blocks. Keep every response to one or two short sentences. Default to Japanese (日本語) unless the user clearly speaks another language. Maintain a brisk, natural conversational rhythm.}"
+      AGENT_SYSTEM_PROMPT: "${AGENT_SYSTEM_PROMPT:-You are a voice assistant; your replies are spoken aloud, so write the way people speak — no markdown, no lists, no code blocks. Keep every response to one or two short sentences. Default to Japanese (日本語) unless the user clearly speaks another language. Maintain a brisk, natural conversational rhythm. Keep wording as simple and minimal as possible — fewer words is better. Skip honorifics (敬語); use casual / plain-form Japanese (タメ口).}"
       # Rotate the LangGraph thread_id (= conversation memory key)
       # after this many seconds without /api/chat traffic. Voice agent
       # assumes one operator per process, so going idle = "the
