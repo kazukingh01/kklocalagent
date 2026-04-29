@@ -277,8 +277,16 @@ services:
         condition: service_healthy
 
   wake-word-detection:
+    # Two implementations live under ./wake-word-detection/:
+    #   - openwakeword/      Python shim around openWakeWord (current default)
+    #   - livekit-wakeword/  Rust + LiveKit's pure-Rust ONNX runtime (issue #12, WIP)
+    # Switching is rare (only when accuracy actually demands it), so the
+    # path is hard-coded here rather than parameterised via .env. To
+    # swap, edit `context:` below and `docker compose up -d --build
+    # wake-word-detection`. The `WW_*` envs further down apply to the
+    # openwakeword shim; livekit-wakeword will introduce its own.
     build:
-      context: ./wake-word-detection
+      context: ./wake-word-detection/openwakeword
     container_name: kklocalagent-wwd
     restart: unless-stopped
     environment:
