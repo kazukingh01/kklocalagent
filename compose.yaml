@@ -331,8 +331,11 @@ services:
       AGENT_SESSION_IDLE_SEC: "${AGENT_SESSION_IDLE_SEC:-600}"
     volumes:
       - agent-data:/data
-    ports:
-      - "7080:7080"
+    # No `ports:` publish — agent is reached by orchestrator via the
+    # compose network (http://agent:7080). Keeping the port internal
+    # means the unauthenticated /api/chat surface isn't exposed on the
+    # host. For diagnostics use `docker exec kklocalagent-agent curl
+    # http://localhost:7080/session`.
     depends_on:
       llm:
         condition: service_healthy

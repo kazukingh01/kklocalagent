@@ -173,7 +173,17 @@ async def stream_chat(graph, sessions: SessionManager, user_text: str
     async for chunk, _meta in graph.astream(
         input_state, config=config, stream_mode="messages"
     ):
-        if isinstance(chunk, AIMessageChunk) and chunk.content:
+        # `chunk.content` is `str` for plain text streams (today's
+        # ChatOllama output), but newer langchain message types can
+        # surface a `list[ContentBlock]` for multimodal / tool-call
+        # deltas. The orchestrator's parser expects a string, so we
+        # only forward str chunks — once tools are bound the list
+        # branch will need its own handling.
+        if (
+            isinstance(chunk, AIMessageChunk)
+            and isinstance(chunk.content, str)
+            and chunk.content
+        ):
             yield {"message": {"content": chunk.content}, "done": False}
     yield {"done": True}
 
@@ -212,9 +222,19 @@ async def chat_handler(request: web.Request) -> web.StreamResponse:
         async for chunk in stream_chat(graph, sessions, user_text):
             line = json.dumps(chunk, ensure_ascii=False) + "\n"
             await resp.write(line.encode())
-    except (ConnectionResetError, asyncio.CancelledError) as e:
-        # Don't re-raise to aiohttp — the connection is already gone.
+    except ConnectionResetError as e:
+        # Client (orchestrator) dropped the response mid-stream — usual
+        # cause is a barge-in: the orchestrator's JoinHandle::abort drops
+        # its reqwest response, our next aiohttp write raises. The
+        # connection is already gone so there's nothing to send back.
         log.info("chat stream cancelled: %s", type(e).__name__)
+    except asyncio.CancelledError:
+        # Re-raise per asyncio's cancellation contract — swallowing it
+        # would break aiohttp's task lifecycle. write_eof() below would
+        # also fail on a cancelled connection, so skip cleanup and let
+        # the framework unwind.
+        log.info("chat stream cancelled: CancelledError")
+        raise
     except Exception as e:  # noqa: BLE001
         log.error("chat stream failed: %s", e)
     await resp.write_eof()

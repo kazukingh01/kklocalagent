@@ -68,7 +68,7 @@ operationally:
 | Variable | Default | What it does |
 |---|---|---|
 | `AGENT_OLLAMA_URL` | `http://llm:11434` | base URL of the ollama service |
-| `AGENT_MODEL` | `gemma3:4b` | model name passed to ChatOllama |
+| `AGENT_MODEL` | `gemma4:e4b` | model name passed to ChatOllama |
 | `AGENT_SYSTEM_PROMPT` | `""` | prepended at LLM invoke time on every turn (not persisted in state) |
 | `AGENT_DB_PATH` | `/data/agent.sqlite` | SQLite checkpoint DB path |
 | `AGENT_SESSION_IDLE_SEC` | `600` | rotate session after this many idle seconds |

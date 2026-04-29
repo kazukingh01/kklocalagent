@@ -21,7 +21,7 @@ COPY app.py /app/app.py
 # survives `docker compose down && up`. AGENT_DB_PATH defaults to a
 # file inside it; override to relocate (e.g. testing against a tmpfs).
 ENV AGENT_OLLAMA_URL=http://llm:11434 \
-    AGENT_MODEL=gemma3:4b \
+    AGENT_MODEL=gemma4:e4b \
     AGENT_SYSTEM_PROMPT="" \
     AGENT_DB_PATH=/data/agent.sqlite \
     AGENT_SESSION_IDLE_SEC=600 \
