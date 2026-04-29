@@ -1,0 +1,27 @@
+# Custom wake-word training config — English template.
+#
+# Structure follows the upstream livekit-wakeword toolkit's expected
+# YAML. Run with:
+#     bash train.sh configs/example.yaml
+#
+# Pick a target phrase that's:
+#   - 2+ syllables (single-syllable wakes false-fire constantly)
+#   - Phonetically distinct from common speech ("hey jarvis" works,
+#     "yes please" doesn't)
+#   - Not a real common word ("computer" generates noise)
+
+target_phrase: "hey agent"
+
+# Synthetic positives via VoxCPM2. Upstream recommends 10k+ for a
+# usable model; PoC runs at 2-3k go faster but trade off recall.
+n_samples: 10000
+
+augmentation:
+  reverb: true   # MIT RIR convolution
+  noise: true    # AudioSet / FMA mixing at varied SNR
+  gain: true     # random level normalization
+
+# Output ONNX path (relative to repo root or absolute). The runtime
+# Dockerfile's wget will be retargeted at the GitHub release URL once
+# this is published.
+output: out/hey_agent.onnx

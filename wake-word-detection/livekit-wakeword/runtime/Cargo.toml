@@ -1,0 +1,32 @@
+[package]
+name = "livekit-wakeword-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "Wake-word detection shim backed by livekit-wakeword (pure-Rust ONNX inference)"
+license = "MIT"
+
+[[bin]]
+name = "livekit-wakeword-runtime"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned to 0.1.x patch range; pre-1.0 so we bump deliberately.
+# No `features` — ort-tract is the default backend everywhere except
+# aarch64-pc-windows-msvc (handled inside the crate's own cfg).
+livekit-wakeword = "0.1"
+
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net", "io-util"] }
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+anyhow = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

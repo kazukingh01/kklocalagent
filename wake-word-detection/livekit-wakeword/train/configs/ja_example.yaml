@@ -1,0 +1,25 @@
+# Custom wake-word training config — Japanese template.
+#
+# CAVEAT: VoxCPM2 supports Japanese synthesis but the upstream
+# embedding model is English-biased. Expect lower recall than an
+# equivalent English phrase, especially on:
+#   - whispered / quiet speech
+#   - non-native or strongly-accented Japanese
+#   - rapid speech runs without clear word boundaries
+#
+# Always validate the resulting ONNX with eval.py against ≥30 of your
+# own recordings before promoting to runtime use. If recall < 0.85 or
+# FPPH > 1.0, fall back to an English wake phrase per design doc M4.
+
+target_phrase: "ねえアシスタント"
+
+# Larger sample count compensates somewhat for the multilingual
+# accuracy gap. Budget more wall-clock vs the English template.
+n_samples: 15000
+
+augmentation:
+  reverb: true
+  noise: true
+  gain: true
+
+output: out/nee_assistant.onnx

@@ -1,0 +1,12 @@
+# Upstream training toolkit. Pulls VoxCPM2 (TTS), torch, audio
+# augmentation, ONNX export. ~3 GB of deps; install on a GPU host
+# only. Pin to the 0.x line until the upstream stabilises.
+livekit-wakeword>=0.1,<0.3
+
+# eval.py uses these to walk recordings, decode WAV, and run the
+# exported ONNX through the same shape the Rust runtime uses. They
+# are *not* required to run training itself — train.sh defers all
+# training-side deps to the package above.
+onnxruntime>=1.17
+numpy>=1.26
+soundfile>=0.12
