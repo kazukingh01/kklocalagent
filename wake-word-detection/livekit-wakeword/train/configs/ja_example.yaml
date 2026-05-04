@@ -22,4 +22,29 @@ augmentation:
   noise: true
   gain: true
 
+model:
+  # Upstream presets (layer_dim, n_blocks):
+  #   tiny=(16,1)  small=(32,1)  medium=(128,2)  large=(256,3)
+  # Even with the larger Japanese sample budget, keep the head at
+  # `small` — the multilingual gap is mostly in the embedding, not
+  # the classifier capacity, so a bigger head buys little here.
+  model_size: small
+
+# Training-step batch composition. Upstream defaults
+# (50 / 50 / 1024 / 50 → 1174 samples/step) doubled to make better
+# use of GPU RAM with the `small` head (≈ 2348 samples/step). Drop
+# back to defaults if OOM.
+batch_n_per_class:
+  positive: 100
+  adversarial_negative: 100
+  ACAV100M_sample: 2048
+  background_noise: 100
+
+# NOTE on alignment / padding direction:
+# Upstream `align_clip_to_end` places the wake phrase at the END of
+# the 2 s window with 0–200 ms jitter; the FRONT is zero-padded.
+# That mirrors the runtime ring buffer (wake word at the trailing
+# edge), so the default is what we want and there is no YAML key
+# to flip it.
+
 output: out/nee_assistant.onnx

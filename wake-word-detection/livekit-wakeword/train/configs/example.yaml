@@ -21,6 +21,34 @@ augmentation:
   noise: true    # AudioSet / FMA mixing at varied SNR
   gain: true     # random level normalization
 
+model:
+  # Upstream presets (layer_dim, n_blocks):
+  #   tiny=(16,1)  small=(32,1)  medium=(128,2)  large=(256,3)
+  # `small` keeps the runtime ONNX cheap enough for the always-on
+  # service while still tolerating the 32-d embedding head.
+  model_size: small
+
+# Training-step batch composition. Upstream defaults (per
+# src/livekit/wakeword/config.py:WakeWordConfig.batch_n_per_class)
+# are 50 / 50 / 1024 / 50 → 1174 samples/step. `small` head is cheap
+# per-sample, so we run at 2× upstream (≈ 2348 samples/step) to make
+# better use of GPU RAM. Drop back to defaults if OOM.
+batch_n_per_class:
+  positive: 100
+  adversarial_negative: 100
+  ACAV100M_sample: 2048
+  background_noise: 100
+
+# NOTE on alignment / padding direction:
+# The upstream augmentation pipeline hardcodes `align_clip_to_end`
+# for positive clips — the wake phrase sits at the END of the 2 s
+# training window with 0–200 ms jitter, and the FRONT of the window
+# is zero-padded. This matches the runtime ring buffer, where the
+# wake word arrives at the trailing edge of the audio frame, so we
+# rely on the upstream default rather than overriding it. (No YAML
+# key exists to flip the alignment; see src/livekit/wakeword/data/
+# augment.py:align_clip_to_end in the upstream toolkit.)
+
 # Output ONNX path (relative to repo root or absolute). The runtime
 # Dockerfile's wget will be retargeted at the GitHub release URL once
 # this is published.
