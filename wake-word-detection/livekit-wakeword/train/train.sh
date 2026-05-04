@@ -3,8 +3,9 @@
 # point is stable even if the upstream CLI flag set evolves; we
 # re-pin the wrapper, callers don't have to.
 #
-# Expects `livekit-wakeword` already installed (pip install -r
-# requirements.txt). GPU recommended; CPU is hours+.
+# Runs via `uv run` so the .venv is materialised from uv.lock on
+# demand — no manual `source .venv/bin/activate` step required.
+# GPU recommended; CPU is hours+.
 
 set -euo pipefail
 
@@ -19,11 +20,9 @@ if [[ ! -f "$CONFIG" ]]; then
     exit 1
 fi
 
-# Resolve to an absolute path so `cd` later doesn't break it.
 CONFIG_ABS="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
 
 cd "$(dirname "$0")"
-mkdir -p out
 
 echo "[train.sh] running livekit-wakeword run $CONFIG_ABS"
-exec livekit-wakeword run "$CONFIG_ABS"
+exec uv run livekit-wakeword run "$CONFIG_ABS"

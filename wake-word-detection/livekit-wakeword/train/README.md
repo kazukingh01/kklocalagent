@@ -30,26 +30,52 @@ the only artefact that comes back into this repo's release flow.
 
 ## Quickstart
 
-```sh
-# 1. Set up Python env (3.10+) on a GPU host
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+This directory uses [`uv`](https://docs.astral.sh/uv/) to manage Python
+and the dependency graph. The `.venv/`, `data/`, and `output/`
+directories are all gitignored; install once on a GPU host, run
+training, and only the resulting ONNX leaves the host.
 
-# 2. Edit a config — start from configs/example.yaml
+```sh
+# 0. (one-time, per host) install uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 1. Materialise the locked env (Python 3.12.8 + ~180 packages,
+#    pinned by uv.lock). First run pulls torch + nvidia-cuda wheels
+#    (~5 GB). Subsequent runs are seconds.
+uv sync
+
+# 2. Download external data (VoxCPM2 weights, ACAV100M features
+#    ~16 GB, RIRs, backgrounds). One-time per host.
+uv run livekit-wakeword setup --config configs/my_phrase.yaml
+
+# 3. Edit a config — start from configs/example.yaml
 cp configs/example.yaml configs/my_phrase.yaml
 $EDITOR configs/my_phrase.yaml
 
-# 3. Train (initial run downloads ACAV100M / AudioSet caches, ~30 min,
-#    ~30-80 GB on disk; subsequent runs are ~20 min)
+# 4. Train. train.sh wraps `uv run livekit-wakeword run`.
 bash train.sh configs/my_phrase.yaml
 
-# 4. Evaluate against your own voice (~30 short recordings of the
+# 5. Evaluate against your own voice (~30 short recordings of the
 #    target phrase + a few minutes of silence/random speech)
-python eval.py --model out/my_phrase.onnx --recordings ./my_recordings/
+uv run python eval.py --model output/my_phrase/my_phrase.onnx \
+    --recordings ./my_recordings/
 
-# 5. Publish — upload my_phrase.onnx as a GitHub release asset, then
+# 6. Publish — upload my_phrase.onnx as a GitHub release asset, then
 #    point runtime/Dockerfile's wget at the release URL.
 ```
+
+### Re-pinning dependencies
+
+`pyproject.toml` declares high-level deps with `==` patch pins;
+`uv.lock` freezes the full transitive tree. To bump:
+
+```sh
+uv lock --upgrade            # refresh uv.lock against latest matching versions
+uv sync                      # apply the new lock to .venv
+```
+
+To bump a single package: edit its `==X.Y.Z` in `pyproject.toml`,
+then `uv lock && uv sync`.
 
 ## Configs
 

@@ -1,0 +1,19 @@
+# uv-managed virtual env. Recreated from uv.lock with `uv sync`.
+.venv/
+
+# Setup downloads (VoxCPM2 weights, ACAV100M features ~16 GB,
+# RIRs, backgrounds). Never commit; re-fetched via `livekit-wakeword
+# setup --config <yaml>` or `huggingface-cli download`.
+data/
+
+# Pipeline artefacts (generated clips, feature .npy files, trained
+# .pt/.onnx, eval JSON/PNG). Per-run, GB-scale; published models go
+# out via GitHub release uploads, not git.
+output/
+
+# Background training logs.
+nohup.out
+
+# Python bytecode.
+__pycache__/
+*.pyc

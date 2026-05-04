@@ -1,0 +1,43 @@
+[project]
+name = "kklocalagent-wakeword-train"
+version = "0.1.0"
+description = "Wake-word training environment pinned to the versions that produced output/<model>/<model>.onnx."
+requires-python = "==3.12.*"
+
+# Top-level deps — patch-pinned per the lock policy. Transitive deps
+# (torch, voxcpm, the nvidia-cuda-* wheels, etc.) are resolved by uv
+# and frozen in uv.lock; do not duplicate them here.
+dependencies = [
+    # Upstream training toolkit. `train` extras pull torch + audio
+    # augmentation + pyyaml; `voxcpm` extras add the VoxCPM2 TTS;
+    # `export` extras add onnx/onnxruntime/onnxscript for ONNX export
+    # and (incidentally) for eval.py at inference time.
+    "livekit-wakeword[train,voxcpm,export]==0.2.0",
+
+    # Pin torch / torchaudio to the CUDA 12.6 builds. Default PyPI
+    # serves the cu13 wheel for these versions, which requires
+    # nvidia driver >= 580; the host this env was first built on
+    # ships driver 525.x (max CUDA 12.x). The cu126 build is
+    # sourced from pytorch.org via [tool.uv.sources] below.
+    "torch==2.11.0+cu126",
+    "torchaudio==2.11.0+cu126",
+
+    # eval.py imports these directly. They also come in transitively
+    # via `train`/`export` extras, but listing them keeps the runtime
+    # contract of eval.py readable from this file alone.
+    "numpy==2.4.4",
+    "soundfile==0.13.1",
+]
+
+# Route torch / torchaudio to PyTorch's CUDA 12.6 wheel index. The
+# `explicit = true` flag means uv only consults this index for the
+# packages mapped via [tool.uv.sources]; everything else still comes
+# from PyPI.
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchaudio = { index = "pytorch-cu126" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
