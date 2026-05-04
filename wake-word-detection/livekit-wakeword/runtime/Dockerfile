@@ -10,7 +10,6 @@ RUN apt-get update \
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-COPY tests ./tests
 # rustls-tls in reqwest means no system openssl is needed; pkg-config +
 # build-essential cover any transitive C deps from the tract stack.
 RUN cargo build --release --bin livekit-wakeword-runtime
