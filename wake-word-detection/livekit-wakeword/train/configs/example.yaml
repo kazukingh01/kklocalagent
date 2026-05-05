@@ -10,10 +10,18 @@
 #     "yes please" doesn't)
 #   - Not a real common word ("computer" generates noise)
 
-target_phrase: "hey agent"
+model_name: hey_agent
+target_phrases:
+  - "hey agent"
 
-# Synthetic positives via VoxCPM2. Upstream recommends 10k+ for a
-# usable model; PoC runs at 2-3k go faster but trade off recall.
+# Synthetic positives via Piper VITS (the upstream default). Piper's
+# G2P is English-only, so this template works for English phrases
+# only — switch to `tts_backend: voxcpm` for non-English (see
+# ja_example.yaml). Piper requires `espeak-ng` on PATH:
+#     sudo apt install espeak-ng   # Linux
+#     brew install espeak-ng       # macOS
+# Upstream recommends 10k+ samples for a usable model; PoC runs at
+# 2-3k go faster but trade off recall.
 n_samples: 10000
 
 augmentation:
@@ -49,7 +57,9 @@ batch_n_per_class:
 # key exists to flip the alignment; see src/livekit/wakeword/data/
 # augment.py:align_clip_to_end in the upstream toolkit.)
 
-# Output ONNX path (relative to repo root or absolute). The runtime
-# Dockerfile's wget will be retargeted at the GitHub release URL once
-# this is published.
-output: out/hey_agent.onnx
+# Output directory. The trained ONNX lands at
+#     <output_dir>/<model_name>/<model_name>.onnx
+# i.e. ./output/hey_agent/hey_agent.onnx with the defaults below. The
+# runtime Dockerfile's wget will be retargeted at the GitHub release
+# URL once this is published.
+output_dir: ./output

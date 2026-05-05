@@ -11,7 +11,16 @@
 # own recordings before promoting to runtime use. If recall < 0.85 or
 # FPPH > 1.0, fall back to an English wake phrase per design doc M4.
 
-target_phrase: "ねえアシスタント"
+model_name: nee_assistant
+target_phrases:
+  - "ねえアシスタント"
+
+# VoxCPM2 is required for Japanese — the default `piper_vits` backend
+# uses an English-only G2P (espeak-ng) that mangles non-Latin
+# phrases. VoxCPM weights are fetched into `data_dir` by
+#     uv run livekit-wakeword setup --config <this file>
+# before the first `train.sh` run.
+tts_backend: voxcpm
 
 # Larger sample count compensates somewhat for the multilingual
 # accuracy gap. Budget more wall-clock vs the English template.
@@ -47,4 +56,8 @@ batch_n_per_class:
 # edge), so the default is what we want and there is no YAML key
 # to flip it.
 
-output: out/nee_assistant.onnx
+# Output directory. The trained ONNX lands at
+#     <output_dir>/<model_name>/<model_name>.onnx
+# i.e. ./output/nee_assistant/nee_assistant.onnx with the defaults
+# below.
+output_dir: ./output
