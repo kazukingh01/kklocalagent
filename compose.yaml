@@ -295,7 +295,14 @@ services:
     container_name: kklocalagent-wwd
     restart: unless-stopped
     environment:
-      WW_MIC_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/mic
+      # ?ts=1 opts into audio-io's per-frame epoch-ns header. Both
+      # implementations under ./wake-word-detection/ honor it:
+      # the Rust runtime requires it (auto-appends if absent) and the
+      # Python openwakeword shim detects it from the URL and strips
+      # the header before feeding PCM to openWakeWord. Removing ?ts=1
+      # is also valid — both implementations fall back to header-less
+      # PCM in that case (the runtime's auto-append will re-add it).
+      WW_MIC_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/mic?ts=1
       WW_SINK_MODE: orchestrator
       WW_ORCHESTRATOR_URL: http://orchestrator:7000/events
       WW_MODELS: "${WW_MODELS:-hey_jarvis}"

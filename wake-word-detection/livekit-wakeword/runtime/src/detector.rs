@@ -18,8 +18,8 @@ use livekit_wakeword::WakeWordModel;
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
-use crate::Detection;
 use crate::config::Config;
+use crate::{Detection, MicFrame};
 
 /// audio-io always emits at this rate; the model is configured to match.
 const SAMPLE_RATE_HZ: u32 = 16_000;
@@ -31,7 +31,7 @@ const HOP_SAMPLES: usize = 1280;
 
 pub async fn run(
     cfg: Config,
-    mut rx: mpsc::Receiver<Vec<i16>>,
+    mut rx: mpsc::Receiver<MicFrame>,
     tx: mpsc::Sender<Detection>,
     model_loaded: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -63,22 +63,19 @@ pub async fn run(
     let mut peak_model: String = String::new();
     let mut last_peak_log = Instant::now();
 
-    // Diagnostic counters. `total_samples` is the cumulative count of
-    // i16 samples received from the WS — it doubles as an "audio
-    // timeline" (audio_t = total_samples / SAMPLE_RATE_HZ). Comparing
-    // audio_t against wall-clock since first chunk reveals dropped
-    // frames upstream (audio_t falls behind wall time).
+    // Diagnostic counters. `total_samples` doubles as a sample-index
+    // for the audio timeline; combined with the per-frame epoch_ns
+    // header from audio-io, we can express both "how fresh is this
+    // frame" (now − end_epoch_ns) and "how stale was the window when
+    // we predicted on it" (now − window_end_epoch_ns).
     let mut total_samples: u64 = 0;
-    let mut first_chunk_at: Option<Instant> = None;
     let mut predict_n: u64 = 0;
+    let frame_ns_per_sample: u64 = 1_000_000_000 / SAMPLE_RATE_HZ as u64;
 
-    while let Some(chunk) = rx.recv().await {
-        let chunk_arrived = Instant::now();
-        let n = chunk.len();
-        if first_chunk_at.is_none() {
-            first_chunk_at = Some(chunk_arrived);
-        }
+    while let Some(frame) = rx.recv().await {
+        let n = frame.samples.len();
         total_samples += n as u64;
+        let window_end_epoch_ns = frame.end_epoch_ns;
 
         let overflow = ring.len() + n;
         if overflow > window_samples {
@@ -86,21 +83,18 @@ pub async fn run(
                 ring.pop_front();
             }
         }
-        ring.extend(chunk);
+        ring.extend(frame.samples);
         samples_since_predict += n;
 
-        let audio_t = total_samples as f64 / SAMPLE_RATE_HZ as f64;
-        let wall_t = first_chunk_at
-            .map(|t| chunk_arrived.duration_since(t).as_secs_f64())
-            .unwrap_or(0.0);
+        let now_ns = epoch_ns_now();
+        let audio_lag_ms = ns_diff_ms(now_ns, window_end_epoch_ns);
         trace!(
             chunk_samples = n,
             ring_len = ring.len(),
             total_samples = total_samples,
             samples_since_predict = samples_since_predict,
-            audio_t_sec = audio_t,
-            wall_t_sec = wall_t,
-            audio_lag_ms = ((wall_t - audio_t) * 1000.0) as i64,
+            frame_end_epoch_ns = window_end_epoch_ns,
+            audio_lag_ms = audio_lag_ms,
             "chunk consumed"
         );
 
@@ -114,15 +108,14 @@ pub async fn run(
         }
         samples_since_predict = 0;
 
-        let window_end_t = total_samples as f64 / SAMPLE_RATE_HZ as f64;
-        let window_start_t = window_end_t - (ring.len() as f64) / (SAMPLE_RATE_HZ as f64);
+        let window_start_epoch_ns = window_end_epoch_ns
+            .saturating_sub((ring.len() as u64) * frame_ns_per_sample);
         debug!(
             predict_n = predict_n,
             window_samples = ring.len(),
-            audio_t_start_sec = window_start_t,
-            audio_t_end_sec = window_end_t,
-            wall_t_sec = wall_t,
-            audio_lag_ms = ((wall_t - window_end_t) * 1000.0) as i64,
+            window_start_epoch_ns = window_start_epoch_ns,
+            window_end_epoch_ns = window_end_epoch_ns,
+            audio_lag_ms = audio_lag_ms,
             "predict START"
         );
         let predict_started = Instant::now();
@@ -148,9 +141,16 @@ pub async fn run(
             };
 
         let predict_dur_ms = predict_started.elapsed().as_millis() as u64;
+        // End-to-end lag = "now" minus the mic time of the *last* sample
+        // in the window we just scored. This is the number to watch
+        // against the 1 s budget: it includes audio-io capture-to-WS,
+        // network/loopback, mpsc, ring append, hop wait, and predict
+        // itself. Anything else (event_sink HTTP) is downstream of this.
+        let e2e_lag_ms = ns_diff_ms(epoch_ns_now(), window_end_epoch_ns);
         debug!(
             predict_n = predict_n,
             duration_ms = predict_dur_ms,
+            e2e_lag_ms = e2e_lag_ms,
             scores = ?scores,
             "predict DONE"
         );
@@ -201,6 +201,24 @@ pub async fn run(
         }
     }
     Ok(())
+}
+
+fn epoch_ns_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// Saturating signed difference in milliseconds: `a - b`. Negative
+/// when the frame timestamp is in the future relative to local clock
+/// (clock skew between hosts, expected to be small in compose).
+fn ns_diff_ms(a: u64, b: u64) -> i64 {
+    if a >= b {
+        ((a - b) / 1_000_000) as i64
+    } else {
+        -(((b - a) / 1_000_000) as i64)
+    }
 }
 
 fn update_peak(peak_score: &mut f32, peak_model: &mut String, name: &str, score: f32) {

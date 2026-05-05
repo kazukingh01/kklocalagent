@@ -31,7 +31,7 @@ RUN mkdir -p ${WW_MODELS_DIR} \
 COPY --from=builder /src/target/release/livekit-wakeword-runtime \
     /usr/local/bin/livekit-wakeword-runtime
 
-ENV WW_MIC_URL=ws://audio-io:7010/mic \
+ENV WW_MIC_URL=ws://audio-io:7010/mic?ts=1 \
     WW_ORCHESTRATOR_URL=http://orchestrator:7000/events \
     WW_MODEL_PATHS=/opt/models/hey_livekit.onnx \
     WW_THRESHOLD=0.5 \

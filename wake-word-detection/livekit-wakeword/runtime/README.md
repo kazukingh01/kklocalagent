@@ -58,7 +58,7 @@ RUST_LOG=debug docker compose up wake-word-detection
 
 | Var | Default |
 |---|---|
-| `WW_MIC_URL` | `ws://audio-io:7010/mic` |
+| `WW_MIC_URL` | `ws://audio-io:7010/mic` (the runtime appends `?ts=1` automatically; see below) |
 | `WW_ORCHESTRATOR_URL` | `http://orchestrator:7000/events` |
 | `WW_MODEL_PATHS` | `/opt/models/hey_livekit.onnx` |
 | `WW_THRESHOLD` | `0.5` |
@@ -68,3 +68,21 @@ RUST_LOG=debug docker compose up wake-word-detection
 | `WW_SINK_MODE` | `orchestrator` |
 | `WW_PEAK_LOG_INTERVAL_SEC` | `0` |
 | `WW_PEAK_LOG_FLOOR` | `0.05` |
+
+## End-to-end latency telemetry
+
+The runtime requires audio-io's `?ts=1` mic protocol — each binary frame
+is `[u64 LE epoch_ns of the frame's last sample][s16le PCM]`. The
+runtime appends `?ts=1` to `WW_MIC_URL` automatically if absent.
+
+Two diagnostics fall out of this:
+
+* `chunk consumed` (TRACE) — `audio_lag_ms = now − frame.end_epoch_ns`
+  per arriving frame. Steady-state freshness; rising values mean
+  audio-io broadcast / Tokio scheduling / NW is backing up.
+* `predict DONE` (DEBUG) — `e2e_lag_ms = now − window_end_epoch_ns`
+  measured *after* the predict completes. This is the headline number
+  for the "wake-word in 1 s" budget: capture → predict result.
+
+Set `RUST_LOG=livekit_wakeword_runtime=debug` to see `e2e_lag_ms` per
+prediction.

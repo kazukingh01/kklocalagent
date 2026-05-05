@@ -1,7 +1,15 @@
-//! Subscribe to audio-io's `/mic` WebSocket. The server emits one
-//! binary frame per ~20 ms of capture (s16le mono 16 kHz; 320 samples
-//! = 640 bytes). We decode each frame into `Vec<i16>` and forward to
-//! the detector.
+//! Subscribe to audio-io's `/mic?ts=1` WebSocket. The server emits one
+//! binary frame per ~20 ms of capture: an 8-byte little-endian u64
+//! header carrying epoch-ns of the frame's *last* sample, followed by
+//! s16le mono 16 kHz PCM (320 samples = 640 bytes). We split the
+//! header off, decode the body into `Vec<i16>`, and forward both to
+//! the detector via `MicFrame`.
+//!
+//! The `?ts=1` query is appended automatically if the configured URL
+//! doesn't already include it — older audio-io revisions that don't
+//! understand the parameter ignore unknown query params, but they
+//! also won't prepend the header, so this client only works against
+//! a header-aware audio-io.
 //!
 //! Reconnects with exponential backoff on disconnect or read error.
 //! `connected` is the flag the /health probe reads — true between
@@ -17,11 +25,16 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn};
 
+use crate::MicFrame;
+
+const HEADER_LEN: usize = 8;
+
 pub async fn run(
     url: String,
-    tx: mpsc::Sender<Vec<i16>>,
+    tx: mpsc::Sender<MicFrame>,
     connected: Arc<AtomicBool>,
 ) -> Result<()> {
+    let url = ensure_ts_query(&url);
     let mut backoff = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(30);
 
@@ -36,14 +49,28 @@ pub async fn run(
                 while let Some(msg) = read.next().await {
                     match msg {
                         Ok(Message::Binary(bytes)) => {
+                            if bytes.len() < HEADER_LEN {
+                                warn!(
+                                    len = bytes.len(),
+                                    "mic ws: dropping short frame (no ts header)"
+                                );
+                                continue;
+                            }
+                            let mut hdr = [0u8; HEADER_LEN];
+                            hdr.copy_from_slice(&bytes[..HEADER_LEN]);
+                            let end_epoch_ns = u64::from_le_bytes(hdr);
                             // s16le → Vec<i16>. audio-io rejects
                             // odd-length frames upstream, so the
                             // exact-chunks split drops nothing.
-                            let samples: Vec<i16> = bytes
+                            let samples: Vec<i16> = bytes[HEADER_LEN..]
                                 .chunks_exact(2)
                                 .map(|c| i16::from_le_bytes([c[0], c[1]]))
                                 .collect();
-                            if tx.send(samples).await.is_err() {
+                            let frame = MicFrame {
+                                end_epoch_ns,
+                                samples,
+                            };
+                            if tx.send(frame).await.is_err() {
                                 // detector dropped — runtime is shutting down.
                                 return Ok(());
                             }
@@ -73,5 +100,40 @@ pub async fn run(
         warn!(?backoff, "reconnecting after backoff");
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(max_backoff);
+    }
+}
+
+fn ensure_ts_query(url: &str) -> String {
+    if url.contains("ts=1") {
+        return url.to_string();
+    }
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}ts=1")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_ts_appends_when_no_query() {
+        assert_eq!(
+            ensure_ts_query("ws://audio-io:7010/mic"),
+            "ws://audio-io:7010/mic?ts=1"
+        );
+    }
+
+    #[test]
+    fn ensure_ts_appends_with_amp_when_query_present() {
+        assert_eq!(
+            ensure_ts_query("ws://x/mic?foo=bar"),
+            "ws://x/mic?foo=bar&ts=1"
+        );
+    }
+
+    #[test]
+    fn ensure_ts_idempotent() {
+        let u = "ws://x/mic?ts=1";
+        assert_eq!(ensure_ts_query(u), u);
     }
 }

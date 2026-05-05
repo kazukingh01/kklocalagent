@@ -49,7 +49,7 @@ docker run --rm \
 
 | Name | Default | Notes |
 |---|---|---|
-| `WW_MIC_URL` | `ws://audio-io:7010/mic` | PCM source (s16le mono 16kHz binary frames). |
+| `WW_MIC_URL` | `ws://audio-io:7010/mic` | PCM source (s16le mono 16kHz binary frames). Append `?ts=1` to opt into audio-io's per-frame epoch-ns header; the shim then logs `e2e_lag_ms` at DEBUG level. URLs without `ts=1` keep the old header-less behavior (used by the offline smoke probe). |
 | `WW_ORCHESTRATOR_URL` | `http://orchestrator:7000/events` | POST target for `WakeWordDetected`. |
 | `WW_MODELS` | `alexa` | Comma-separated. Bundled names: `alexa`, `hey_jarvis`, `hey_mycroft`, `hey_rhasspy`, `current_weather`, `timers`. |
 | `WW_THRESHOLD` | `0.5` | Fire when any model score >= this value. |

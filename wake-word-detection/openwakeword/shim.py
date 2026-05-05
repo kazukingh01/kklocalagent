@@ -23,9 +23,11 @@ import asyncio
 import json
 import logging
 import os
+import struct
 import sys
 import time
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 import websockets
@@ -37,6 +39,13 @@ VALID_SINK_MODES = ("orchestrator", "dry-run")
 # audio-io emits s16le mono @ 16kHz. openWakeWord wants chunks that are
 # multiples of 80ms (1280 samples = 2560 bytes) for best efficiency.
 FRAME_BYTES = 2560
+SAMPLE_RATE_HZ = 16000
+
+# When ?ts=1 is in WW_MIC_URL, audio-io prepends a u64 LE epoch-ns to
+# each Binary frame (the wall-clock time of the frame's *last* sample).
+# 8 bytes; documented in audio-io/src/ws.rs and mirrored in the
+# livekit-wakeword Rust runtime.
+TS_HEADER_BYTES = 8
 
 log = logging.getLogger("wwd")
 
@@ -86,11 +95,28 @@ class Shim:
                 f"WW_SINK_MODE must be one of {VALID_SINK_MODES}, got {self.sink_mode!r}"
             )
 
+        # Header opt-in: audio-io's `?ts=1` prepends a per-frame
+        # epoch-ns header. Detect it from the configured URL so the
+        # offline smoke probe (which sends raw PCM) still works
+        # untouched while a real audio-io connection benefits from the
+        # header. No auto-append — the URL is the source of truth.
+        try:
+            qs = parse_qs(urlparse(self.mic_url).query)
+            self.with_ts = qs.get("ts", [""])[0] == "1"
+        except Exception:  # noqa: BLE001
+            self.with_ts = False
+
         self.model: Optional[Model] = None
         self.http: Optional[ClientSession] = None
         self.ws_connected = False
         self.last_fire_ts = 0.0
         self.buffer = bytearray()
+        # Updated each WS message when `with_ts` is on. Holds the
+        # epoch-ns of the most recent PCM byte we've appended to
+        # `self.buffer`. Combined with how many bytes remain in the
+        # buffer after a predict-chunk drain, it lets us compute the
+        # end-to-end lag (capture → predict result) per prediction.
+        self.last_frame_end_ns = 0
         # Per-window peak-score tracker for the diagnostic log path.
         # Reset each time a window is logged.
         self.peak_score = 0.0
@@ -132,15 +158,36 @@ class Shim:
             else:
                 self.ws_connected = False
 
-    async def process(self, pcm: bytes) -> None:
-        # Re-buffer: audio-io emits 20ms frames but a single WS message
-        # may carry several (and TCP coalesces), so slice into 80ms
-        # chunks that openWakeWord prefers.
-        self.buffer.extend(pcm)
+    async def process(self, msg: bytes) -> None:
+        # When ?ts=1 is in effect, each WS message is one audio-io
+        # frame: [8B u64 LE epoch-ns of last sample][640B s16le PCM].
+        # We strip the header, remember its timestamp, and feed only
+        # the PCM into `self.buffer`. The buffer mechanism still
+        # exists because audio-io emits 20 ms frames and openWakeWord
+        # wants 80 ms chunks; we accumulate four frames per predict.
+        if self.with_ts:
+            if len(msg) < TS_HEADER_BYTES:
+                log.warning("mic ws: dropping short frame (no ts header), len=%d", len(msg))
+                return
+            (self.last_frame_end_ns,) = struct.unpack_from("<Q", msg, 0)
+            self.buffer.extend(msg[TS_HEADER_BYTES:])
+        else:
+            self.buffer.extend(msg)
         assert self.model is not None
         while len(self.buffer) >= FRAME_BYTES:
             chunk = bytes(self.buffer[:FRAME_BYTES])
             del self.buffer[:FRAME_BYTES]
+            # After draining FRAME_BYTES from the front (oldest), the
+            # remaining buffer holds samples newer than the predict
+            # window. So the time of the window's last sample is
+            # last_frame_end_ns minus the duration of whatever's still
+            # buffered. Only meaningful when with_ts is on.
+            window_end_ns = 0
+            if self.with_ts:
+                remaining_samples = len(self.buffer) // 2
+                window_end_ns = self.last_frame_end_ns - int(
+                    remaining_samples * 1_000_000_000 / SAMPLE_RATE_HZ
+                )
             frame = np.frombuffer(chunk, dtype=np.int16)
             # `model.predict` is a synchronous ML call — for tflite the
             # default `alexa` model it's ~1–2 ms, but ONNX or larger
@@ -155,6 +202,16 @@ class Shim:
             # time per shim instance.
             scores = await asyncio.to_thread(self.model.predict, frame)
             now = time.time()
+            if self.with_ts and window_end_ns > 0:
+                # End-to-end lag = "now" minus mic time of the last
+                # sample in the predicted 80 ms window. Mirrors the
+                # livekit-wakeword runtime's e2e_lag_ms diagnostic;
+                # this is the headline number for the 1 s wake-word
+                # latency budget. DEBUG so production stays quiet but
+                # threshold-tuning sessions (RUST_LOG-equivalent
+                # `--log-level DEBUG` via env) can see it.
+                e2e_lag_ms = int(now * 1_000) - (window_end_ns // 1_000_000)
+                log.debug("predict done e2e_lag_ms=%d", e2e_lag_ms)
             if (now - self.last_fire_ts) < self.cooldown:
                 continue
             # scores: {model_name: float}; take the best over configured models.

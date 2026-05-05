@@ -35,8 +35,10 @@ services:
       context: ..
     container_name: kklocalagent-test-wwd-online
     environment:
-      # Live audio source on the Windows host.
-      WW_MIC_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/mic
+      # Live audio source on the Windows host. ?ts=1 opts into
+      # audio-io's per-frame epoch-ns header so the shim can log
+      # e2e_lag_ms at DEBUG (run with WW_LOG_LEVEL=DEBUG to see it).
+      WW_MIC_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/mic?ts=1
       # Dry-run sink: log the detection envelope rather than POST it.
       # Lets this stack run standalone — no orchestrator needed.
       WW_SINK_MODE: dry-run

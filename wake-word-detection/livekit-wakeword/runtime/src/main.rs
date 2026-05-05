@@ -35,6 +35,18 @@ pub struct Detection {
     pub ts: f64,
 }
 
+/// One PCM frame received from audio-io's `/mic?ts=1` WebSocket. The
+/// 8-byte header carries the wall-clock time of the frame's *last*
+/// sample (epoch ns). Held alongside the samples so the detector can
+/// compute end-to-end lag against `SystemTime::now()` without relying
+/// on chunk-arrival time (which hides intra-audio-io / broadcast / NW
+/// delay).
+#[derive(Debug, Clone)]
+pub struct MicFrame {
+    pub end_epoch_ns: u64,
+    pub samples: Vec<i16>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -54,7 +66,7 @@ async fn main() -> Result<()> {
     // ws_client → detector: 32 frames ≈ 640 ms back-pressure tolerance
     // before audio-io's broadcast channel starts dropping (it's sized
     // ~1.28 s upstream).
-    let (pcm_tx, pcm_rx) = mpsc::channel::<Vec<i16>>(32);
+    let (pcm_tx, pcm_rx) = mpsc::channel::<MicFrame>(32);
     // detector → event_sink: cooldown caps the rate at <1 detection /
     // 2 s, so 8 is generous.
     let (det_tx, det_rx) = mpsc::channel::<Detection>(8);
