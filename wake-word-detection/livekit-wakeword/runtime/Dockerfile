@@ -1,6 +1,6 @@
-# livekit-wakeword runtime: subscribes to audio-io /mic, runs the
-# livekit-wakeword crate's pure-Rust ONNX inference (ort-tract), and
-# POSTs WakeWordDetected to the orchestrator. Pattern mirrors the
+# livekit-wakeword runtime: subscribes to audio-io /mic, runs ONNX
+# inference via real onnxruntime (ort 2.0 with load-dynamic), POSTs
+# WakeWordDetected to the orchestrator. Pattern mirrors the
 # orchestrator and audio-io Dockerfiles for consistency.
 
 FROM rust:1-slim-bookworm AS builder
@@ -11,13 +11,26 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 # rustls-tls in reqwest means no system openssl is needed; pkg-config +
-# build-essential cover any transitive C deps from the tract stack.
+# build-essential cover any transitive C deps. ort uses load-dynamic
+# so libonnxruntime.so is *not* needed at build time — only at run time
+# (linked into the next stage below).
 RUN cargo build --release --bin livekit-wakeword-runtime
 
 FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl wget \
     && rm -rf /var/lib/apt/lists/*
+
+# onnxruntime CPU shared library. `load-dynamic` resolves
+# libonnxruntime.so via ORT_DYLIB_PATH or ldconfig at startup;
+# /usr/local/lib + ldconfig is the simpler of the two. v1.20.1 is the
+# last 1.20.x patch and is binary-compatible with ort 2.0.0-rc.11.
+ARG ONNXRUNTIME_VERSION=1.20.1
+RUN curl -sL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}.tgz" \
+        | tar -xz -C /tmp \
+    && cp -P "/tmp/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}/lib/"libonnxruntime.so* /usr/local/lib/ \
+    && ldconfig \
+    && rm -rf "/tmp/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}"*
 
 # Pre-fetch the upstream "hey livekit" classifier ONNX into the
 # image. M3 will replace this with our own custom-trained models
@@ -31,9 +44,17 @@ RUN mkdir -p ${WW_MODELS_DIR} \
 COPY --from=builder /src/target/release/livekit-wakeword-runtime \
     /usr/local/bin/livekit-wakeword-runtime
 
+# WW_FEATURE_ONNX_DIR points at the directory containing the mel +
+# embedding ONNX. The expected workflow is to bind-mount the train uv
+# venv resources directory here so the runtime always uses the same
+# feature extractor that produced the trained classifier — see
+# runtime/README.md for the docker run / compose snippet. /opt/feature
+# is just a default mount point; override the env var if your mount
+# lives elsewhere.
 ENV WW_MIC_URL=ws://audio-io:7010/mic?ts=1 \
     WW_ORCHESTRATOR_URL=http://orchestrator:7000/events \
     WW_MODEL_PATHS=/opt/models/hey_livekit.onnx \
+    WW_FEATURE_ONNX_DIR=/opt/feature \
     WW_THRESHOLD=0.5 \
     WW_COOLDOWN_SEC=2.0 \
     WW_PREDICT_WINDOW_MS=2000 \

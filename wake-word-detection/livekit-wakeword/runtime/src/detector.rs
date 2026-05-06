@@ -1,5 +1,5 @@
-//! Ring buffer + predict loop. The crate's predict() needs ~2 s of
-//! audio (returns all-zero scores below that), so we hold the last
+//! Ring buffer + predict loop. predict() needs ~2 s of audio (returns
+//! all-zero scores below that), so we hold the last
 //! `WW_PREDICT_WINDOW_MS` worth in a `VecDeque` and call predict every
 //! 80 ms once warm. 80 ms is the model's own embedding stride —
 //! calling more often is wasted CPU.
@@ -14,19 +14,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
-use livekit_wakeword::WakeWordModel;
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
 use crate::config::Config;
+use crate::wakeword::WakeWordModel;
 use crate::{Detection, MicFrame};
 
 /// audio-io always emits at this rate; the model is configured to match.
 const SAMPLE_RATE_HZ: u32 = 16_000;
 
-/// 80 ms hop. livekit-wakeword's embedding stride is also 80 ms, so
-/// calling predict() more often than this is wasted work — the model
-/// has nothing new to ingest.
+/// 80 ms hop. The embedding stride is also 80 ms, so calling predict()
+/// more often than this is wasted work — the model has nothing new to
+/// ingest.
 const HOP_SAMPLES: usize = 1280;
 
 pub async fn run(
@@ -35,12 +35,14 @@ pub async fn run(
     tx: mpsc::Sender<Detection>,
     model_loaded: Arc<AtomicBool>,
 ) -> Result<()> {
-    // Build the model on a blocking thread — ONNX init parses a few MB
-    // of bundled mel/embedding bytes plus the classifier ONNX, taking
-    // hundreds of ms. The runtime worker shouldn't block on it.
-    let paths = cfg.model_paths.clone();
+    // Build the model on a blocking thread — ONNX init parses several
+    // MB of mel/embedding/classifier bytes, taking hundreds of ms. The
+    // runtime worker shouldn't block on it.
+    let classifier_paths = cfg.model_paths.clone();
+    let mel_path = cfg.mel_onnx_path.clone();
+    let emb_path = cfg.embedding_onnx_path.clone();
     let model = tokio::task::spawn_blocking(move || {
-        WakeWordModel::new(&paths, SAMPLE_RATE_HZ)
+        WakeWordModel::new(&mel_path, &emb_path, &classifier_paths)
     })
     .await?
     .map_err(|e| anyhow!("WakeWordModel::new failed: {e:?}"))?;

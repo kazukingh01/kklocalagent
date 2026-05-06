@@ -26,6 +26,7 @@ mod config;
 mod detector;
 mod event_sink;
 mod health;
+mod wakeword;
 mod ws_client;
 
 #[derive(Debug, Clone)]

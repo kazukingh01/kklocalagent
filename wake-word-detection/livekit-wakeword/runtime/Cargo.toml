@@ -2,7 +2,7 @@
 name = "livekit-wakeword-runtime"
 version = "0.1.0"
 edition = "2021"
-description = "Wake-word detection shim backed by livekit-wakeword (pure-Rust ONNX inference)"
+description = "Wake-word detection shim backed by onnxruntime (real ORT, not tract)"
 license = "MIT"
 
 [[bin]]
@@ -10,10 +10,14 @@ name = "livekit-wakeword-runtime"
 path = "src/main.rs"
 
 [dependencies]
-# Pinned to 0.1.x patch range; pre-1.0 so we bump deliberately.
-# No `features` — ort-tract is the default backend everywhere except
-# aarch64-pc-windows-msvc (handled inside the crate's own cfg).
-livekit-wakeword = "0.1"
+# Real onnxruntime via dlopen. Feature ONNX (mel + embedding) and
+# classifier ONNX are loaded at startup from paths supplied by the
+# caller — typically the train-side venv resources, see config.rs.
+# `load-dynamic` defers libonnxruntime.so resolution to runtime
+# (ORT_DYLIB_PATH or standard ldconfig paths); the Dockerfile drops
+# the lib into /usr/local/lib so ldconfig picks it up.
+ort = { version = "=2.0.0-rc.11", default-features = false, features = ["ndarray", "std", "load-dynamic"] }
+ndarray = "0.17"
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net", "io-util"] }
 tokio-tungstenite = "0.21"
