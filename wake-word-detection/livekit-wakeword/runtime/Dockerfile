@@ -23,9 +23,10 @@ RUN apt-get update \
 
 # onnxruntime CPU shared library. `load-dynamic` resolves
 # libonnxruntime.so via ORT_DYLIB_PATH or ldconfig at startup;
-# /usr/local/lib + ldconfig is the simpler of the two. v1.20.1 is the
-# last 1.20.x patch and is binary-compatible with ort 2.0.0-rc.11.
-ARG ONNXRUNTIME_VERSION=1.20.1
+# /usr/local/lib + ldconfig is the simpler of the two. ort
+# 2.0.0-rc.11 enforces onnxruntime >= 1.23.x at dylib load time
+# ("expected version >= '1.23.x'"), so 1.23.0 is the floor.
+ARG ONNXRUNTIME_VERSION=1.23.0
 RUN curl -sL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}.tgz" \
         | tar -xz -C /tmp \
     && cp -P "/tmp/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}/lib/"libonnxruntime.so* /usr/local/lib/ \
