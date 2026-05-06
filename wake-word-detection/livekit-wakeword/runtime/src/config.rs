@@ -15,13 +15,14 @@
 //!     for windows shorter than ~2 s, so the default is 2000.
 //!   * `WW_FEATURE_ONNX_DIR` / `WW_MEL_ONNX_PATH` /
 //!     `WW_EMBEDDING_ONNX_PATH` are new — they point at the mel and
-//!     embedding ONNX files. Defaults resolve into the train-side
-//!     uv venv (`train/.venv/lib/python3.12/site-packages/livekit/
-//!     wakeword/resources/`). Using the train artefacts directly
-//!     guarantees the runtime extracts features identically to how
-//!     the classifier was trained — bundling a frozen copy with the
-//!     Rust crate is what made the previous (tract-backed) runtime
-//!     prone to silent feature drift across upstream version bumps.
+//!     embedding ONNX files. At least one must be set; the Dockerfile
+//!     supplies `WW_FEATURE_ONNX_DIR=/opt/models` as the default mount
+//!     point so feature ONNX sits alongside the classifier ONNX
+//!     referenced by `WW_MODEL_PATHS`. Using the train artefacts
+//!     directly (rather than a frozen copy bundled into the binary)
+//!     is what guarantees the runtime extracts features identically
+//!     to how the classifier was trained — silent drift across
+//!     upstream version bumps was the failure mode this avoids.
 
 use anyhow::{anyhow, Context, Result};
 use std::net::SocketAddr;
@@ -50,14 +51,11 @@ pub struct Config {
     pub peak_log_floor: f32,
 }
 
-/// Default resources path inside the train-side uv venv. The Python
-/// `livekit-wakeword` package bundles the mel + embedding ONNX here,
-/// and `requires-python = "==3.12.*"` in `train/pyproject.toml` is
-/// what justifies pinning `python3.12` in the segment.
-const TRAIN_VENV_RESOURCES_REL: &str = concat!(
-    "wake-word-detection/livekit-wakeword/train/.venv/lib/python3.12/",
-    "site-packages/livekit/wakeword/resources",
-);
+/// Filenames inside `WW_FEATURE_ONNX_DIR`. These match what the
+/// upstream Python `livekit-wakeword` package ships under
+/// `livekit/wakeword/resources/`, so a bind-mount of that directory
+/// (or a COPY of those two files) into `WW_FEATURE_ONNX_DIR` works
+/// without renaming.
 const MEL_ONNX_FILENAME: &str = "melspectrogram.onnx";
 const EMBEDDING_ONNX_FILENAME: &str = "embedding_model.onnx";
 
@@ -129,57 +127,60 @@ impl Config {
     }
 }
 
-/// Resolve mel + embedding ONNX paths. Priority:
+/// Resolve mel + embedding ONNX paths from env vars. Priority:
 ///
-/// 1. `WW_MEL_ONNX_PATH` and `WW_EMBEDDING_ONNX_PATH` (individual override).
-/// 2. `WW_FEATURE_ONNX_DIR` / `<dir>/{melspectrogram,embedding_model}.onnx`.
-/// 3. Auto-resolve relative to `WW_REPO_ROOT` if set, else relative to
-///    the current working directory, looking for the train uv venv.
+/// 1. `WW_MEL_ONNX_PATH` / `WW_EMBEDDING_ONNX_PATH` (individual file
+///    paths). Each override falls back to the directory below if not
+///    set, so partial overrides are fine.
+/// 2. `WW_FEATURE_ONNX_DIR` joined with the upstream filenames
+///    (`melspectrogram.onnx`, `embedding_model.onnx`).
 ///
-/// Step 3 is the dev-loop default: training writes the venv, runtime
-/// picks it up without extra env vars. In Docker, set
-/// `WW_FEATURE_ONNX_DIR` to wherever the resources directory is
-/// mounted (or COPYed) — the volume mount is the recommended flow,
-/// see runtime/README.md.
+/// At least one of these must produce a path for both files. The
+/// Dockerfile sets `WW_FEATURE_ONNX_DIR=/opt/models` so the feature
+/// ONNX sits alongside the classifier ONNX (`WW_MODEL_PATHS`); local
+/// non-Docker runs need to export one of the env vars themselves —
+/// most commonly pointing at the train uv venv resources directory.
 fn resolve_feature_onnx_paths() -> Result<(PathBuf, PathBuf)> {
     let mel_override = std::env::var("WW_MEL_ONNX_PATH").ok();
     let emb_override = std::env::var("WW_EMBEDDING_ONNX_PATH").ok();
-    if let (Some(mel), Some(emb)) = (mel_override.as_ref(), emb_override.as_ref()) {
-        return Ok((PathBuf::from(mel), PathBuf::from(emb)));
-    }
+    let dir_env = std::env::var("WW_FEATURE_ONNX_DIR").ok();
 
-    let dir = if let Ok(d) = std::env::var("WW_FEATURE_ONNX_DIR") {
-        PathBuf::from(d)
-    } else {
-        let root = match std::env::var("WW_REPO_ROOT") {
-            Ok(v) => PathBuf::from(v),
-            Err(_) => std::env::current_dir()
-                .context("WW_REPO_ROOT unset and current_dir() failed")?,
-        };
-        root.join(TRAIN_VENV_RESOURCES_REL)
+    let mel = match (mel_override.as_ref(), dir_env.as_ref()) {
+        (Some(p), _) => PathBuf::from(p),
+        (None, Some(d)) => PathBuf::from(d).join(MEL_ONNX_FILENAME),
+        (None, None) => {
+            return Err(anyhow!(
+                "mel ONNX path unset. Set WW_MEL_ONNX_PATH or \
+                 WW_FEATURE_ONNX_DIR (e.g. /opt/models for the docker \
+                 image, or the train uv venv resources directory \
+                 locally)."
+            ));
+        }
     };
-
-    let mel = mel_override
-        .map(PathBuf::from)
-        .unwrap_or_else(|| dir.join(MEL_ONNX_FILENAME));
-    let emb = emb_override
-        .map(PathBuf::from)
-        .unwrap_or_else(|| dir.join(EMBEDDING_ONNX_FILENAME));
+    let emb = match (emb_override.as_ref(), dir_env.as_ref()) {
+        (Some(p), _) => PathBuf::from(p),
+        (None, Some(d)) => PathBuf::from(d).join(EMBEDDING_ONNX_FILENAME),
+        (None, None) => {
+            return Err(anyhow!(
+                "embedding ONNX path unset. Set WW_EMBEDDING_ONNX_PATH \
+                 or WW_FEATURE_ONNX_DIR."
+            ));
+        }
+    };
 
     if !mel.exists() {
         return Err(anyhow!(
-            "mel ONNX not found at {}. Set WW_MEL_ONNX_PATH or \
-             WW_FEATURE_ONNX_DIR, or run `uv sync` under \
-             wake-word-detection/livekit-wakeword/train/ to materialise \
-             the venv-bundled resources.",
+            "mel ONNX not found at {}. Check WW_MEL_ONNX_PATH / \
+             WW_FEATURE_ONNX_DIR, or that the file is mounted into \
+             the container.",
             mel.display()
         ));
     }
     if !emb.exists() {
         return Err(anyhow!(
-            "embedding ONNX not found at {}. Set WW_EMBEDDING_ONNX_PATH \
-             or WW_FEATURE_ONNX_DIR, or run `uv sync` under \
-             wake-word-detection/livekit-wakeword/train/.",
+            "embedding ONNX not found at {}. Check WW_EMBEDDING_ONNX_PATH \
+             / WW_FEATURE_ONNX_DIR, or that the file is mounted into \
+             the container.",
             emb.display()
         ));
     }

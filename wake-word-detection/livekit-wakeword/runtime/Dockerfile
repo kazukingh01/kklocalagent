@@ -45,16 +45,16 @@ COPY --from=builder /src/target/release/livekit-wakeword-runtime \
     /usr/local/bin/livekit-wakeword-runtime
 
 # WW_FEATURE_ONNX_DIR points at the directory containing the mel +
-# embedding ONNX. The expected workflow is to bind-mount the train uv
-# venv resources directory here so the runtime always uses the same
-# feature extractor that produced the trained classifier — see
-# runtime/README.md for the docker run / compose snippet. /opt/feature
-# is just a default mount point; override the env var if your mount
-# lives elsewhere.
+# embedding ONNX (filenames: melspectrogram.onnx, embedding_model.onnx).
+# Defaults to /opt/models so feature ONNX sits alongside the classifier
+# ONNX referenced by WW_MODEL_PATHS — one bind mount of the host's
+# train uv venv resources directory (or a hand-curated models dir)
+# covers everything. Override individually with WW_MEL_ONNX_PATH /
+# WW_EMBEDDING_ONNX_PATH if the layout doesn't match.
 ENV WW_MIC_URL=ws://audio-io:7010/mic?ts=1 \
     WW_ORCHESTRATOR_URL=http://orchestrator:7000/events \
     WW_MODEL_PATHS=/opt/models/hey_livekit.onnx \
-    WW_FEATURE_ONNX_DIR=/opt/feature \
+    WW_FEATURE_ONNX_DIR=/opt/models \
     WW_THRESHOLD=0.5 \
     WW_COOLDOWN_SEC=2.0 \
     WW_PREDICT_WINDOW_MS=2000 \

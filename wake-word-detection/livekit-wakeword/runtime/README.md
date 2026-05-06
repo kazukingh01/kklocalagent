@@ -9,22 +9,29 @@ sudo docker build -t kklocalagent/wake-word-detection:test .
 
 ## Run (standalone, test mode)
 
-The runtime needs the train-side feature ONNX (mel + embedding) at
-runtime — bind-mount the uv venv resources directory so the runtime
-uses the same feature extractor that produced the trained classifier.
-Sync the train env first if you haven't (`cd ../train && uv sync`).
+The runtime needs the train-side feature ONNX (mel + embedding,
+filenames `melspectrogram.onnx` and `embedding_model.onnx`) mounted
+into the container so it uses the same feature extractor that produced
+the trained classifier. The image defaults to `/opt/models` for both
+the classifier and the feature ONNX, so a single bind mount covers it
+all. Sync the train env first if you haven't (`cd ../train && uv sync`).
 
 ```sh
 TRAIN_RES=$(realpath ../train/.venv/lib/python3.12/site-packages/livekit/wakeword/resources)
 
+# One option: stage classifier + feature ONNX in $(pwd)/models, then
+# mount that single dir to /opt/models. Another is to mount the train
+# venv resources to /opt/models directly if it already contains the
+# classifier you want to test.
+mkdir -p models
+cp "${TRAIN_RES}/melspectrogram.onnx" "${TRAIN_RES}/embedding_model.onnx" models/
+
 sudo docker run --rm \
     --name ww-test \
     -v "$(pwd)/models:/opt/models:ro" \
-    -v "${TRAIN_RES}:/opt/feature:ro" \
     -e WW_MIC_URL=ws://$(ip route show | awk '/default/ {print $3}'):7010/mic \
     -e WW_SINK_MODE=dry-run \
     -e WW_MODEL_PATHS=/opt/models/my_phrase.onnx \
-    -e WW_FEATURE_ONNX_DIR=/opt/feature \
     -e WW_PEAK_LOG_INTERVAL_SEC=1.0 \
     -e WW_PEAK_LOG_FLOOR=0.01 \
     -e RUST_LOG=info,livekit_wakeword_runtime::detector=debug \
@@ -32,9 +39,11 @@ sudo docker run --rm \
     kklocalagent/wake-word-detection:test
 ```
 
-`WW_FEATURE_ONNX_DIR=/opt/feature` is the image default, so it can be
-omitted as long as the volume is mounted at that path. Override with
-`WW_MEL_ONNX_PATH` / `WW_EMBEDDING_ONNX_PATH` for individual files.
+The image defaults `WW_FEATURE_ONNX_DIR=/opt/models`, so as long as
+the two feature ONNX files exist at `/opt/models/{melspectrogram,
+embedding_model}.onnx` no extra env var is needed. Override
+individual paths with `WW_MEL_ONNX_PATH` / `WW_EMBEDDING_ONNX_PATH`
+if the layout differs.
 
 ## Run (compose cutover from openwakeword)
 
@@ -44,7 +53,7 @@ omitted as long as the volume is mounted at that path. Override with
 #   environment:
 #     WW_MODEL_PATHS: /opt/models/hey_livekit.onnx
 #   volumes:
-#     - ./wake-word-detection/livekit-wakeword/train/.venv/lib/python3.12/site-packages/livekit/wakeword/resources:/opt/feature:ro
+#     - ./path/to/models:/opt/models:ro   # contains classifier + mel/embedding ONNX
 #   (remove WW_MODELS, WW_INFERENCE_FRAMEWORK)
 
 docker compose up -d --build wake-word-detection
@@ -76,7 +85,7 @@ RUST_LOG=debug docker compose up wake-word-detection
 | `WW_MIC_URL` | `ws://audio-io:7010/mic` (the runtime appends `?ts=1` automatically; see below) |
 | `WW_ORCHESTRATOR_URL` | `http://orchestrator:7000/events` |
 | `WW_MODEL_PATHS` | `/opt/models/hey_livekit.onnx` |
-| `WW_FEATURE_ONNX_DIR` | `/opt/feature` (mount point for train venv `livekit/wakeword/resources/`) |
+| `WW_FEATURE_ONNX_DIR` | `/opt/models` (must contain `melspectrogram.onnx` + `embedding_model.onnx`) |
 | `WW_MEL_ONNX_PATH` | unset → `${WW_FEATURE_ONNX_DIR}/melspectrogram.onnx` |
 | `WW_EMBEDDING_ONNX_PATH` | unset → `${WW_FEATURE_ONNX_DIR}/embedding_model.onnx` |
 | `WW_THRESHOLD` | `0.5` |
