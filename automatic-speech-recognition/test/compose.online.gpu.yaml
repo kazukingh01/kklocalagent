@@ -1,0 +1,33 @@
+# GPU override on top of compose.online.yaml.
+#
+# Switches the ASR container from the upstream CPU image (`main`) to
+# the source-built CUDA variant (`main-cuda`) and reserves an NVIDIA
+# GPU. Use when the host has nvidia-container-toolkit set up and you
+# want CUDA-accelerated whisper.cpp for the live mic smoke test.
+#
+# Run from this directory:
+#   sudo WINDOWS_HOST=$(ip route show | awk '/default/ {print $3; exit}') \
+#       docker compose -f compose.online.yaml -f compose.online.gpu.yaml up --build
+
+services:
+  automatic-speech-recognition:
+    build:
+      args:
+        WHISPER_VARIANT: main-cuda
+    environment:
+      # Tell nvidia-container-toolkit which driver libs to mount.
+      # whisper.cpp's upstream `main-cuda` image (and our source build
+      # of it) doesn't preset these, and recent toolkit versions skip
+      # mounting libcuda/libnvidia-ml when these are unset — leading
+      # to `ggml_cuda_init: no CUDA-capable device is detected` even
+      # though `deploy.resources` did request a GPU. Mirrors the root
+      # compose.yaml's ASR block.
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

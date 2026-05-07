@@ -1,72 +1,58 @@
 # automatic-speech-recognition
 
-Whisper.cpp server packaged for kklocalagent. Wraps the upstream
-`ghcr.io/ggml-org/whisper.cpp:main` (or `main-cuda` / `main-intel` /
-`main-musa`) image and exposes the HTTP `/inference` endpoint on port
-8080. The upstream image bundles all binaries — our entrypoint just
-points at `/app/build/bin/whisper-server`.
+whisper.cpp サーバを kklocalagent 用にパッケージしたもの。
+`ghcr.io/ggml-org/whisper.cpp` を thin-wrap し `/inference` を公開。
 
-## Build
+# Test
 
-```bash
-# CPU (default)
-docker build -t kklocalagent/asr automatic-speech-recognition
+```text
+[offline]
+mic-stub ── ws://mic-stub:7010/mic ──► vad ── POST /inference (WAV) ──► asr
 
-# CUDA — requires NVIDIA Container Toolkit at run time
-docker build --build-arg WHISPER_VARIANT=main-cuda \
-    -t kklocalagent/asr:cuda automatic-speech-recognition
+[online]
+audio-io (Windows) ── ws://${WINDOWS_HOST}:7010/mic ──► vad ── POST /inference (WAV) ──► asr
 ```
 
-## Fetch a model
-
-Models live in `automatic-speech-recognition/models/` (gitignored) and
-are bind-mounted into the container at `/models`.
+## Setup
 
 ```bash
-cd automatic-speech-recognition
-./fetch-models.sh                    # ggml-tiny.bin (~75 MB)
-./fetch-models.sh ggml-base.bin      # other names work too
-./fetch-models.sh ggml-small.bin
+bash ./fetch-models.sh ggml-small-q8_0.bin    # ~250 MB into ./models
 ```
-
-## Run
 
 ```bash
-docker run --rm -p 7040:8080 \
-    -v "$(pwd)/automatic-speech-recognition/models:/models:ro" \
-    -e WHISPER_MODEL=ggml-tiny.bin \
-    -e WHISPER_LANGUAGE=auto \
-    kklocalagent/asr
+# Synthesize a Japanese test wav into test/samples (~270 KB).
+# Uses gTTS in a one-shot docker container; needs internet.
+bash ./test/fetch-sample-ja.sh
 ```
 
-Env vars consumed by `entrypoint.sh`:
-
-| name | default | purpose |
-|---|---|---|
-| `WHISPER_MODEL` | `ggml-tiny.bin` | file name under `/models` |
-| `WHISPER_LANGUAGE` | `auto` | `whisper-server --language` value (e.g. `ja`, `en`, `auto`) |
-| `WHISPER_THREADS` | `4` | `whisper-server --threads`. Bump for heavy models but rarely past the host's *physical* core count — Hyperthreading hurts whisper.cpp's cache locality. |
-
-## HTTP API
-
-Inherited from whisper.cpp's `whisper-server`:
-
-| Method | Path | Description |
-|---|---|---|
-| GET | `/` | health / info page |
-| POST | `/inference` | multipart upload (`file=@audio.wav`) → JSON transcription |
-| POST | `/load` | hot-swap model |
+## Offline
 
 ```bash
-# Smoke test the running container.
-curl http://127.0.0.1:7040/inference \
-    -F file=@some-audio.wav \
-    -F response_format=json
-# -> {"text":"..."}
+sudo docker compose -f ./test/compose.offline.yaml up --build
 ```
 
-## End-to-end test (audio-io ↔ vad ↔ asr)
+以下の log が表示されるはず
 
-A self-contained compose stack lives under `test/` that wires a wav
-playback stub (substituting for `audio-io`, which is Windows native) →
-`voice-activity-detection` → this service. See `test/README.md`.
+```text
+kklocalagent-test-vad       | 2026-05-07T16:08:28.419211Z  INFO vad::asr: [asr <-] transcription: "こんにちは私はクロードです これは音声認識のテストです\n今日は良い天気ですね"
+```
+
+## Online
+
+```bash
+sudo WINDOWS_HOST=$(ip route show | awk '/default/ {print $3; exit}') docker compose -f ./test/compose.online.yaml up --build
+```
+
+```bash
+sudo WINDOWS_HOST=$(ip route show | awk '/default/ {print $3; exit}') \
+    docker compose -f ./test/compose.online.yaml -f ./test/compose.online.gpu.yaml \
+    up --build
+```
+
+# Envs
+
+| Var | Default |
+|---|---|
+| `WHISPER_MODEL` | `ggml-tiny.bin` (`/models` 下のファイル名) |
+| `WHISPER_LANGUAGE` | `auto` (`ja` / `en` / `auto`) |
+| `WHISPER_THREADS` | `4` |
