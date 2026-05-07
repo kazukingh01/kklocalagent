@@ -181,7 +181,7 @@ services:
     # does not call this directly. Port 7060 is published so manual
     # /audio_query + /synthesis calls from the host still work.
     build:
-      context: ./text-to-speech
+      context: ./text-to-speech/engine/voicevox
     container_name: kklocalagent-tts
     restart: unless-stopped
     ports:

@@ -105,7 +105,7 @@ services:
 
   text-to-speech:
     build:
-      context: ../../../text-to-speech
+      context: ../../../text-to-speech/engine/voicevox
     container_name: kklocalagent-test-int-tts
 
   tts-streamer:
