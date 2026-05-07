@@ -110,7 +110,7 @@ services:
 
   tts-streamer:
     build:
-      context: ../../../tts-streamer
+      context: ../../../text-to-speech/streamer
     container_name: kklocalagent-test-int-tts-streamer
     environment:
       VOICEVOX_URL: http://text-to-speech:50021

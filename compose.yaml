@@ -193,7 +193,7 @@ services:
     # mono, and streams the frames over WS to audio-io's /spk endpoint
     # on the Windows host.
     build:
-      context: ./tts-streamer
+      context: ./text-to-speech/streamer
     container_name: kklocalagent-tts-streamer
     restart: unless-stopped
     environment:
