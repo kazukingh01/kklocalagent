@@ -59,6 +59,7 @@ ENV WW_MIC_URL=ws://audio-io:7010/mic?ts=1 \
     WW_THRESHOLD=0.5 \
     WW_COOLDOWN_SEC=2.0 \
     WW_PREDICT_WINDOW_MS=2000 \
+    WW_PREDICT_INTERVAL_MS=100 \
     WW_LISTEN=0.0.0.0:7030 \
     WW_SINK_MODE=orchestrator
 

@@ -1,20 +1,31 @@
-//! Ring buffer + predict loop. predict() needs ~2 s of audio (returns
-//! all-zero scores below that), so we hold the last
-//! `WW_PREDICT_WINDOW_MS` worth in a `VecDeque` and call predict every
-//! 80 ms once warm. 80 ms is the model's own embedding stride —
-//! calling more often is wasted CPU.
+//! Two-task split: an *ingester* keeps a shared ring buffer of the
+//! latest `WW_PREDICT_WINDOW_MS` of audio always up to date, and a
+//! *predictor* fires on a wallclock timer (`WW_PREDICT_INTERVAL_MS`,
+//! default 100 ms), snapshots the ring, and runs inference. Both
+//! tasks are independent, so a slow predict no longer stalls the WS
+//! drain — frames keep flowing into the ring while predict is busy.
+//!
+//! Skip semantics:
+//!   * Predict still running when the next tick fires → tick is
+//!     coalesced via `MissedTickBehavior::Skip` (the predictor is
+//!     a single task, so two predicts can never overlap by
+//!     construction).
+//!   * Ring not yet full (warm-up under `predict_window_ms`) → the
+//!     predictor returns to its tick loop without invoking the model.
 //!
 //! `WakeWordModel::predict` requires `&mut self` and is sync, so the
-//! call goes inside `tokio::task::spawn_blocking`. The mutex is
-//! single-writer (this task is the only locker) so contention is zero.
+//! call still goes through `tokio::task::spawn_blocking`. The model
+//! mutex is single-locker (only the predictor task takes it) so it
+//! exists purely to satisfy `Send`/`'static` for the spawn.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
+use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, info, trace, warn};
 
 use crate::config::Config;
@@ -24,14 +35,18 @@ use crate::{Detection, MicFrame};
 /// audio-io always emits at this rate; the model is configured to match.
 const SAMPLE_RATE_HZ: u32 = 16_000;
 
-/// 80 ms hop. The embedding stride is also 80 ms, so calling predict()
-/// more often than this is wasted work — the model has nothing new to
-/// ingest.
-const HOP_SAMPLES: usize = 1280;
+/// Shared rolling buffer. `latest_end_epoch_ns` mirrors the most
+/// recently appended frame's stamp so the predictor can compute lag
+/// off a snapshot without holding the lock.
+struct Ring {
+    samples: VecDeque<i16>,
+    capacity: usize,
+    latest_end_epoch_ns: u64,
+}
 
 pub async fn run(
     cfg: Config,
-    mut rx: mpsc::Receiver<MicFrame>,
+    rx: mpsc::Receiver<MicFrame>,
     tx: mpsc::Sender<Detection>,
     model_loaded: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -53,81 +68,123 @@ pub async fn run(
         threshold = cfg.threshold,
         cooldown_ms = cfg.cooldown.as_millis() as u64,
         window_ms = cfg.predict_window_ms,
+        interval_ms = cfg.predict_interval_ms,
         "model loaded"
     );
 
-    let window_samples =
-        (cfg.predict_window_ms as usize) * (SAMPLE_RATE_HZ as usize) / 1000;
-    let mut ring: VecDeque<i16> = VecDeque::with_capacity(window_samples);
-    let mut samples_since_predict: usize = 0;
+    let capacity = (cfg.predict_window_ms as usize) * (SAMPLE_RATE_HZ as usize) / 1000;
+    let ring = Arc::new(std::sync::Mutex::new(Ring {
+        samples: VecDeque::with_capacity(capacity),
+        capacity,
+        latest_end_epoch_ns: 0,
+    }));
+
+    let h_ingest = tokio::spawn(ingest(rx, Arc::clone(&ring)));
+    let h_predict = tokio::spawn(predict_loop(
+        cfg.clone(),
+        Arc::clone(&ring),
+        Arc::clone(&model),
+        tx,
+    ));
+
+    // Either task ending means we're done. The ingester only exits on
+    // ws_client dropping its sender (shutdown), and the predictor only
+    // exits on event_sink dropping its receiver — both are shutdown
+    // signals, so propagating the first one out is correct.
+    tokio::select! {
+        r = h_ingest => match r {
+            Ok(()) => Ok(()),
+            Err(e) => Err(anyhow!("ingest task panicked: {e}")),
+        },
+        r = h_predict => match r {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(anyhow!("predict task panicked: {e}")),
+        },
+    }
+}
+
+/// Drain the ws_client mpsc into the shared ring. Drops oldest
+/// samples to keep the ring at exactly `capacity`. Holds the mutex
+/// only for the push/pop — never across `.await`.
+async fn ingest(mut rx: mpsc::Receiver<MicFrame>, ring: Arc<std::sync::Mutex<Ring>>) {
+    while let Some(frame) = rx.recv().await {
+        let n = frame.samples.len();
+        let frame_end = frame.end_epoch_ns;
+        let ring_len = {
+            let mut r = ring.lock().expect("ring poisoned");
+            let overflow = r.samples.len() + n;
+            if overflow > r.capacity {
+                for _ in 0..(overflow - r.capacity) {
+                    r.samples.pop_front();
+                }
+            }
+            r.samples.extend(frame.samples);
+            r.latest_end_epoch_ns = frame_end;
+            r.samples.len()
+        };
+        let audio_lag_ms = ns_diff_ms(epoch_ns_now(), frame_end);
+        trace!(
+            chunk_samples = n,
+            ring_len = ring_len,
+            frame_end_epoch_ns = frame_end,
+            audio_lag_ms = audio_lag_ms,
+            "chunk consumed"
+        );
+    }
+}
+
+/// Wallclock-driven predict loop. Snapshots the ring, runs predict
+/// off-thread, then handles the cooldown / threshold / peak-log
+/// bookkeeping. A slow predict only delays *its own* next tick (via
+/// `MissedTickBehavior::Skip`); the ingester keeps draining the WS
+/// the whole time.
+async fn predict_loop(
+    cfg: Config,
+    ring: Arc<std::sync::Mutex<Ring>>,
+    model: Arc<std::sync::Mutex<WakeWordModel>>,
+    tx: mpsc::Sender<Detection>,
+) -> Result<()> {
+    let mut tick = interval(Duration::from_millis(cfg.predict_interval_ms as u64));
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
     let mut last_fire: Option<Instant> = None;
     let mut peak_score: f32 = 0.0;
     let mut peak_model: String = String::new();
     let mut last_peak_log = Instant::now();
 
-    // Diagnostic counters. `total_samples` doubles as a sample-index
-    // for the audio timeline; combined with the per-frame epoch_ns
-    // header from audio-io, we can express both "how fresh is this
-    // frame" (now − end_epoch_ns) and "how stale was the window when
-    // we predicted on it" (now − window_end_epoch_ns).
-    let mut total_samples: u64 = 0;
-    let mut predict_n: u64 = 0;
-    let frame_ns_per_sample: u64 = 1_000_000_000 / SAMPLE_RATE_HZ as u64;
+    loop {
+        tick.tick().await;
 
-    while let Some(frame) = rx.recv().await {
-        let n = frame.samples.len();
-        total_samples += n as u64;
-        let window_end_epoch_ns = frame.end_epoch_ns;
-
-        let overflow = ring.len() + n;
-        if overflow > window_samples {
-            for _ in 0..(overflow - window_samples) {
-                ring.pop_front();
+        // Snapshot under brief lock. Skip if the ring hasn't reached
+        // the configured window yet — the model returns all-zero
+        // scores below ~2 s, so calling predict() during warm-up is
+        // pure overhead.
+        let (snapshot, window_end_epoch_ns) = {
+            let r = ring.lock().expect("ring poisoned");
+            if r.samples.len() < r.capacity {
+                continue;
             }
-        }
-        ring.extend(frame.samples);
-        samples_since_predict += n;
+            (
+                r.samples.iter().copied().collect::<Vec<i16>>(),
+                r.latest_end_epoch_ns,
+            )
+        };
 
-        let now_ns = epoch_ns_now();
-        let audio_lag_ms = ns_diff_ms(now_ns, window_end_epoch_ns);
-        trace!(
-            chunk_samples = n,
-            ring_len = ring.len(),
-            total_samples = total_samples,
-            samples_since_predict = samples_since_predict,
-            frame_end_epoch_ns = window_end_epoch_ns,
-            audio_lag_ms = audio_lag_ms,
-            "chunk consumed"
-        );
-
-        // Warm-up: predict() returns all zeros for windows < ~2 s, so
-        // there is no point calling it before the ring is full.
-        if ring.len() < window_samples {
-            continue;
-        }
-        if samples_since_predict < HOP_SAMPLES {
-            continue;
-        }
-        samples_since_predict = 0;
-
-        let window_start_epoch_ns = window_end_epoch_ns
-            .saturating_sub((ring.len() as u64) * frame_ns_per_sample);
+        let audio_lag_ms = ns_diff_ms(epoch_ns_now(), window_end_epoch_ns);
         debug!(
-            predict_n = predict_n,
-            window_samples = ring.len(),
-            window_start_epoch_ns = window_start_epoch_ns,
+            window_samples = snapshot.len(),
             window_end_epoch_ns = window_end_epoch_ns,
             audio_lag_ms = audio_lag_ms,
             "predict START"
         );
         let predict_started = Instant::now();
 
-        let window_vec: Vec<i16> = ring.iter().copied().collect();
         let model_clone = Arc::clone(&model);
         let scores: HashMap<String, f32> =
             match tokio::task::spawn_blocking(move || {
-                let mut m = model_clone.lock().expect("predict mutex poisoned");
-                m.predict(&window_vec)
+                let mut m = model_clone.lock().expect("model mutex poisoned");
+                m.predict(&snapshot)
             })
             .await
             {
@@ -143,20 +200,13 @@ pub async fn run(
             };
 
         let predict_dur_ms = predict_started.elapsed().as_millis() as u64;
-        // End-to-end lag = "now" minus the mic time of the *last* sample
-        // in the window we just scored. This is the number to watch
-        // against the 1 s budget: it includes audio-io capture-to-WS,
-        // network/loopback, mpsc, ring append, hop wait, and predict
-        // itself. Anything else (event_sink HTTP) is downstream of this.
         let e2e_lag_ms = ns_diff_ms(epoch_ns_now(), window_end_epoch_ns);
         debug!(
-            predict_n = predict_n,
             duration_ms = predict_dur_ms,
             e2e_lag_ms = e2e_lag_ms,
             scores = ?scores,
             "predict DONE"
         );
-        predict_n += 1;
 
         let now = Instant::now();
         let in_cooldown = last_fire
@@ -183,12 +233,12 @@ pub async fn run(
                 }
             }
 
-            if let Some(interval) = cfg.peak_log_interval {
+            if let Some(interval_dur) = cfg.peak_log_interval {
                 update_peak(&mut peak_score, &mut peak_model, name, score);
-                if now.duration_since(last_peak_log) >= interval {
+                if now.duration_since(last_peak_log) >= interval_dur {
                     if peak_score >= cfg.peak_log_floor {
                         info!(
-                            interval_sec = interval.as_secs_f32(),
+                            interval_sec = interval_dur.as_secs_f32(),
                             model = %peak_model,
                             score = peak_score,
                             threshold = cfg.threshold,
@@ -202,7 +252,6 @@ pub async fn run(
             }
         }
     }
-    Ok(())
 }
 
 fn epoch_ns_now() -> u64 {
@@ -234,7 +283,6 @@ fn update_peak(peak_score: &mut f32, peak_model: &mut String, name: &str, score:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
     fn update_peak_replaces_on_higher_score() {

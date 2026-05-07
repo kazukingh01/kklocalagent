@@ -91,6 +91,7 @@ RUST_LOG=debug docker compose up wake-word-detection
 | `WW_THRESHOLD` | `0.5` |
 | `WW_COOLDOWN_SEC` | `2.0` |
 | `WW_PREDICT_WINDOW_MS` | `2000` |
+| `WW_PREDICT_INTERVAL_MS` | `100` (predict cadence; predictor task fires on this wallclock interval) |
 | `WW_LISTEN` | `0.0.0.0:7030` |
 | `WW_SINK_MODE` | `orchestrator` |
 | `WW_PEAK_LOG_INTERVAL_SEC` | `0` |

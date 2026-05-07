@@ -45,6 +45,7 @@ pub struct Config {
     pub threshold: f32,
     pub cooldown: Duration,
     pub predict_window_ms: u32,
+    pub predict_interval_ms: u32,
     pub listen_addr: SocketAddr,
     pub sink_mode: SinkMode,
     pub peak_log_interval: Option<Duration>,
@@ -85,6 +86,10 @@ impl Config {
         let threshold = parse_env_f32("WW_THRESHOLD", 0.5)?;
         let cooldown = Duration::from_secs_f32(parse_env_f32("WW_COOLDOWN_SEC", 2.0)?);
         let predict_window_ms = parse_env_u32("WW_PREDICT_WINDOW_MS", 2000)?;
+        let predict_interval_ms = parse_env_u32("WW_PREDICT_INTERVAL_MS", 100)?;
+        if predict_interval_ms == 0 {
+            return Err(anyhow!("WW_PREDICT_INTERVAL_MS must be > 0"));
+        }
 
         let listen_str =
             std::env::var("WW_LISTEN").unwrap_or_else(|_| "0.0.0.0:7030".to_string());
@@ -119,6 +124,7 @@ impl Config {
             threshold,
             cooldown,
             predict_window_ms,
+            predict_interval_ms,
             listen_addr,
             sink_mode,
             peak_log_interval,
