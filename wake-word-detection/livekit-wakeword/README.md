@@ -26,9 +26,9 @@ For WSL2
 sudo docker run --rm \
     --name ww-test \
     -v "$(pwd)/models:/opt/models:ro" \
-    -e WW_MIC_URL=ws://$(ip route show | awk '/default/ {print $3}'):7010/mic \
+    -e WW_MIC_URL=ws://$(ip route show | awk '/default/ {print $3}'):7010/mic?ts=1 \
     -e WW_SINK_MODE=dry-run \
-    -e WW_MODEL_PATHS=/opt/models/xxxxxx.onnx \
+    -e WW_MODELS=xxxxxx.onnx \
     -e WW_PEAK_LOG_INTERVAL_SEC=1.0 \
     -e WW_PEAK_LOG_FLOOR=0.01 \
     -e RUST_LOG=info,livekit_wakeword_runtime::detector=debug \
@@ -42,9 +42,9 @@ For Linux
 sudo docker run --rm \
     --name ww-test --network=host \
     -v "$(pwd)/models:/opt/models:ro" \
-    -e WW_MIC_URL=ws://127.0.0.1:7010/mic \
+    -e WW_MIC_URL=ws://127.0.0.1:7010/mic?ts=1 \
     -e WW_SINK_MODE=dry-run \
-    -e WW_MODEL_PATHS=/opt/models/xxxxxx.onnx \
+    -e WW_MODELS=xxxxxx.onnx \
     -e WW_PEAK_LOG_INTERVAL_SEC=1.0 \
     -e WW_PEAK_LOG_FLOOR=0.01 \
     -e RUST_LOG=info,livekit_wakeword_runtime::detector=debug \
@@ -54,16 +54,12 @@ sudo docker run --rm \
 
 #### Envs
 
-## Environment
-
 | Var | Default |
 |---|---|
-| `WW_MIC_URL` | `ws://audio-io:7010/mic` (the runtime appends `?ts=1` automatically; see below) |
+| `WW_MIC_URL` | `ws://audio-io:7010/mic?ts=1` (`?ts=1` enables the per-frame epoch-ns header for `e2e_lag_ms`; auto-appended if you override without it) |
 | `WW_ORCHESTRATOR_URL` | `http://orchestrator:7000/events` |
-| `WW_MODEL_PATHS` | `/opt/models/hey_livekit.onnx` |
-| `WW_FEATURE_ONNX_DIR` | `/opt/models` (must contain `melspectrogram.onnx` + `embedding_model.onnx`) |
-| `WW_MEL_ONNX_PATH` | unset → `${WW_FEATURE_ONNX_DIR}/melspectrogram.onnx` |
-| `WW_EMBEDDING_ONNX_PATH` | unset → `${WW_FEATURE_ONNX_DIR}/embedding_model.onnx` |
+| `WW_MODELS` | `hey_livekit.onnx` (comma-separated classifier ONNX **filenames** under `WW_MODELS_DIR`) |
+| `WW_MODELS_DIR` | `/opt/models` — must contain the classifier ONNX(s) named in `WW_MODELS` plus `melspectrogram.onnx` + `embedding_model.onnx` (filenames hardcoded). |
 | `WW_THRESHOLD` | `0.5` |
 | `WW_COOLDOWN_SEC` | `2.0` |
 | `WW_PREDICT_WINDOW_MS` | `2000` |

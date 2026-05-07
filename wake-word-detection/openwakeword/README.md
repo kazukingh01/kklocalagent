@@ -17,8 +17,10 @@
 | `WW_THRESHOLD` | `0.5` |
 | `WW_COOLDOWN_SEC` | `2.0` |
 | `WW_INFERENCE_FRAMEWORK` | `tflite` |
-| `WW_PORT` | `7030` |
+| `WW_LISTEN` | `0.0.0.0:7030` |
 | `WW_SINK_MODE` | `orchestrator` |
+| `WW_PEAK_LOG_INTERVAL_SEC` | `0.0` |
+| `WW_PEAK_LOG_FLOOR` | `0.05` |
 
 ## Test
 

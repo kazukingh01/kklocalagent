@@ -284,7 +284,9 @@ services:
     # path is hard-coded here rather than parameterised via .env. To
     # swap to the Rust runtime:
     #   1. change `context:` below to `./wake-word-detection/livekit-wakeword/runtime`
-    #   2. rename `WW_MODELS` → `WW_MODEL_PATHS` (file paths, not bare names)
+    #   2. set `WW_MODELS` to a classifier ONNX filename (resolved
+    #      against `WW_MODELS_DIR`, default `/opt/models`); openwakeword
+    #      reads bundled names from the same var.
     #   3. delete the `WW_INFERENCE_FRAMEWORK` line (only one backend)
     #   4. `docker compose up -d --build wake-word-detection`
     # Roll back by reverting the same edits. See

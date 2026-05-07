@@ -88,7 +88,12 @@ class Shim:
         # is interesting; below is treated as silence.
         self.peak_log_floor = env_float("WW_PEAK_LOG_FLOOR", 0.05)
         self.framework = os.environ.get("WW_INFERENCE_FRAMEWORK", "tflite")
-        self.port = env_int("WW_PORT", 7030)
+        listen_str = os.environ.get("WW_LISTEN", "0.0.0.0:7030")
+        host, _, port_str = listen_str.rpartition(":")
+        if not host or not port_str:
+            raise SystemExit(f"WW_LISTEN must be host:port, got {listen_str!r}")
+        self.listen_host = host
+        self.listen_port = int(port_str)
         self.sink_mode = os.environ.get("WW_SINK_MODE", "orchestrator").lower()
         if self.sink_mode not in VALID_SINK_MODES:
             raise SystemExit(
@@ -283,9 +288,9 @@ class Shim:
         # observes.
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", self.port)
+        site = web.TCPSite(runner, self.listen_host, self.listen_port)
         await site.start()
-        log.info("http server on :%d", self.port)
+        log.info("http server on %s:%d", self.listen_host, self.listen_port)
 
 
 async def main() -> None:

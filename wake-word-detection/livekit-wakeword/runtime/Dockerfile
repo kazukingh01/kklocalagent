@@ -45,17 +45,14 @@ RUN mkdir -p ${WW_MODELS_DIR} \
 COPY --from=builder /src/target/release/livekit-wakeword-runtime \
     /usr/local/bin/livekit-wakeword-runtime
 
-# WW_FEATURE_ONNX_DIR points at the directory containing the mel +
-# embedding ONNX (filenames: melspectrogram.onnx, embedding_model.onnx).
-# Defaults to /opt/models so feature ONNX sits alongside the classifier
-# ONNX referenced by WW_MODEL_PATHS — one bind mount of the host's
-# train uv venv resources directory (or a hand-curated models dir)
-# covers everything. Override individually with WW_MEL_ONNX_PATH /
-# WW_EMBEDDING_ONNX_PATH if the layout doesn't match.
+# WW_MODELS_DIR (set above) is the single directory containing both
+# classifier ONNX(s) named in WW_MODELS *and* the upstream
+# melspectrogram.onnx + embedding_model.onnx (filenames are hardcoded).
+# One bind mount of the host's train uv venv resources directory (or
+# a hand-curated models dir) covers everything.
 ENV WW_MIC_URL=ws://audio-io:7010/mic?ts=1 \
     WW_ORCHESTRATOR_URL=http://orchestrator:7000/events \
-    WW_MODEL_PATHS=/opt/models/hey_livekit.onnx \
-    WW_FEATURE_ONNX_DIR=/opt/models \
+    WW_MODELS=hey_livekit.onnx \
     WW_THRESHOLD=0.5 \
     WW_COOLDOWN_SEC=2.0 \
     WW_PREDICT_WINDOW_MS=2000 \
