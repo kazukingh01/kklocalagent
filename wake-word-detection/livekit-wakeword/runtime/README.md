@@ -23,6 +23,7 @@ TRAIN_RES=$(realpath ../train/.venv/lib/python3.12/site-packages/livekit/wakewor
 # mount that single dir to /opt/models. Another is to mount the train
 # venv resources to /opt/models directly if it already contains the
 # classifier you want to test.
+# wake-word-detection/livekit-wakeword/train/.venv/lib/python3.12/site-packages/livekit/wakeword/resources/{melspectrogram,embedding_model}.onnx
 mkdir -p models
 cp "${TRAIN_RES}/melspectrogram.onnx" "${TRAIN_RES}/embedding_model.onnx" models/
 
@@ -30,6 +31,22 @@ sudo docker run --rm \
     --name ww-test \
     -v "$(pwd)/models:/opt/models:ro" \
     -e WW_MIC_URL=ws://$(ip route show | awk '/default/ {print $3}'):7010/mic \
+    -e WW_SINK_MODE=dry-run \
+    -e WW_MODEL_PATHS=/opt/models/my_phrase.onnx \
+    -e WW_PEAK_LOG_INTERVAL_SEC=1.0 \
+    -e WW_PEAK_LOG_FLOOR=0.01 \
+    -e RUST_LOG=info,livekit_wakeword_runtime::detector=debug \
+    -p 7030:7030 \
+    kklocalagent/wake-word-detection:test
+```
+
+For Linux
+
+```bash
+sudo docker run --rm \
+    --name ww-test --network=host \
+    -v "$(pwd)/models:/opt/models:ro" \
+    -e WW_MIC_URL=ws://127.0.0.1:7010/mic \
     -e WW_SINK_MODE=dry-run \
     -e WW_MODEL_PATHS=/opt/models/my_phrase.onnx \
     -e WW_PEAK_LOG_INTERVAL_SEC=1.0 \
