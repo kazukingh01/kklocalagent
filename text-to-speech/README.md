@@ -12,6 +12,6 @@ text-to-speech/
 | Layer | Subdir | Status |
 |---|---|---|
 | engine | [`engine/voicevox/`](./engine/voicevox/) | current default |
-| streamer | [`streamer/`](./streamer/) | (TODO Phase 2) |
+| streamer | [`streamer/`](./streamer/) | Rust impl |
 
 詳細・コマンドは各 subdir の README を参照。
