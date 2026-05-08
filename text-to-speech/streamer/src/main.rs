@@ -34,7 +34,7 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::AbortHandle;
-use tokio::time::{sleep, timeout};
+use tokio::time::{sleep, timeout, Instant};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
@@ -51,6 +51,16 @@ struct Config {
     voicevox_speed_scale: f32,
     spk_url: Option<String>,
     audio_io_base: Option<String>,
+    /// Wall-clock interval (ms) between consecutive WS sends after the
+    /// initial prebuffer burst. Default = 500 ms = exactly the per-batch
+    /// audio length (= realtime). Set lower than 500 to overrate the
+    /// wire and compensate for measured environment drift; e.g. on a
+    /// WSL2/Docker host where audio-io's cpal hardware clock outpaces
+    /// the streamer's wall-clock by ~10 %, set WS_PACING_MS=450 to send
+    /// ~11 % faster than realtime and keep audio-io's ring topped up.
+    /// Setting higher than 500 underrates → audio-io ring drains and
+    /// underruns; only useful for debugging.
+    ws_pacing_ms: u64,
 }
 
 impl Config {
@@ -68,6 +78,10 @@ impl Config {
                 .context("invalid VOICEVOX_SPEED_SCALE")?,
             spk_url: env::var("SPK_URL").ok().filter(|s| !s.is_empty()),
             audio_io_base: env::var("AUDIO_IO_BASE").ok().filter(|s| !s.is_empty()),
+            ws_pacing_ms: env::var("WS_PACING_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(500),
         })
     }
 }
@@ -114,6 +128,7 @@ async fn main() -> Result<()> {
         voicevox = %cfg.voicevox_url,
         spk = cfg.spk_url.as_deref().unwrap_or("(unset)"),
         speaker = cfg.voicevox_speaker,
+        ws_pacing_ms = cfg.ws_pacing_ms,
         "tts-streamer starting"
     );
 
@@ -293,6 +308,7 @@ async fn speak_one(state: AppState, text: String) -> Result<Value> {
     // write. Failures here are non-fatal — older audio-io builds
     // without /start still accept frames.
     if let Some(base) = state.cfg.audio_io_base.as_deref() {
+        let t = Instant::now();
         match state
             .http
             .post(format!("{}/start", base))
@@ -303,10 +319,16 @@ async fn speak_one(state: AppState, text: String) -> Result<Value> {
             Ok(_) => {}
             Err(e) => warn!("POST /start failed ({}); continuing", e),
         }
+        info!(elapsed_ms = t.elapsed().as_millis() as u64, "POST /start done");
     }
 
     let spk_url = state.cfg.spk_url.as_deref().unwrap();
-    let sent = push_to_spk(spk_url, &pcm).await?;
+    let push_t = Instant::now();
+    let sent = push_to_spk(spk_url, &pcm, state.cfg.ws_pacing_ms).await?;
+    info!(
+        elapsed_ms = push_t.elapsed().as_millis() as u64,
+        "push_to_spk returned"
+    );
     info!(sent, target = spk_url, "streamed");
 
     Ok(json!({
@@ -426,40 +448,228 @@ fn parse_wav_pcm(bytes: &[u8]) -> Result<Vec<u8>> {
     data.ok_or_else(|| anyhow!("WAV has no data chunk"))
 }
 
-/// Stream `pcm` to audio-io's /spk WS in 20 ms frames, paced.
+/// Stream `pcm` to audio-io's /spk WS at wall-clock cadence, with
+/// pacing and WS send running as concurrent halves of this task.
 ///
-/// Returns when the last frame has been sent — does NOT wait for
-/// audio-io's playback ring to drain. The drain handshake is factored
-/// into /finalize so a mid-turn /speak doesn't block the next one:
-/// audio-io's ring keeps feeding the cpal callback while the next
-/// sentence's PCM is being pushed in, so the speaker hears continuous
-/// audio with no inter-sentence silence gaps.
-async fn push_to_spk(spk_url: &str, pcm: &[u8]) -> Result<usize> {
-    let (mut ws, _resp) = tokio_tungstenite::connect_async(spk_url)
+/// Two concerns drive the structure:
+///
+///   1. **Batching to 100 ms / message** (FRAMES_PER_BATCH = 5).
+///      Amortizes per-send overhead and gives the pacing loop a 100 ms
+///      budget per cycle instead of 20 ms — small TCP/WS hiccups no
+///      longer eat the entire window.
+///   2. **Decoupling pacing from network send** via an in-task mpsc.
+///      A serial `sleep_until → ws.send().await → repeat` loop
+///      (everything in one future) is *sequential*: any 150 ms
+///      WSL2/Docker TCP spike inside `ws.send()` blocks the next
+///      `sleep_until` from even being entered, so the spike's full
+///      duration is added to every later batch's arrival time at
+///      audio-io. The cpal ring drains permanently and the
+///      `unwrap_or(0.0)` silence fallback bleeds zero-samples →
+///      audible buzz / non-smooth voice on long utterances. With a
+///      channel in between, a stall just backs up 1–2 batches in the
+///      queue; the pacing future keeps hitting its absolute deadlines
+///      and the writer future catches up the moment the network
+///      releases.
+///
+/// `tokio::join!` runs both futures inside the *same* task so they
+/// share its cancellation (barge-in via speak_one's abort tears down
+/// the WS write immediately — a detached `tokio::spawn` would leak
+/// queued batches past /spk/stop).
+///
+/// Returns when the last batch has been sent — does NOT wait for
+/// audio-io's ring to drain (that's /finalize's job).
+async fn push_to_spk(spk_url: &str, pcm: &[u8], cadence_ms: u64) -> Result<usize> {
+    // 500 ms-per-batch + 5 s prebuffer + audio-io ring of 10 s.
+    //
+    // Sized to absorb steady-state clock skew between the streamer
+    // (WSL2 docker, drifts 5–15 % vs wall-clock under Hyper-V VM
+    // pause/resume mechanics) and audio-io's cpal hardware clock
+    // (Windows-native, exact 48 kHz). Any single utterance shorter
+    // than ~50 s at 10 % skew finishes before prebuffer drains; up to
+    // ~5 s of WSL2 pause is also absorbed without underrun. The cost
+    // is 5 s latency to first audio — fine for offline TTS testing,
+    // unacceptable for live voice-agent use (revisit prebuffer for
+    // production).
+    const FRAMES_PER_BATCH: usize = 25;
+    const BYTES_PER_BATCH: usize = FRAMES_PER_BATCH * BYTES_PER_FRAME;
+    // BATCH_MS = FRAMES_PER_BATCH × FRAME_MS = 500 ms = audio length
+    // per batch. The realtime cadence equals this value; cadence_ms
+    // (= WS_PACING_MS env, default 500) gates how often we send.
+    const PREBUFFER_BATCHES: usize = 10;
+    // 32 batches × 500 ms = 16 s of in-flight queue between pacing
+    // and writer. Larger than any expected single-utterance wire
+    // backlog so `tx.send().await` is effectively non-blocking even
+    // through a multi-second WSL2 stall.
+    const CHANNEL_DEPTH: usize = 32;
+
+    let connect_t = Instant::now();
+    let (ws, _resp) = tokio_tungstenite::connect_async(spk_url)
         .await
         .with_context(|| format!("connect WS {}", spk_url))?;
+    info!(
+        elapsed_ms = connect_t.elapsed().as_millis() as u64,
+        "ws connect_async returned"
+    );
 
-    let mut sent = 0usize;
-    let mut iter = pcm.chunks_exact(BYTES_PER_FRAME);
-    for chunk in iter.by_ref() {
-        ws.send(Message::Binary(chunk.to_vec()))
-            .await
-            .context("WS send frame")?;
-        sent += BYTES_PER_FRAME;
-        sleep(Duration::from_millis(FRAME_MS)).await;
-    }
-    // Pad the trailing partial frame with zeros so the tail isn't
-    // truncated — audio-io's frame parser drops short writes.
+    let mut iter = pcm.chunks_exact(BYTES_PER_BATCH);
+    let mut batches: Vec<Vec<u8>> = iter.by_ref().map(|c| c.to_vec()).collect();
+    // Pad the trailing partial batch with zeros so audio-io's
+    // even-length parser accepts it and the tail isn't truncated. At
+    // most ~99 ms of trailing silence; /finalize's drain handshake
+    // makes the orchestrator's timing independent of this padding.
     let rem = iter.remainder();
     if !rem.is_empty() {
-        let mut tail = Vec::with_capacity(BYTES_PER_FRAME);
+        let mut tail = Vec::with_capacity(BYTES_PER_BATCH);
         tail.extend_from_slice(rem);
-        tail.resize(BYTES_PER_FRAME, 0);
-        ws.send(Message::Binary(tail)).await.context("WS send tail")?;
-        sent += BYTES_PER_FRAME;
-        sleep(Duration::from_millis(FRAME_MS)).await;
+        tail.resize(BYTES_PER_BATCH, 0);
+        batches.push(tail);
     }
-    let _ = ws.close(None).await;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(CHANNEL_DEPTH);
+
+    let pacing = async move {
+        // Wall-clock-anchored pacing. tokio::time::sleep_until uses
+        // CLOCK_MONOTONIC (= Instant), which on WSL2 docker can lag
+        // SystemTime by ~10–15% — Hyper-V VM scheduling / pause-resume
+        // mechanics keep monotonic time pegged to VM-active wallclock,
+        // not the host's real wallclock. Audio hardware (cpal/WASAPI
+        // on Windows) runs on its own crystal at the device's reported
+        // rate, so a monotonic-paced sender feeds 10–15% slower than
+        // realtime and audio-io's playback ring drains continuously →
+        // continuous cpal underrun (= the warn lines we get from
+        // playback.rs) → the audible "ノイズ + なめらかでない音声"
+        // that started after the prebuffer ran out. Polling SystemTime
+        // every ≤5 ms gates each batch on the host's wallclock and
+        // eliminates the drift; tokio::sleep is still monotonic for
+        // the short naps but we re-check wall-clock on every iteration
+        // so any monotonic-side lag gets corrected within one tick.
+        let start_wall = std::time::SystemTime::now();
+        let start_inst = Instant::now();
+        info!("pacing start");
+        let mut last_late_ms: u64 = 0;
+        let mut max_late_ms: u64 = 0;
+        let mut late_ticks: u32 = 0;
+        for (i, batch) in batches.into_iter().enumerate() {
+            if i >= PREBUFFER_BATCHES {
+                // Cadence is env-overridable so an operator can compensate
+                // for measured environment drift (cf. WS_PACING_MS in
+                // Config). cadence_ms < BATCH_MS = overrate (each batch
+                // delivers BATCH_MS of audio in cadence_ms wall-clock),
+                // which steadily fills audio-io's ring and tolerates a
+                // faster-than-reported cpal hardware clock.
+                let offset_ms = (i - PREBUFFER_BATCHES + 1) as u64 * cadence_ms;
+                let target = start_wall + Duration::from_millis(offset_ms);
+                loop {
+                    let remaining = target
+                        .duration_since(std::time::SystemTime::now())
+                        .unwrap_or(Duration::ZERO);
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    let nap = remaining.min(Duration::from_millis(5));
+                    sleep(nap).await;
+                }
+                if let Ok(late) = std::time::SystemTime::now().duration_since(target) {
+                    let late_ms = late.as_millis() as u64;
+                    last_late_ms = late_ms;
+                    if late_ms > max_late_ms {
+                        max_late_ms = late_ms;
+                    }
+                    if late_ms >= 5 {
+                        late_ticks += 1;
+                    }
+                }
+            }
+            let send_t = Instant::now();
+            if tx.send(batch).await.is_err() {
+                break;
+            }
+            // tx.send.await on tokio::sync::mpsc only blocks when the
+            // channel is full; with CHANNEL_DEPTH = 32 and a fast
+            // writer it should be sub-µs. Anything bigger means
+            // back-pressure from the writer = the writer can't keep up.
+            let send_elapsed = send_t.elapsed();
+            if send_elapsed > Duration::from_millis(5) {
+                warn!(
+                    batch_idx = i,
+                    blocked_ms = send_elapsed.as_millis() as u64,
+                    "pacing tx.send blocked — channel saturated, writer behind"
+                );
+            }
+        }
+        // Both clocks reported so the operator can confirm the WSL2
+        // wall-vs-monotonic skew: a healthy run has both within a few
+        // ms; total_inst_ms << total_wall_ms is the smoking gun for
+        // the underrun pattern this whole construction is fixing.
+        let total_inst = start_inst.elapsed();
+        let total_wall = start_wall.elapsed().unwrap_or_default();
+        info!(
+            total_inst_ms = total_inst.as_millis() as u64,
+            total_wall_ms = total_wall.as_millis() as u64,
+            max_late_ms,
+            last_late_ms,
+            late_ticks_ge_5ms = late_ticks,
+            "pacing summary"
+        );
+        // tx dropped on scope exit → rx.recv() returns None → writer
+        // drains remaining queued batches and closes the WS cleanly.
+    };
+
+    let writer = async move {
+        let mut ws = ws;
+        let mut sent = 0usize;
+        // Track per-batch ws.send() wall-clock and aggregate. Sustained
+        // averages near or over BATCH_MS (100 ms) mean the writer is
+        // the bottleneck — pacing keeps queueing into the channel
+        // faster than the wire can drain. If the channel ever
+        // saturates, pacing's `tx.send().await` blocks and the
+        // decoupling effectively unwinds; the summary log below makes
+        // that diagnosable post-hoc.
+        let mut batch_idx = 0usize;
+        let mut total_send: Duration = Duration::ZERO;
+        let mut max_send: Duration = Duration::ZERO;
+        let mut slow_sends: u32 = 0;
+        while let Some(batch) = rx.recv().await {
+            let n = batch.len();
+            let send_start = Instant::now();
+            if let Err(e) = ws.send(Message::Binary(batch)).await {
+                error!("WS send batch: {}", e);
+                break;
+            }
+            let elapsed = send_start.elapsed();
+            total_send += elapsed;
+            if elapsed > max_send {
+                max_send = elapsed;
+            }
+            if elapsed > Duration::from_millis(50) {
+                slow_sends += 1;
+                warn!(
+                    batch_idx,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "slow WS send (≥ 50 ms) — likely cause of audio-io ring drain"
+                );
+            }
+            sent += n;
+            batch_idx += 1;
+        }
+        if batch_idx > 0 {
+            let avg_ms = total_send.as_secs_f64() * 1000.0 / batch_idx as f64;
+            info!(
+                batches = batch_idx,
+                avg_send_ms = (avg_ms * 100.0).round() / 100.0,
+                max_send_ms = max_send.as_millis() as u64,
+                slow_sends,
+                "ws writer summary"
+            );
+        }
+        let close_t = Instant::now();
+        let _ = ws.close(None).await;
+        let close_ms = close_t.elapsed().as_millis() as u64;
+        info!(close_ms, "ws close completed");
+        sent
+    };
+
+    let (_, sent) = tokio::join!(pacing, writer);
     Ok(sent)
 }
 
