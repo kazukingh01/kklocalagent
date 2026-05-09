@@ -40,11 +40,26 @@ pub struct PlaybackHandle {
     task: Option<tokio::task::JoinHandle<()>>,
     logger_task: Option<tokio::task::JoinHandle<()>>,
     spk_tx: mpsc::Sender<PlaybackMessage>,
+    stats: Arc<UnderrunStats>,
+    native_rate: u32,
+    native_channels: u16,
 }
 
 impl PlaybackHandle {
     pub fn sender(&self) -> mpsc::Sender<PlaybackMessage> {
         self.spk_tx.clone()
+    }
+
+    pub fn stats(&self) -> Arc<UnderrunStats> {
+        self.stats.clone()
+    }
+
+    pub fn native_rate(&self) -> u32 {
+        self.native_rate
+    }
+
+    pub fn native_channels(&self) -> u16 {
+        self.native_channels
     }
 }
 
@@ -64,12 +79,12 @@ impl Drop for PlaybackHandle {
     }
 }
 
-/// Counters incremented by the cpal output callback every time the
-/// playback ring is empty and the `unwrap_or(0.0)` silence fallback
-/// fires. Read by a periodic logger task — direct logging from the
-/// audio thread risks blocking on tracing's lock and missing the
-/// callback's deadline (= further underruns).
-struct UnderrunStats {
+/// Counters incremented by the cpal output callback. The silence-path
+/// counters (`samples`, `callbacks`) feed the periodic underrun logger;
+/// `consumed` and `callbacks_total` track every callback regardless of
+/// underrun and let an external observer (e.g. the /spk WS handler)
+/// measure hardware-vs-system clock drift over a session window.
+pub struct UnderrunStats {
     /// Total number of zero-sample emissions across all callbacks.
     samples: AtomicU64,
     /// Number of callbacks that hit the silence path at least once.
@@ -82,6 +97,13 @@ struct UnderrunStats {
     /// fire continuously while no client is connected (cpal keeps
     /// running and pulling 0.0 silence from the empty ring).
     audio_seen: AtomicBool,
+    /// Total interleaved samples consumed by the cpal output callback,
+    /// including silence-fallback samples. Driven by the hardware audio
+    /// clock; comparing against system-clock elapsed time exposes
+    /// drift between the DAC and the OS wall clock.
+    consumed: AtomicU64,
+    /// Total cpal output callbacks invoked (hardware-clock paced).
+    callbacks_total: AtomicU64,
 }
 
 impl UnderrunStats {
@@ -90,7 +112,19 @@ impl UnderrunStats {
             samples: AtomicU64::new(0),
             callbacks: AtomicU64::new(0),
             audio_seen: AtomicBool::new(false),
+            consumed: AtomicU64::new(0),
+            callbacks_total: AtomicU64::new(0),
         }
+    }
+
+    /// Returns `(callbacks_total, consumed_samples)` snapshot. Both grow
+    /// monotonically from playback start; subtract two snapshots to get
+    /// session-scoped deltas.
+    pub fn snapshot(&self) -> (u64, u64) {
+        (
+            self.callbacks_total.load(Ordering::Relaxed),
+            self.consumed.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -142,6 +176,9 @@ pub fn start_playback(
         }
     };
 
+    let native_rate = ready.native_rate;
+    let native_channels = ready.native_channels;
+
     // 32 frames ≈ 640 ms at 20 ms/frame — a small multiple of the
     // playback ring so backpressure hits the WebSocket well before a
     // multi-second backlog can accumulate (important for barge-in).
@@ -150,8 +187,8 @@ pub fn start_playback(
         spk_rx,
         ready.producer,
         audio.sample_rate,
-        ready.native_rate,
-        ready.native_channels,
+        native_rate,
+        native_channels,
         flush,
         stats.clone(),
     ));
@@ -205,6 +242,9 @@ pub fn start_playback(
         task: Some(task),
         logger_task: Some(logger_task),
         spk_tx,
+        stats,
+        native_rate,
+        native_channels,
     })
 }
 
@@ -292,6 +332,8 @@ fn run_playback(
                         stats.samples.fetch_add(underrun, Ordering::Relaxed);
                         stats.callbacks.fetch_add(1, Ordering::Relaxed);
                     }
+                    stats.consumed.fetch_add(data.len() as u64, Ordering::Relaxed);
+                    stats.callbacks_total.fetch_add(1, Ordering::Relaxed);
                 },
                 err_fn,
                 None,
@@ -322,6 +364,8 @@ fn run_playback(
                         stats.samples.fetch_add(underrun, Ordering::Relaxed);
                         stats.callbacks.fetch_add(1, Ordering::Relaxed);
                     }
+                    stats.consumed.fetch_add(data.len() as u64, Ordering::Relaxed);
+                    stats.callbacks_total.fetch_add(1, Ordering::Relaxed);
                 },
                 err_fn,
                 None,
@@ -353,6 +397,8 @@ fn run_playback(
                         stats.samples.fetch_add(underrun, Ordering::Relaxed);
                         stats.callbacks.fetch_add(1, Ordering::Relaxed);
                     }
+                    stats.consumed.fetch_add(data.len() as u64, Ordering::Relaxed);
+                    stats.callbacks_total.fetch_add(1, Ordering::Relaxed);
                 },
                 err_fn,
                 None,

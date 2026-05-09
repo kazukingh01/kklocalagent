@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::time::Instant;
 
 use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
@@ -86,6 +87,26 @@ async fn handle_spk(mut socket: WebSocket, state: AppState) {
         }
     };
 
+    // Hardware-vs-system clock drift snapshot. We baseline cpal's
+    // hardware-clock-paced counters at connect and diff at disconnect;
+    // the wall-clock duration of the session is the system-clock
+    // reference. Output device may not be running (rare), in which case
+    // we simply skip the drift report.
+    let drift_baseline = {
+        let guard = state.handles.lock().await;
+        guard.playback.as_ref().map(|h| {
+            let (cb, samples) = h.stats().snapshot();
+            (
+                Instant::now(),
+                cb,
+                samples,
+                h.native_rate(),
+                h.native_channels(),
+                h.stats(),
+            )
+        })
+    };
+
     while let Some(msg) = socket.recv().await {
         match msg {
             Ok(Message::Binary(data)) => {
@@ -168,6 +189,27 @@ async fn handle_spk(mut socket: WebSocket, state: AppState) {
                 break;
             }
         }
+    }
+    if let Some((start, cb0, samples0, native_rate, native_channels, stats)) = drift_baseline {
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        let (cb1, samples1) = stats.snapshot();
+        let callbacks = cb1.saturating_sub(cb0);
+        let consumed = samples1.saturating_sub(samples0);
+        let frames_per_sec = native_rate as u64 * native_channels.max(1) as u64;
+        let consumed_ms = if frames_per_sec > 0 {
+            consumed * 1000 / frames_per_sec
+        } else {
+            0
+        };
+        let drift_ms = consumed_ms as i64 - elapsed_ms as i64;
+        info!(
+            elapsed_ms,
+            callbacks,
+            consumed_samples = consumed,
+            consumed_ms,
+            drift_ms,
+            "spk ws session: hw clock vs system clock"
+        );
     }
     info!("spk ws: client disconnected");
 }
