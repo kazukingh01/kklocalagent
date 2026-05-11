@@ -105,12 +105,12 @@ services:
 
   text-to-speech:
     build:
-      context: ../../../text-to-speech
+      context: ../../../text-to-speech/engine/voicevox
     container_name: kklocalagent-test-int-tts
 
   tts-streamer:
     build:
-      context: ../../../tts-streamer
+      context: ../../../text-to-speech/streamer
     container_name: kklocalagent-test-int-tts-streamer
     environment:
       VOICEVOX_URL: http://text-to-speech:50021
@@ -168,7 +168,7 @@ services:
 
   wake-word-detection:
     build:
-      context: ../../../wake-word-detection
+      context: ../../../wake-word-detection/openwakeword
     container_name: kklocalagent-test-int-wwd
     environment:
       WW_MIC_URL: ws://mic-stub:7010/mic

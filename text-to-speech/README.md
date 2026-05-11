@@ -1,71 +1,76 @@
 # text-to-speech
 
-VOICEVOX engine packaged for kklocalagent. Wraps the upstream
-`voicevox/voicevox_engine:${VOICEVOX_VARIANT}` image (default
-`cpu-latest`; use `nvidia-latest` for CUDA) and exposes the HTTP API on
-port 50021. The default speaker is **3 = ずんだもん (ノーマル)**.
+Voice agent の TTS 一式。engine と streamer の 2 層構成。
 
-## Build
-
-```bash
-cd text-to-speech
-docker build -t kklocalagent/text-to-speech .
-
-# GPU variant
-docker build --build-arg VOICEVOX_VARIANT=nvidia-latest \
-    -t kklocalagent/text-to-speech:nvidia .
+```
+text-to-speech/
+├── engine/        TTS 合成エンジン (将来複数実装を想定して dir で分離)
+│   └── voicevox/    VOICEVOX (ずんだもん 等) — current default
+└── streamer/      orchestrator ↔ engine ↔ audio-io の glue (Rust)
 ```
 
-## Run
+| Layer | Subdir | Status |
+|---|---|---|
+| engine | [`engine/voicevox/`](./engine/voicevox/) | current default |
+| streamer | [`streamer/`](./streamer/) | Rust impl |
+
+# Test
 
 ```bash
-docker run --rm -p 7060:50021 kklocalagent/text-to-speech
+sudo WINDOWS_HOST=$(ip route show | awk '/default/ {print $3; exit}') \
+    docker compose -f compose.voicevox.yaml up --build
 ```
 
-The engine takes ~10–60 s on first boot to mmap the ONNX voice models;
-the Dockerfile `HEALTHCHECK` polls `/version` so dependent compose
-services can `depends_on: condition: service_healthy`.
+```bash
+curl -sS -X POST http://127.0.0.1:7070/speak \
+      -H 'Content-Type: application/json' \
+      -d '{"text":"おはよう"}'
 
-## API
+  sleep 0.5
 
-VOICEVOX synthesis is a two-step flow:
+  # 割り込み — こっちが勝つ
+  curl -sS -X POST http://127.0.0.1:7070/speak \
+      -H 'Content-Type: application/json' \
+      -d '{"text":"割り込みです。"}'
+```
 
 ```bash
-# 1) Generate the audio_query JSON for `text`
 curl -s -X POST 'http://127.0.0.1:7060/audio_query?speaker=3' \
-    --get --data-urlencode 'text=ぼくはずんだもんなのだ。' \
-    > query.json
-
-# 2) Synthesize WAV from that query
-curl -s -X POST 'http://127.0.0.1:7060/synthesis?speaker=3' \
-    -H 'Content-Type: application/json' -d @query.json \
-    > out.wav
+      --get --data-urlencode 'text=ぼくはずんだもんなのだ。今日はとてもいい天気なのだ。' \
+    | curl -s -X POST 'http://127.0.0.1:7060/synthesis?speaker=3' \
+        -H 'Content-Type: application/json' --data-binary @- \
+    > /tmp/zundamon.wav
 ```
 
-Output is **WAV s16le, 24 kHz, mono** by default. Resample to audio-io's
-wire format (16 kHz mono s16le) when streaming back through `/spk`.
+# API (streamer)
 
-## Speakers
+| Method | Path | Description |
+|---|---|---|
+| GET | `/health` | liveness probe |
+| POST | `/speak` | body の `text` を VOICEVOX で合成し audio-io `/spk` に stream |
+| POST | `/finalize` | audio-io 再生 ring の drain 待ち (post-TTS VAD 静音窓の anchor) |
+| POST | `/stop` | 進行中の `/speak` を abort + audio-io 側 buffer drop |
 
-```bash
-curl -s http://127.0.0.1:7060/speakers | jq '.[] | {name, styles}'
-```
+並行 `/speak` は **newest wins**: 新しいリクエストが in-flight タスクを abort してから自分を起動。abort された側は **499 Client Closed Request** で返る (barge-in と通常エラーの区別)。
 
-`speaker` is the per-style id, not the per-character one. Common ids:
+# Envs
 
-| id | character / style |
-|---:|---|
-| 2 | 四国めたん (ノーマル) |
-| 3 | ずんだもん (ノーマル) — default |
-| 8 | 春日部つむぎ (ノーマル) |
-| 14 | 冥鳴ひまり (ノーマル) |
+## streamer (`text-to-speech/streamer/`)
 
-VOICEVOX licensing: generated voice content may be used commercially or
-non-commercially provided you credit the speaker, e.g. `VOICEVOX:ずんだもん`.
+| Var | Default | Notes |
+|---|---|---|
+| `VOICEVOX_URL` | `http://text-to-speech:50021` | engine base URL |
+| `VOICEVOX_SPEAKER` | `3` (ずんだもん ノーマル) | per-style id; `curl /speakers` で列挙 |
+| `VOICEVOX_SPEED_SCALE` | `1.0` | AudioQuery の `speedScale` (おおむね 0.5–2.0) |
+| `SPK_URL` | _(unset → /speak は 500)_ | `ws://${WINDOWS_HOST}:7010/spk` |
+| `AUDIO_IO_BASE` | _(unset → /start, /spk/stop はスキップ)_ | `http://${WINDOWS_HOST}:7010` |
+| `WS_PACING_MS` | `500` | prebuffer 後の WS 送信間隔。500 = realtime。下げると wire を overrate して audio-io 側のハード時計ドリフトを補償 (例: `WS_PACING_MS=450` で約 11 % 速く) |
+| `HOST` / `PORT` | `0.0.0.0` / `7070` | bind |
+| `RUST_LOG` | `info` | tracing filter |
 
-## Smoke tests
+## compose (`compose.voicevox.yaml`)
 
-See `test/README.md` — two compose stacks:
-
-- `compose.offline.yaml` — synthesize a fixed phrase to `test/out/zundamon.wav`
-- `compose.online.yaml`  — synthesize and stream to audio-io `/spk` for live playback
+| Var | Default | Notes |
+|---|---|---|
+| `WINDOWS_HOST` | `host.docker.internal` | audio-io が居るホスト。別マシンなら LAN IP |
+| `VOICEVOX_VARIANT` | `cpu-latest` | engine image tag (`nvidia-latest` で GPU) |

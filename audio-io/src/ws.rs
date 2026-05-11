@@ -1,7 +1,9 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::time::Instant;
 
 use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -12,18 +14,35 @@ use tracing::{debug, info, warn};
 use crate::playback::PlaybackMessage;
 use crate::state::AppState;
 
-pub async fn ws_mic(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_mic(socket, state))
+pub async fn ws_mic(
+    ws: WebSocketUpgrade,
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    // `?ts=1` opts the client into an 8-byte little-endian u64 header
+    // (epoch ns of the frame's *last* sample) prepended to each PCM
+    // frame. Default behavior is unchanged so existing consumers (VAD,
+    // openwakeword shim, tests) keep working without modification.
+    let with_ts = matches!(params.get("ts").map(String::as_str), Some("1"));
+    ws.on_upgrade(move |socket| handle_mic(socket, state, with_ts))
 }
 
-async fn handle_mic(mut socket: WebSocket, state: AppState) {
+async fn handle_mic(mut socket: WebSocket, state: AppState, with_ts: bool) {
     let mut rx = state.mic_tx.subscribe();
-    info!("mic ws: client connected");
+    info!(with_ts, "mic ws: client connected");
     loop {
         tokio::select! {
             msg = rx.recv() => match msg {
-                Ok(frame) => {
-                    if socket.send(Message::Binary(frame.to_vec())).await.is_err() {
+                Ok((ts_ns, frame)) => {
+                    let payload = if with_ts {
+                        let mut buf = Vec::with_capacity(8 + frame.len());
+                        buf.extend_from_slice(&ts_ns.to_le_bytes());
+                        buf.extend_from_slice(&frame);
+                        buf
+                    } else {
+                        frame.to_vec()
+                    };
+                    if socket.send(Message::Binary(payload)).await.is_err() {
                         break;
                     }
                 }
@@ -51,6 +70,13 @@ pub async fn ws_spk(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 
 async fn handle_spk(mut socket: WebSocket, state: AppState) {
     info!("spk ws: client connected");
+    // Tracks whether this WS actually pushed any PCM. cpal is always
+    // running (consuming silence when no producer), so a drift report
+    // for a zero-PCM session would still log a number — but it would
+    // be measuring host scheduling jitter against the device crystal,
+    // not anything related to /spk. Suppress that case so the log
+    // line is unambiguously "this session's PCM throughput vs hw clock".
+    let mut pcm_frames_received: u64 = 0;
     let spk_tx = {
         let guard = state.spk_tx.lock().await;
         match guard.as_ref() {
@@ -66,6 +92,26 @@ async fn handle_spk(mut socket: WebSocket, state: AppState) {
                 return;
             }
         }
+    };
+
+    // Hardware-vs-system clock drift snapshot. We baseline cpal's
+    // hardware-clock-paced counters at connect and diff at disconnect;
+    // the wall-clock duration of the session is the system-clock
+    // reference. Output device may not be running (rare), in which case
+    // we simply skip the drift report.
+    let drift_baseline = {
+        let guard = state.handles.lock().await;
+        guard.playback.as_ref().map(|h| {
+            let (cb, samples) = h.stats().snapshot();
+            (
+                Instant::now(),
+                cb,
+                samples,
+                h.native_rate(),
+                h.native_channels(),
+                h.stats(),
+            )
+        })
     };
 
     while let Some(msg) = socket.recv().await {
@@ -92,6 +138,7 @@ async fn handle_spk(mut socket: WebSocket, state: AppState) {
                     warn!("spk ws: playback task gone; closing");
                     break;
                 }
+                pcm_frames_received = pcm_frames_received.saturating_add(1);
             }
             Ok(Message::Text(text)) => {
                 // EOS/drain handshake. Client sends `{"type":"eos"}`
@@ -149,6 +196,35 @@ async fn handle_spk(mut socket: WebSocket, state: AppState) {
                 debug!("spk ws recv err: {e}");
                 break;
             }
+        }
+    }
+    if let Some((start, cb0, samples0, native_rate, native_channels, stats)) = drift_baseline {
+        if pcm_frames_received == 0 {
+            // No /spk traffic this session → skip the drift line. cpal's
+            // sample counter advances on silence too (the consumer task
+            // pushes zeros when the producer is idle), and reporting that
+            // as "drift_ms" is meaningless for /spk diagnosis.
+        } else {
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            let (cb1, samples1) = stats.snapshot();
+            let callbacks = cb1.saturating_sub(cb0);
+            let consumed = samples1.saturating_sub(samples0);
+            let frames_per_sec = native_rate as u64 * native_channels.max(1) as u64;
+            let consumed_ms = if frames_per_sec > 0 {
+                consumed * 1000 / frames_per_sec
+            } else {
+                0
+            };
+            let drift_ms = consumed_ms as i64 - elapsed_ms as i64;
+            info!(
+                elapsed_ms,
+                callbacks,
+                consumed_samples = consumed,
+                consumed_ms,
+                drift_ms,
+                pcm_frames_received,
+                "spk ws session: cpal hw-clock consumed vs wall elapsed"
+            );
         }
     }
     info!("spk ws: client disconnected");

@@ -51,6 +51,12 @@ services:
   automatic-speech-recognition:
     build:
       context: ..
+      args:
+        # Offline smoke test runs without GPU — pin to the upstream CPU
+        # image so we don't end up with a CUDA binary that can't find
+        # libcuda.so.1 at runtime. Root compose.yaml overrides this
+        # back to main-cuda for the production stack.
+        WHISPER_VARIANT: main
     container_name: kklocalagent-test-asr
     volumes:
       - ../models:/models:ro

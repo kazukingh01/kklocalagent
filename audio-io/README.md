@@ -55,7 +55,7 @@ cp config.example.toml /mnt/c/Users/XXXX/Documents/config.local.toml
 Open windows power shell.
 
 ```bash
-$env:RUST_LOG = "info"
+$env:RUST_LOG = "info,audio_io::playback=debug"
 .\audio-io.exe --config .\config.local.toml
 ```
 

@@ -181,7 +181,7 @@ services:
     # does not call this directly. Port 7060 is published so manual
     # /audio_query + /synthesis calls from the host still work.
     build:
-      context: ./text-to-speech
+      context: ./text-to-speech/engine/voicevox
     container_name: kklocalagent-tts
     restart: unless-stopped
     ports:
@@ -193,7 +193,7 @@ services:
     # mono, and streams the frames over WS to audio-io's /spk endpoint
     # on the Windows host.
     build:
-      context: ./tts-streamer
+      context: ./text-to-speech/streamer
     container_name: kklocalagent-tts-streamer
     restart: unless-stopped
     environment:
@@ -277,23 +277,59 @@ services:
         condition: service_healthy
 
   wake-word-detection:
+    # Two implementations live under ./wake-word-detection/:
+    #   - openwakeword/                Python shim around openWakeWord
+    #   - livekit-wakeword/runtime/    Rust crate `livekit-wakeword` w/
+    #                                  real onnxruntime (current default)
+    # Switching is rare (only when accuracy actually demands it), so the
+    # path is hard-coded here rather than parameterised via .env. To
+    # swap back to the Python shim:
+    #   1. change `context:` below to `./wake-word-detection/openwakeword`
+    #   2. drop the `volumes:` block (openwakeword bundles its own models)
+    #   3. set `WW_MODELS` to a bundled name (e.g. `hey_jarvis`)
+    #   4. add `WW_INFERENCE_FRAMEWORK: tflite`
+    #   5. `docker compose up -d --build wake-word-detection`
+    # See ./wake-word-detection/livekit-wakeword/README.md for env-var
+    # specifics on the Rust side.
     build:
-      context: ./wake-word-detection
+      context: ./wake-word-detection/livekit-wakeword/runtime
     container_name: kklocalagent-wwd
     restart: unless-stopped
     environment:
-      WW_MIC_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/mic
+      # ?ts=1 opts into audio-io's per-frame epoch-ns header. The two
+      # implementations under ./wake-word-detection/ differ in how they
+      # handle this URL:
+      #   - Rust runtime (livekit-wakeword): auto-appends ?ts=1 if the
+      #     configured URL doesn't already include it. So removing
+      #     ?ts=1 here has no effect on the Rust path.
+      #   - Python shim (openwakeword): does NOT auto-append. It
+      #     detects ts=1 from the URL and strips the header when
+      #     present; without ts=1 it falls back to header-less PCM.
+      # Keep ?ts=1 explicit here so the shim path also gets the header
+      # if you swap implementations per the steps above.
+      WW_MIC_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/mic?ts=1
       WW_SINK_MODE: orchestrator
       WW_ORCHESTRATOR_URL: http://orchestrator:7000/events
-      WW_MODELS: "${WW_MODELS:-hey_jarvis}"
+      # Classifier ONNX filename(s) under WW_MODELS_DIR (= /opt/models
+      # via the bind mount below). The Rust runtime needs the file to
+      # exist on disk; the directory must also contain
+      # melspectrogram.onnx + embedding_model.onnx (filenames hardcoded
+      # in config.rs).
+      WW_MODELS: "${WW_MODELS:-my_phrase.onnx}"
       WW_THRESHOLD: "${WW_THRESHOLD:-0.5}"
       WW_COOLDOWN_SEC: "2.0"
-      WW_INFERENCE_FRAMEWORK: tflite
       # Diagnostic: when > 0, log the peak score seen in each window
       # so the operator can tune WW_THRESHOLD. Off (0) by default.
       # Set to e.g. 5.0 in .env to see "what scores my voice is
       # producing" without changing the source code.
       WW_PEAK_LOG_INTERVAL_SEC: "${WW_PEAK_LOG_INTERVAL_SEC:-0}"
+    volumes:
+      # mel/embedding ONNX live here alongside the classifier — the
+      # Dockerfile only bakes hey_livekit.onnx, so a bind mount of the
+      # runtime's local models/ dir is the supported way to ship a
+      # custom-trained classifier (and the upstream fixtures it needs).
+      # Read-only: the runtime never writes to this directory.
+      - ./wake-word-detection/livekit-wakeword/runtime/models:/opt/models:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

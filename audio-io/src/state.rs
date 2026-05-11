@@ -11,7 +11,13 @@ use crate::playback::{PlaybackHandle, PlaybackMessage};
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
-    pub mic_tx: broadcast::Sender<Bytes>,
+    /// Per-mic-frame broadcast. The `u64` is the wall-clock time of the
+    /// frame's *last* sample as nanoseconds since UNIX epoch, captured at
+    /// `dispatch` (i.e. immediately after the cpal callback finishes
+    /// assembling the frame). Subscribers that don't care about timing
+    /// can ignore the first field; the WS handler exposes it on the wire
+    /// only when the client requests it via `?ts=1`.
+    pub mic_tx: broadcast::Sender<(u64, Bytes)>,
     pub spk_tx: Arc<Mutex<Option<mpsc::Sender<PlaybackMessage>>>>,
     pub flush: Arc<FlushSignals>,
     pub handles: Arc<Mutex<ServiceHandles>>,

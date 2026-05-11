@@ -1,0 +1,74 @@
+# VOICEVOX engine + tts-streamer の 2 サービス compose。
+#
+# audio-io はコンテナ外 (Windows ネイティブ or 同一 Linux ホスト or LAN
+# 上の任意マシン) で別途起動済み前提。streamer は WS で
+# ws://${WINDOWS_HOST}:7010/spk に PCM を流し込むので、接続先 IP は
+# WINDOWS_HOST 環境変数で差し替える:
+#
+#   - audio-io が Windows ホスト (WSL2/Docker Desktop): default の
+#     host.docker.internal で OK
+#   - audio-io が同一 Linux ホスト: WINDOWS_HOST=host.docker.internal
+#     のまま (extra_hosts で host-gateway に解決) or 明示的に LAN IP
+#   - audio-io が別マシン: WINDOWS_HOST=<LAN IP> + audio-io 側で
+#     [server] host = "0.0.0.0"
+#
+# Run (repo root から):
+#   docker compose -f text-to-speech/compose.voicevox.yaml up -d --build
+#
+#   # 別ホストの audio-io に向ける:
+#   WINDOWS_HOST=192.168.1.20 \
+#       docker compose -f text-to-speech/compose.voicevox.yaml up -d --build
+#
+#   # GPU で voicevox を回す:
+#   VOICEVOX_VARIANT=nvidia-latest \
+#       docker compose -f text-to-speech/compose.voicevox.yaml up -d --build
+#
+# 喋らせる (streamer の /speak を叩くだけ — audio-io スピーカーから出る):
+#   curl -sS -X POST http://127.0.0.1:7070/speak \
+#       -H 'Content-Type: application/json' \
+#       -d '{"text":"ぼくはずんだもんなのだ。今日はとてもいい天気なのだ。"}'
+#
+# Tear down:
+#   docker compose -f text-to-speech/compose.voicevox.yaml down
+
+services:
+  voicevox:
+    build:
+      context: ./engine/voicevox
+      args:
+        VOICEVOX_VARIANT: ${VOICEVOX_VARIANT:-cpu-latest}
+    container_name: kklocalagent-test-voicevox
+    restart: unless-stopped
+    ports:
+      # ホストから /audio_query / /synthesis を直接叩きたい時用に publish。
+      # streamer はコンテナ間 DNS (voicevox:50021) で参照する。
+      - "7060:50021"
+
+  tts-streamer:
+    build:
+      context: ./streamer
+    container_name: kklocalagent-test-tts-streamer
+    restart: unless-stopped
+    environment:
+      VOICEVOX_URL: http://voicevox:50021
+      VOICEVOX_SPEAKER: "${VOICEVOX_SPEAKER:-3}"
+      VOICEVOX_SPEED_SCALE: "${VOICEVOX_SPEED_SCALE:-1.0}"
+      SPK_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/spk
+      AUDIO_IO_BASE: http://${WINDOWS_HOST:-host.docker.internal}:7010
+      # Post-prebuffer cadence (ms). Default 500 = realtime (matches
+      # 25-frame batch length). Lower to overrate the wire and
+      # compensate for measured environment drift; e.g. WS_PACING_MS=450
+      # sends ~11 % faster than realtime, useful when audio-io's cpal
+      # hardware clock outpaces this container's wall-clock.
+      WS_PACING_MS: "${WS_PACING_MS:-500}"
+    extra_hosts:
+      # 素の Linux docker (Docker Desktop / WSL2 以外) は
+      # host.docker.internal を解決しない。host-gateway で docker bridge
+      # gateway = host に向ける。Docker Desktop / WSL2 では既にリゾルバ
+      # 側で解決されるので無害。
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "7070:7070"
+    depends_on:
+      voicevox:
+        condition: service_healthy
