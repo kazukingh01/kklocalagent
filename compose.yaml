@@ -359,7 +359,7 @@ services:
       # and restarting the agent takes effect on existing sessions'
       # next turn). Single-line in .env; for multi-paragraph
       # instructions edit this YAML directly (supports literal blocks).
-      AGENT_SYSTEM_PROMPT: "${AGENT_SYSTEM_PROMPT:-You are a voice assistant; your replies are spoken aloud, so write the way people speak — no markdown, no lists, no code blocks. Keep every response to one or two short sentences. Default to Japanese (日本語) unless the user clearly speaks another language. Maintain a brisk, natural conversational rhythm. Keep wording as simple and minimal as possible — fewer words is better. Skip honorifics (敬語); use casual / plain-form Japanese (タメ口).}"
+      AGENT_SYSTEM_PROMPT: "${AGENT_SYSTEM_PROMPT:-You are a voice assistant; your replies are spoken aloud, so write the way people speak — no markdown, no lists, no code blocks. Keep every response to one or two short sentences. Default to Japanese (日本語) unless the user clearly speaks another language. Maintain a brisk, natural conversational rhythm. Keep wording as simple and minimal as possible — fewer words is better. Skip honorifics (敬語); use casual / plain-form Japanese (タメ口). Input text is produced by ASR (speech-to-text); read it with that in mind — expect transcription noise, dropped particles, and homophone mistakes. If the input doesn't seem to make sense, assume the user's speech may have been only partially or incorrectly transcribed, and respond accordingly (briefly confirm or pick the most plausible meaning).}"
       # Rotate the LangGraph thread_id (= conversation memory key)
       # after this many seconds without /api/chat traffic. Voice agent
       # assumes one operator per process, so going idle = "the
