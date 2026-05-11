@@ -114,10 +114,15 @@ EOF
             # with `MTP_QUANTIZE=` (empty) to keep BF16 on a card with
             # ≥ 24 GiB, or with e.g. `q4_K_M` for tighter memory at
             # some quality cost.
+            # Ollama 0.23.2 only exposes `--quantize` (applies to the
+            # target model). `--quantize-draft` was mentioned in the
+            # PR thread but isn't on the CLI yet — the drafter stays
+            # at its native dtype, which is fine because it's tiny
+            # (the 4-layer assistant is a few hundred MB regardless).
             QUANTIZE="${MTP_QUANTIZE-q8_0}"
             QUANTIZE_FLAGS=()
             if [ -n "${QUANTIZE}" ]; then
-                QUANTIZE_FLAGS+=(--quantize "${QUANTIZE}" --quantize-draft "${QUANTIZE}")
+                QUANTIZE_FLAGS+=(--quantize "${QUANTIZE}")
             fi
             echo "[init] ollama create --experimental ${MODEL} (quantize=${QUANTIZE:-bf16})"
             ollama create --experimental "${MODEL}" -f "${BUILD_DIR}/Modelfile" "${QUANTIZE_FLAGS[@]}"
