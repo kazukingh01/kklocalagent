@@ -8,15 +8,26 @@
 #
 # Model cache lives at /root/.ollama — mount a named volume there so
 # the first-boot pull persists across `docker compose down && up`.
-ARG OLLAMA_TAG=latest
+# Pinned to a named release rather than `latest` so the image is
+# reproducible. 0.23.2 is the first stable release that bundles
+# PR #15980 (Gemma 4 multi-token prediction speculative decoding) —
+# bump alongside the drafter / target model upgrade when we wire it
+# up. Override at build time with `--build-arg OLLAMA_TAG=…`.
+ARG OLLAMA_TAG=0.23.2
 
 FROM ollama/ollama:${OLLAMA_TAG}
 
 # curl is needed for the HEALTHCHECK probe and for init.sh to poll
-# /api/tags before issuing the pull. Not guaranteed in upstream.
+# /api/tags before issuing the pull. python3 + huggingface_hub is
+# only used by the MTP path in init.sh (LLM_MODEL ends in `-mtp`),
+# where the target + drafter safetensors live behind Google's
+# gated Gemma license on HF and need an authenticated download
+# before `ollama create` can ingest them.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends curl python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip3 install --no-cache-dir --break-system-packages \
+        "huggingface_hub[cli]>=0.25,<1.0"
 
 # Default model per design v0.2 (#4 §9). Override at runtime via
 # compose `environment:` — the HEALTHCHECK CMD below is a shell-form

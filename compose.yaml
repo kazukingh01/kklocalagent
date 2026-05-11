@@ -164,6 +164,11 @@ services:
       # Don't let a stray /api/show or warm-pull hold a second model
       # resident: voice agent only needs the one configured weight.
       OLLAMA_MAX_LOADED_MODELS: "1"
+      # Forwarded to huggingface-cli inside init.sh — only consulted
+      # when LLM_MODEL ends in `-mtp` (target + drafter safetensors
+      # for the MTP build path are gated Gemma weights). Plain ollama
+      # pull tags (e.g. `gemma4:e4b`) don't need this.
+      HF_TOKEN: "${HF_TOKEN:-}"
     volumes:
       - ollama-data:/root/.ollama
     ports:
