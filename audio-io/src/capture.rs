@@ -155,6 +155,13 @@ fn run_capture(
 }
 
 fn dispatch(frames: Vec<Vec<u8>>, tx: &broadcast::Sender<(u64, Bytes)>, frame_ns: u64) {
+    // Common in steady-state: framer.push_* returns 0 frames when
+    // the cpal callback delivered fewer samples than one emit unit.
+    // Skip the SystemTime call + the empty loop body — also makes the
+    // `(n - 1 - i)` arithmetic below defensively safe (n > 0).
+    if frames.is_empty() {
+        return;
+    }
     // `now` is captured once after the cpal callback's framer.push_*
     // returns — i.e. immediately after the *last* emitted frame's tail
     // sample arrived. Earlier frames in this batch ended `frame_ns`

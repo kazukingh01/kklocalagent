@@ -36,12 +36,19 @@ RUN apt-get update \
 # /usr/local/lib + ldconfig is the simpler of the two. ort
 # 2.0.0-rc.11 enforces onnxruntime >= 1.23.x at dylib load time
 # ("expected version >= '1.23.x'"), so 1.23.0 is the floor.
+#
+# Tarball is sha256-verified for bit-for-bit reproducibility (matches
+# the classifier ONNX handling below). Refresh both ARGs together when
+# bumping; new sha256 from `sha256sum onnxruntime-linux-x64-*.tgz`.
 ARG ONNXRUNTIME_VERSION=1.23.0
-RUN curl -sL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}.tgz" \
-        | tar -xz -C /tmp \
+ARG ONNXRUNTIME_SHA256=b6deea7f2e22c10c043019f294a0ea4d2a6c0ae52a009c34847640db75ec5580
+RUN curl -sL -o /tmp/onnxruntime.tgz \
+        "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}.tgz" \
+    && echo "${ONNXRUNTIME_SHA256}  /tmp/onnxruntime.tgz" | sha256sum -c - \
+    && tar -xzf /tmp/onnxruntime.tgz -C /tmp \
     && cp -P "/tmp/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}/lib/"libonnxruntime.so* /usr/local/lib/ \
     && ldconfig \
-    && rm -rf "/tmp/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}"*
+    && rm -rf "/tmp/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}"* /tmp/onnxruntime.tgz
 
 # Pre-fetch the upstream "hey livekit" classifier ONNX into the
 # image. M3 will replace this with our own custom-trained models

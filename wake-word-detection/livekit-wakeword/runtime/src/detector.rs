@@ -18,7 +18,7 @@
 //! mutex is single-locker (only the predictor task takes it) so it
 //! exists purely to satisfy `Send`/`'static` for the spawn.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -122,12 +122,23 @@ pub async fn run(
 /// Drain the ws_client mpsc into the shared ring. Drops oldest
 /// samples to keep the ring at exactly `capacity`. Holds the mutex
 /// only for the push/pop — never across `.await`.
+///
+/// On `PoisonError` we recover via `into_inner()` rather than
+/// panicking. A panic here would propagate out of `tokio::select!` in
+/// `run()` and tear down the runtime — including the `ws_client`
+/// reconnection loop — which is worse than a single noisy log line.
 async fn ingest(mut rx: mpsc::Receiver<MicFrame>, ring: Arc<std::sync::Mutex<Ring>>) {
     while let Some(frame) = rx.recv().await {
         let n = frame.samples.len();
         let frame_end = frame.end_epoch_ns;
         let ring_len = {
-            let mut r = ring.lock().expect("ring poisoned");
+            let mut r = match ring.lock() {
+                Ok(g) => g,
+                Err(poisoned) => {
+                    warn!("ring mutex poisoned; recovering inner state");
+                    poisoned.into_inner()
+                }
+            };
             let overflow = r.samples.len() + n;
             if overflow > r.capacity {
                 for _ in 0..(overflow - r.capacity) {
@@ -183,7 +194,13 @@ async fn predict_loop(
         // scores below ~2 s, so calling predict() during warm-up is
         // pure overhead.
         let window_end_epoch_ns = {
-            let r = ring.lock().expect("ring poisoned");
+            let r = match ring.lock() {
+                Ok(g) => g,
+                Err(poisoned) => {
+                    warn!("ring mutex poisoned; recovering inner state");
+                    poisoned.into_inner()
+                }
+            };
             if r.samples.len() < r.capacity {
                 continue;
             }
@@ -208,13 +225,22 @@ async fn predict_loop(
         // alloc/free ~64 KB × predict_interval_hz per second forever.
         let join = tokio::task::spawn_blocking(move || {
             let result = {
-                let mut m = model_clone.lock().expect("model mutex poisoned");
+                // Recover from PoisonError rather than panicking — the
+                // model is single-locker (only this task takes the
+                // mutex) so poison can only come from a prior predict()
+                // panic. Surface the inner state and let predict() try
+                // again; a recurring failure will show up in the warn!
+                // path below.
+                let mut m = match model_clone.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
                 m.predict(&snapshot)
             };
             (result, snapshot)
         })
         .await;
-        let scores: HashMap<String, f32> = match join {
+        let scores: BTreeMap<String, f32> = match join {
             Ok((Ok(s), buf)) => {
                 snapshot_buf = buf;
                 s

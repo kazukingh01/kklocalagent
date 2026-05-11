@@ -21,7 +21,7 @@
 //! The on-disk resampler from upstream is dropped — `audio-io` always
 //! emits 16 kHz, so we never need to resample.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
@@ -118,7 +118,7 @@ impl EmbeddingModel {
 pub struct WakeWordModel {
     mel_model: MelspectrogramModel,
     emb_model: EmbeddingModel,
-    classifiers: HashMap<String, Session>,
+    classifiers: BTreeMap<String, Session>,
 }
 
 impl WakeWordModel {
@@ -130,7 +130,7 @@ impl WakeWordModel {
         let mut model = Self {
             mel_model: MelspectrogramModel::from_path(mel_onnx_path)?,
             emb_model: EmbeddingModel::from_path(embedding_onnx_path)?,
-            classifiers: HashMap::new(),
+            classifiers: BTreeMap::new(),
         };
         for path in classifier_paths {
             model.load_classifier(path.as_ref())?;
@@ -164,9 +164,9 @@ impl WakeWordModel {
     /// Run inference on ~2 s of i16 PCM at 16 kHz. Windows shorter
     /// than `MIN_EMBEDDINGS * EMBEDDING_STRIDE + EMBEDDING_WINDOW` mel
     /// frames return zeros (warm-up).
-    pub fn predict(&mut self, audio_chunk: &[i16]) -> Result<HashMap<String, f32>> {
+    pub fn predict(&mut self, audio_chunk: &[i16]) -> Result<BTreeMap<String, f32>> {
         if self.classifiers.is_empty() {
-            return Ok(HashMap::new());
+            return Ok(BTreeMap::new());
         }
 
         // Build the f32 PCM Vec once and pass it by value to detect()
@@ -207,7 +207,10 @@ impl WakeWordModel {
         let emb_sequence = ndarray::stack(Axis(0), &views)?;
         let emb_input = emb_sequence.insert_axis(Axis(0));
 
-        let mut predictions = HashMap::with_capacity(self.classifiers.len());
+        // BTreeMap has no with_capacity; iteration order is by sorted key
+        // (classifier name) so the "best score on tie" decision below is
+        // reproducible across runs.
+        let mut predictions: BTreeMap<String, f32> = BTreeMap::new();
         let n_classifiers = self.classifiers.len();
         let mut emb_input = Some(emb_input);
         for (idx, (name, session)) in (&mut self.classifiers).into_iter().enumerate() {
@@ -245,7 +248,7 @@ impl WakeWordModel {
         Ok(predictions)
     }
 
-    fn zero_scores(&self) -> HashMap<String, f32> {
+    fn zero_scores(&self) -> BTreeMap<String, f32> {
         self.classifiers.keys().map(|k| (k.clone(), 0.0)).collect()
     }
 }

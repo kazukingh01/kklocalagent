@@ -11,7 +11,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 # Two-step copy so editing src/ doesn't bust the (slow) deps build.
-COPY Cargo.toml Cargo.lock* ./
+# Cargo.lock is required (not `Cargo.lock*`) so a build that lost the
+# lockfile fails loudly instead of producing a non-reproducible image.
+COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src \
     && echo 'fn main() {}' > src/main.rs \
     && cargo build --release --bin tts-streamer \

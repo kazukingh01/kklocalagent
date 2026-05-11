@@ -20,7 +20,7 @@ ort = { version = "=2.0.0-rc.11", default-features = false, features = ["ndarray
 ndarray = "0.17"
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net", "io-util"] }
-tokio-tungstenite = "0.21"
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
 futures-util = "0.3"
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

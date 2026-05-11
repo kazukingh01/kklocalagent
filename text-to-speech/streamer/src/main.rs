@@ -32,11 +32,16 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::task::AbortHandle;
 use tokio::time::{sleep, timeout, Instant};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
+
+/// 499 Client Closed Request — non-standard nginx code we use to
+/// distinguish a barge-in cancel from a network/synth error. Wrapped
+/// here so we don't repeat the `from_u16` fallible call at each site.
+const STATUS_CLIENT_CLOSED: u16 = 499;
 
 // audio-io wire format — must match audio-io README:
 //   s16le, 16 kHz, mono, 20 ms / frame = 640 bytes / frame.
@@ -98,6 +103,15 @@ struct AppState {
     // request return 499 cleanly while the new request awaits its
     // own task.
     current_task: Arc<Mutex<Option<AbortHandle>>>,
+    // Single-permit semaphore around speak_one. A burst of /speak
+    // requests aborts the previous task via current_task.abort(), but
+    // the abort signal only takes effect at the next .await point —
+    // a request mid-`reqwest::send().await` keeps running until the
+    // network resolves. The semaphore makes the new request wait for
+    // the previous one's permit to drop, preventing two
+    // synthesize→ws-push pipelines from overlapping on VOICEVOX and
+    // /spk.
+    speak_permit: Arc<Semaphore>,
 }
 
 #[derive(Deserialize)]
@@ -139,6 +153,7 @@ async fn main() -> Result<()> {
             .build()
             .context("build reqwest client")?,
         current_task: Arc::new(Mutex::new(None)),
+        speak_permit: Arc::new(Semaphore::new(1)),
     };
 
     let app = Router::new()
@@ -212,8 +227,10 @@ async fn speak(State(state): State<AppState>, Json(body): Json<SpeakBody>) -> Re
             // "cancelled" without conflating it with synth/network
             // errors.
             info!("speak cancelled (barge-in)");
+            let status = StatusCode::from_u16(STATUS_CLIENT_CLOSED)
+                .expect("499 is a valid HTTP status code");
             (
-                StatusCode::from_u16(499).unwrap(),
+                status,
                 Json(json!({"ok": false, "cancelled": true})),
             )
                 .into_response()
@@ -287,6 +304,20 @@ async fn stop(State(state): State<AppState>) -> Json<Value> {
 // --- core flow -----------------------------------------------------
 
 async fn speak_one(state: AppState, text: String) -> Result<Value> {
+    // Serialise speak_one regardless of which caller spawned us. The
+    // /speak handler aborts the previous task before spawning a new
+    // one, but abort only takes effect at .await boundaries — a task
+    // blocked in `reqwest::send().await` finishes the in-flight HTTP
+    // call before observing the cancel. Holding a permit for the
+    // whole synthesise→push pipeline guarantees the old task has
+    // fully released VOICEVOX and the /spk WS before the new one
+    // starts, even under barge-in races.
+    let _permit = state
+        .speak_permit
+        .clone()
+        .acquire_owned()
+        .await
+        .context("acquire speak permit")?;
     let speaker = state.cfg.voicevox_speaker;
     info!(
         speaker,
@@ -322,7 +353,15 @@ async fn speak_one(state: AppState, text: String) -> Result<Value> {
         info!(elapsed_ms = t.elapsed().as_millis() as u64, "POST /start done");
     }
 
-    let spk_url = state.cfg.spk_url.as_deref().unwrap();
+    // The /speak handler bails out before spawn if spk_url is None, so
+    // this should always be Some here. Surface a clean error rather
+    // than panicking if the invariant ever changes (e.g. a future
+    // refactor calls speak_one from another path).
+    let spk_url = state
+        .cfg
+        .spk_url
+        .as_deref()
+        .ok_or_else(|| anyhow!("SPK_URL not configured (speak_one invariant violated)"))?;
     let push_t = Instant::now();
     let sent = push_to_spk(spk_url, &pcm, state.cfg.ws_pacing_ms).await?;
     info!(
@@ -543,12 +582,29 @@ async fn push_to_spk(spk_url: &str, pcm: &[u8], cadence_ms: u64) -> Result<usize
         // eliminates the drift; tokio::sleep is still monotonic for
         // the short naps but we re-check wall-clock on every iteration
         // so any monotonic-side lag gets corrected within one tick.
-        let start_wall = std::time::SystemTime::now();
+        //
+        // Risk of SystemTime as primary: a forward NTP step (or VM
+        // resume after a long pause) makes `target.duration_since(now)`
+        // return Err for every queued batch, flushing the rest of the
+        // utterance to the WS as fast as the writer can drain it. We
+        // bound that burst on a monotonic floor below (see
+        // `min_inter_send_ms`) — even if wall-clock says "send now",
+        // we never fire batches closer than ~half a cadence apart in
+        // monotonic time.
+        let mut start_wall = std::time::SystemTime::now();
         let start_inst = Instant::now();
+        // Half a cadence is the floor: comfortably above the cadence_ms
+        // overrate range (WS_PACING_MS=400 ms → floor 200 ms ≈ batch
+        // duration / 2.5, still tolerable for the ring) and well above
+        // any legitimate WSL2 monotonic-vs-wall skew, so the cap only
+        // fires on a genuine wall-clock forward jump.
+        let min_inter_send = Duration::from_millis(cadence_ms / 2);
+        let mut last_send_inst = start_inst;
         info!("pacing start");
         let mut last_late_ms: u64 = 0;
         let mut max_late_ms: u64 = 0;
         let mut late_ticks: u32 = 0;
+        let mut wall_jumps: u32 = 0;
         for (i, batch) in batches.into_iter().enumerate() {
             if i >= PREBUFFER_BATCHES {
                 // Pacing model: keep ~5 s of audio in audio-io's ring at
@@ -579,9 +635,18 @@ async fn push_to_spk(spk_url: &str, pcm: &[u8], cadence_ms: u64) -> Result<usize
                 let offset_ms = (i - PREBUFFER_BATCHES + 1) as u64 * cadence_ms;
                 let target = start_wall + Duration::from_millis(offset_ms);
                 loop {
-                    let remaining = target
-                        .duration_since(std::time::SystemTime::now())
+                    let now_wall = std::time::SystemTime::now();
+                    let remaining_wall = target
+                        .duration_since(now_wall)
                         .unwrap_or(Duration::ZERO);
+                    // Monotonic floor: protect against an unbounded
+                    // burst if SystemTime stepped forward (NTP / VM
+                    // resume). last_send_inst is set after the prior
+                    // tx.send, so this naturally throttles to
+                    // ≥ min_inter_send between sends.
+                    let monotonic_remaining =
+                        min_inter_send.saturating_sub(last_send_inst.elapsed());
+                    let remaining = remaining_wall.max(monotonic_remaining);
                     if remaining.is_zero() {
                         break;
                     }
@@ -604,12 +669,30 @@ async fn push_to_spk(spk_url: &str, pcm: &[u8], cadence_ms: u64) -> Result<usize
                     if late_ms >= 5 {
                         late_ticks += 1;
                     }
+                    // If we're > 2 cadences late, treat it as a
+                    // wall-clock forward jump rather than a legitimate
+                    // pacing miss. Re-anchor start_wall to "now minus
+                    // current offset" so subsequent batches don't all
+                    // see target in the past. The monotonic floor above
+                    // already prevents the burst itself; this just
+                    // keeps the late/jitter metrics meaningful.
+                    if late_ms > cadence_ms * 2 {
+                        wall_jumps += 1;
+                        warn!(
+                            late_ms,
+                            batch_idx = i,
+                            "wall-clock jumped forward; re-anchoring pacing"
+                        );
+                        start_wall = std::time::SystemTime::now()
+                            - Duration::from_millis(offset_ms);
+                    }
                 }
             }
             let send_t = Instant::now();
             if tx.send(batch).await.is_err() {
                 break;
             }
+            last_send_inst = Instant::now();
             // tx.send.await on tokio::sync::mpsc only blocks when the
             // channel is full; with CHANNEL_DEPTH = 32 and a fast
             // writer it should be sub-µs. Anything bigger means
@@ -635,6 +718,7 @@ async fn push_to_spk(spk_url: &str, pcm: &[u8], cadence_ms: u64) -> Result<usize
             max_late_ms,
             last_late_ms,
             late_ticks_ge_5ms = late_ticks,
+            wall_jumps,
             "pacing summary"
         );
         // tx dropped on scope exit → rx.recv() returns None → writer

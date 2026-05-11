@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use futures_util::StreamExt;
@@ -28,6 +28,11 @@ use tracing::{info, warn};
 use crate::MicFrame;
 
 const HEADER_LEN: usize = 8;
+
+/// Only reset the reconnect backoff once a connection has lived this
+/// long. Without this gate, a 100 ms flap would reset to 1 s on every
+/// handshake and the loop would hammer the server at 1 Hz indefinitely.
+const STABLE_RESET_AFTER: Duration = Duration::from_secs(10);
 
 pub async fn run(
     url: String,
@@ -40,10 +45,11 @@ pub async fn run(
 
     loop {
         info!(url = %url, "connecting to mic ws");
+        let mut connect_inst: Option<Instant> = None;
         match connect_async(&url).await {
             Ok((ws, _)) => {
                 connected.store(true, Ordering::Relaxed);
-                backoff = Duration::from_secs(1);
+                connect_inst = Some(Instant::now());
                 info!("mic ws connected");
                 let (_write, mut read) = ws.split();
                 while let Some(msg) = read.next().await {
@@ -100,9 +106,21 @@ pub async fn run(
             }
         }
         connected.store(false, Ordering::Relaxed);
-        warn!(?backoff, "reconnecting after backoff");
+        // Only reset backoff if the connection lived long enough to
+        // count as "stable". A 100 ms flap that resets every time keeps
+        // hammering the peer at 1 Hz; gating on connect lifetime makes
+        // the backoff actually accumulate for unhealthy peers.
+        let stable = connect_inst
+            .map(|t| t.elapsed() >= STABLE_RESET_AFTER)
+            .unwrap_or(false);
+        if stable {
+            backoff = Duration::from_secs(1);
+        }
+        warn!(?backoff, stable_reset = stable, "reconnecting after backoff");
         tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(max_backoff);
+        if !stable {
+            backoff = (backoff * 2).min(max_backoff);
+        }
     }
 }
 
