@@ -93,10 +93,17 @@ case "${MODEL}" in
             HF_TOKEN="${HF_TOKEN}" huggingface-cli download "${DRAFT_REPO}" \
                 --local-dir "${BUILD_DIR}/draft" \
                 --local-dir-use-symlinks False
+            # Modelfile is intentionally minimal: PARAMETER
+            # `num_speculative_tokens` is not in 0.23.2's allowlist
+            # ("unknown parameter") even though the PR conversation
+            # mentioned it. Letting Ollama use its default count is
+            # fine for now; revisit when the upstream surfaces the
+            # knob (env var or per-request option). NUM_SPEC_TOKENS
+            # is kept above as documentation of the recommended
+            # value per variant.
             cat > "${BUILD_DIR}/Modelfile" <<EOF
 FROM ${BUILD_DIR}/target
 DRAFT ${BUILD_DIR}/draft
-PARAMETER num_speculative_tokens ${NUM_SPEC_TOKENS}
 EOF
             echo "[init] ollama create --experimental ${MODEL}"
             ollama create --experimental "${MODEL}" -f "${BUILD_DIR}/Modelfile"
