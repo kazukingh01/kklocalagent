@@ -1007,7 +1007,13 @@ async fn drain_handshake_inner(spk_url: &str) -> Result<()> {
         .await
         .context("WS send eos")?;
     loop {
-        let msg = timeout(Duration::from_secs(2), ws.next())
+        // Per-recv timeout. audio-io's Eos handler sleeps until the
+        // cpal ring is fully drained, which takes (real audio
+        // duration) seconds — a turn's last sentence(s) can easily
+        // queue ~5 s before /finalize fires. The earlier 2 s cap was
+        // tripping legitimate multi-sentence drains and surfacing as
+        // "drain recv timeout" in production.
+        let msg = timeout(Duration::from_secs(10), ws.next())
             .await
             .context("drain recv timeout")?
             .ok_or_else(|| anyhow!("WS closed before drained"))?
