@@ -105,8 +105,22 @@ case "${MODEL}" in
 FROM ${BUILD_DIR}/target
 DRAFT ${BUILD_DIR}/draft
 EOF
-            echo "[init] ollama create --experimental ${MODEL}"
-            ollama create --experimental "${MODEL}" -f "${BUILD_DIR}/Modelfile"
+            # Quantize at import time. The PR conversation noted that
+            # unquantized BF16 has the best output quality but the
+            # target weights alone (~14 GiB for E4B BF16) plus KV
+            # cache + activations push past 16 GiB on a 4090 Laptop.
+            # q8_0 halves the model size at near-lossless quality and
+            # leaves headroom for the 32 k context KV cache. Override
+            # with `MTP_QUANTIZE=` (empty) to keep BF16 on a card with
+            # ≥ 24 GiB, or with e.g. `q4_K_M` for tighter memory at
+            # some quality cost.
+            QUANTIZE="${MTP_QUANTIZE-q8_0}"
+            QUANTIZE_FLAGS=()
+            if [ -n "${QUANTIZE}" ]; then
+                QUANTIZE_FLAGS+=(--quantize "${QUANTIZE}" --quantize-draft "${QUANTIZE}")
+            fi
+            echo "[init] ollama create --experimental ${MODEL} (quantize=${QUANTIZE:-bf16})"
+            ollama create --experimental "${MODEL}" -f "${BUILD_DIR}/Modelfile" "${QUANTIZE_FLAGS[@]}"
             # Cleanup: ollama create copied the weights into its own
             # blob store under /root/.ollama; the staging dir is no
             # longer needed and would otherwise waste ~10 GB per build.
