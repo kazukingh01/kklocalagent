@@ -359,7 +359,7 @@ async fn enter_speak(state: AppState, text: String, mode: ApiMode) -> Response {
     // Append doesn't cancel or reset — the previous task (if any) will
     // complete naturally, and speak_permit serialises us behind it.
 
-    let task = tokio::spawn(speak_one(state.clone(), text));
+    let task = tokio::spawn(speak_one(state.clone(), text, mode));
     let abort = task.abort_handle();
     {
         // Store our abort handle so a subsequent /speak can cancel us.
@@ -470,7 +470,7 @@ async fn stop(State(state): State<AppState>) -> Json<Value> {
 
 // --- core flow -----------------------------------------------------
 
-async fn speak_one(state: AppState, text: String) -> Result<Value> {
+async fn speak_one(state: AppState, text: String, mode: ApiMode) -> Result<Value> {
     // Serialise speak_one regardless of which caller spawned us. The
     // /speak handler aborts the previous task before spawning a new
     // one, but abort only takes effect at .await boundaries — a task
@@ -502,22 +502,29 @@ async fn speak_one(state: AppState, text: String) -> Result<Value> {
         "synthesized"
     );
 
-    // Idempotent /start so the playback pipeline is up before the WS
-    // write. Failures here are non-fatal — older audio-io builds
-    // without /start still accept frames.
-    if let Some(base) = state.cfg.audio_io_base.as_deref() {
-        let t = Instant::now();
-        match state
-            .http
-            .post(format!("{}/start", base))
-            .timeout(Duration::from_secs(5))
-            .send()
-            .await
-        {
-            Ok(_) => {}
-            Err(e) => warn!("POST /start failed ({}); continuing", e),
+    // POST /start only at the start of a turn (api①). audio-io's
+    // /start currently rebuilds the cpal stream + ring buffer from
+    // scratch, so calling it before every /append used to drop the
+    // tail of the previous sentence (the ~200 ms between /start
+    // returning and the next WS frame arriving would be filled with
+    // cpal silence — manifesting as the "聞こえるよ" head-clipped
+    // playback). /append assumes audio-io is already running because
+    // /speak just brought it up.
+    if mode == ApiMode::Speak {
+        if let Some(base) = state.cfg.audio_io_base.as_deref() {
+            let t = Instant::now();
+            match state
+                .http
+                .post(format!("{}/start", base))
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => warn!("POST /start failed ({}); continuing", e),
+            }
+            info!(elapsed_ms = t.elapsed().as_millis() as u64, "POST /start done");
         }
-        info!(elapsed_ms = t.elapsed().as_millis() as u64, "POST /start done");
     }
 
     // The /speak handler bails out before spawn if spk_url is None, so
