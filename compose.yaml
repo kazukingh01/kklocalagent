@@ -463,3 +463,19 @@ volumes:
   asr-models:
   ollama-data:
   agent-data:
+
+# Pin the default bridge subnet so the UFW rule that allows
+# `audio-io` (host port 7010) inbound stays valid across
+# `docker compose down/up`. Without an explicit ipam.config, Docker
+# picks a free subnet each time the network is recreated — the rule
+# would silently stop matching and containers would lose audio-io
+# again. Gateway 172.25.0.1 is the host's br-xxxxx IP that ssh -R
+# binds to.
+networks:
+  default:
+    name: kklocalagent_default
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.25.0.0/16
+          gateway: 172.25.0.1
