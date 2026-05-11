@@ -407,12 +407,12 @@ fn spawn_tts_consumer(
             // First sentence per turn → /speak (api①, resets budget).
             // Subsequent sentences → /append (api②) if configured,
             // else fall back to /speak.
-            let target_url = if is_first || backends.tts.append_url.is_empty() {
-                &backends.tts.url
+            let (api_label, target_url) = if is_first || backends.tts.append_url.is_empty() {
+                ("speak", &backends.tts.url)
             } else {
-                &backends.tts.append_url
+                ("append", &backends.tts.append_url)
             };
-            tts_speak_inner(&backends, target_url, &sentence).await;
+            tts_speak_inner(&backends, api_label, target_url, &sentence).await;
             is_first = false;
         }
         drop(permit);
@@ -421,8 +421,18 @@ fn spawn_tts_consumer(
 
 /// Inner POST. Permit management is the caller's responsibility — see
 /// `spawn_tts_consumer` (per-turn permit) for the streaming path.
-/// `url` selects between `/speak` and `/append` (see consumer).
-async fn tts_speak_inner(backends: &Backends, url: &str, text: &str) {
+/// `api` is "speak" or "append" (set by the consumer based on
+/// is_first/append_url); it's only used for log clarity — the actual
+/// dispatch is by `url`.
+async fn tts_speak_inner(backends: &Backends, api: &str, url: &str, text: &str) {
+    info!(
+        target: "orch::pipeline",
+        api,
+        url,
+        chars = text.chars().count(),
+        "TTS POST: {:?}",
+        text.chars().take(40).collect::<String>()
+    );
     let body = json!({ "text": text });
     let res = backends
         .http
@@ -440,18 +450,19 @@ async fn tts_speak_inner(backends: &Backends, url: &str, text: &str) {
             // so it doesn't pollute production logs every time the
             // user interrupts the assistant.
             if status.is_success() || status.as_u16() == 499 {
-                info!(target: "orch::pipeline", "TTS ok ({status})");
+                info!(target: "orch::pipeline", api, "TTS ok ({status})");
             } else {
                 let body = resp.text().await.unwrap_or_default();
                 warn!(
                     target: "orch::pipeline",
+                    api,
                     "TTS responded {}: {}",
                     status,
                     body.chars().take(200).collect::<String>()
                 );
             }
         }
-        Err(e) => warn!(target: "orch::pipeline", "TTS POST failed: {e:#}"),
+        Err(e) => warn!(target: "orch::pipeline", api, "TTS POST failed: {e:#}"),
     }
 }
 
