@@ -330,29 +330,47 @@ async fn enter_speak(state: AppState, text: String, mode: ApiMode) -> Response {
         // Barge-in: tear down the in-flight task and the audio already
         // queued in audio-io's ring, then reset the burst budget so
         // the new utterance starts from a full 5 s headroom.
+        //
+        // current_task may hold the AbortHandle of a task that has
+        // already completed normally (we don't proactively clear it
+        // when speak_one returns). Calling /spk/stop on that branch
+        // sets audio-io's flush flag, and the *new* utterance's
+        // first Frame then gets eaten by the cancellation path in
+        // playback_producer_task — manifesting as the head of the
+        // 2nd-turn 1st sentence being clipped to ~500 ms of silence
+        // (the "うん" → "ん" head-clip seen in production). Guard
+        // with is_finished() so /spk/stop only fires on a real
+        // barge-in (previous task still running).
         let prev_abort = {
             let mut guard = state.current_task.lock().await;
             guard.take()
         };
         if let Some(prev) = prev_abort {
-            prev.abort();
-            // Drop already-buffered playback. The abort above stops
-            // further frames from being WS-pushed, but audio-io still
-            // has up to playback_buffer_ms of ring on the speaker —
-            // without /spk/stop the user keeps hearing the cancelled
-            // utterance for up to 10 s (fixes PR #15 review #27).
-            if let Some(base) = state.cfg.audio_io_base.as_deref() {
-                match state
-                    .http
-                    .post(format!("{}/spk/stop", base))
-                    .timeout(Duration::from_secs(2))
-                    .send()
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(e) => warn!("POST /spk/stop after barge-in failed: {}", e),
+            if !prev.is_finished() {
+                prev.abort();
+                // Drop already-buffered playback. The abort above stops
+                // further frames from being WS-pushed, but audio-io
+                // still has up to playback_buffer_ms of ring on the
+                // speaker — without /spk/stop the user keeps hearing
+                // the cancelled utterance for up to 10 s (fixes
+                // PR #15 review #27).
+                if let Some(base) = state.cfg.audio_io_base.as_deref() {
+                    match state
+                        .http
+                        .post(format!("{}/spk/stop", base))
+                        .timeout(Duration::from_secs(2))
+                        .send()
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(e) => warn!("POST /spk/stop after barge-in failed: {}", e),
+                    }
                 }
             }
+            // Else: previous task already finished, the stored
+            // AbortHandle is just a stale reference — drop it without
+            // touching audio-io. The new task's Frames will land in a
+            // clean ring with no flush flag racing them.
         }
         state.burst_budget.lock().await.reset();
     }
