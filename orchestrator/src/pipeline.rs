@@ -377,6 +377,13 @@ pub async fn run_turn(
 /// TTS consumer task: drains the sentence channel, calling
 /// `tts_speak_inner` serially per sentence while the turn is still
 /// active. Holds the turn-level TTS permit until the channel closes.
+///
+/// The first sentence of each turn goes to `tts.url` (`/speak` =
+/// api①, resets the burst budget on the streamer); subsequent
+/// sentences go to `tts.append_url` (`/append` = api②, reuses the
+/// budget). When `append_url` is empty we fall back to `url` for
+/// every sentence — pre-issue-#16 behaviour, kept so old deployments
+/// don't break before the streamer is updated.
 fn spawn_tts_consumer(
     backends: Arc<Backends>,
     wake: Arc<WakeMachine>,
@@ -384,6 +391,7 @@ fn spawn_tts_consumer(
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut is_first = true;
         while let Some(sentence) = rx.recv().await {
             // Drain the rest after barge-in so the LLM sender can
             // finish without blocking, but skip the actual /speak.
@@ -396,19 +404,29 @@ fn spawn_tts_consumer(
             if permit.is_none() || backends.tts.url.is_empty() || sentence.is_empty() {
                 continue;
             }
-            tts_speak_inner(&backends, &sentence).await;
+            // First sentence per turn → /speak (api①, resets budget).
+            // Subsequent sentences → /append (api②) if configured,
+            // else fall back to /speak.
+            let target_url = if is_first || backends.tts.append_url.is_empty() {
+                &backends.tts.url
+            } else {
+                &backends.tts.append_url
+            };
+            tts_speak_inner(&backends, target_url, &sentence).await;
+            is_first = false;
         }
         drop(permit);
     })
 }
 
-/// Inner /speak POST. Permit management is the caller's responsibility
-/// — see `spawn_tts_consumer` (per-turn permit) for the streaming path.
-async fn tts_speak_inner(backends: &Backends, text: &str) {
+/// Inner POST. Permit management is the caller's responsibility — see
+/// `spawn_tts_consumer` (per-turn permit) for the streaming path.
+/// `url` selects between `/speak` and `/append` (see consumer).
+async fn tts_speak_inner(backends: &Backends, url: &str, text: &str) {
     let body = json!({ "text": text });
     let res = backends
         .http
-        .post(&backends.tts.url)
+        .post(url)
         .json(&body)
         .timeout(std::time::Duration::from_millis(backends.tts.timeout_ms))
         .send()

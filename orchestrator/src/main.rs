@@ -46,6 +46,14 @@ struct Args {
     #[arg(long, env = "ORCH_TTS_URL")]
     tts_url: Option<String>,
 
+    /// Override `tts.append_url`. POSTed for continuation sentences
+    /// within a turn (issue #16 — `/append` reuses the streamer's
+    /// burst budget instead of re-prebuffering 5 s every sentence,
+    /// which used to overflow audio-io's ring). Empty falls back to
+    /// `tts.url` for every sentence.
+    #[arg(long, env = "ORCH_TTS_APPEND_URL")]
+    tts_append_url: Option<String>,
+
     /// Override `tts.stop_url`. Empty disables barge-in TTS cancel.
     #[arg(long, env = "ORCH_TTS_STOP_URL")]
     tts_stop_url: Option<String>,
@@ -132,6 +140,9 @@ async fn main() -> Result<()> {
     }
     if let Some(v) = args.tts_url {
         config.tts.url = v;
+    }
+    if let Some(v) = args.tts_append_url {
+        config.tts.append_url = v;
     }
     if let Some(v) = args.tts_stop_url {
         config.tts.stop_url = v;

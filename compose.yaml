@@ -405,6 +405,11 @@ services:
       # anyway, but keeping this empty makes the contract explicit.
       ORCH_LLM_SYSTEM_PROMPT: ""
       ORCH_TTS_URL: http://tts-streamer:7070/speak
+      # /append (api②) — used for the 2nd-and-later sentences of each
+      # turn so the streamer reuses its burst budget instead of
+      # re-prebuffering 5 s every sentence (which overflows audio-io's
+      # ring; issue #16). Empty falls back to /speak for every sentence.
+      ORCH_TTS_APPEND_URL: http://tts-streamer:7070/append
       ORCH_TTS_STOP_URL: http://tts-streamer:7070/stop
       # Drain handshake target. Called once per turn after the last
       # /speak — tts-streamer's response is the precise speaker-

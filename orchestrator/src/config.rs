@@ -101,8 +101,19 @@ pub struct LlmConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct TtsConfig {
-    /// `tts-streamer` `/speak` URL. Empty disables the stage.
+    /// `tts-streamer` `/speak` URL. Empty disables the stage. POSTed
+    /// for the **first** sentence of each turn — `/speak` is api①: it
+    /// cancels any in-flight utterance, drops audio-io's ring, and
+    /// starts the new audio with a full 5 s burst budget.
     pub url: String,
+    /// `tts-streamer` `/append` URL. POSTed for the **second and
+    /// later** sentences of the same turn. `/append` is api②: it
+    /// doesn't cancel or reset, just consumes whatever burst budget
+    /// is left after realtime drain — preventing the audio-io ring
+    /// overflow that issue #16 describes (re-bursting 5 s every
+    /// sentence caused dropouts). Empty falls back to using `url`
+    /// for every sentence (matches pre-#16 behaviour).
+    pub append_url: String,
     /// `tts-streamer` `/stop` URL. Used for barge-in (`wake.barge_in`)
     /// — orchestrator POSTs here when a new WakeWordDetected arrives
     /// while a previous turn's TTS is still streaming. Empty disables
@@ -245,6 +256,7 @@ impl Default for TtsConfig {
             // this; dev / CI runs without `tts-streamer` leave it empty
             // so the pipeline still completes without trying to speak.
             url: String::new(),
+            append_url: String::new(),
             stop_url: String::new(),
             finalize_url: String::new(),
             timeout_ms: 60_000,
