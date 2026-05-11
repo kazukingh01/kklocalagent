@@ -79,8 +79,8 @@ pub async fn run(
         latest_end_epoch_ns: 0,
     }));
 
-    let h_ingest = tokio::spawn(ingest(rx, Arc::clone(&ring)));
-    let h_predict = tokio::spawn(predict_loop(
+    let mut h_ingest = tokio::spawn(ingest(rx, Arc::clone(&ring)));
+    let mut h_predict = tokio::spawn(predict_loop(
         cfg.clone(),
         Arc::clone(&ring),
         Arc::clone(&model),
@@ -91,15 +91,30 @@ pub async fn run(
     // ws_client dropping its sender (shutdown), and the predictor only
     // exits on event_sink dropping its receiver — both are shutdown
     // signals, so propagating the first one out is correct.
+    //
+    // Dropping a JoinHandle does NOT cancel the underlying tokio task,
+    // so after select! picks a winner we explicitly abort + await the
+    // other. Without this the loser would orphan: the ingester would
+    // hold the mpsc receiver alive after a predictor exit, and a
+    // predictor sitting on spawn_blocking would keep the blocking
+    // worker thread until runtime drop.
     tokio::select! {
-        r = h_ingest => match r {
-            Ok(()) => Ok(()),
-            Err(e) => Err(anyhow!("ingest task panicked: {e}")),
+        r = &mut h_ingest => {
+            h_predict.abort();
+            let _ = (&mut h_predict).await;
+            match r {
+                Ok(()) => Ok(()),
+                Err(e) => Err(anyhow!("ingest task panicked: {e}")),
+            }
         },
-        r = h_predict => match r {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(e),
-            Err(e) => Err(anyhow!("predict task panicked: {e}")),
+        r = &mut h_predict => {
+            h_ingest.abort();
+            let _ = (&mut h_ingest).await;
+            match r {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(anyhow!("predict task panicked: {e}")),
+            }
         },
     }
 }
@@ -153,6 +168,13 @@ async fn predict_loop(
     let mut peak_model: String = String::new();
     let mut last_peak_log = Instant::now();
 
+    // Reused snapshot buffer for the i16 PCM window. spawn_blocking
+    // takes ownership each tick; we get a fresh Vec back via
+    // std::mem::replace at the next iteration. ~64 KB at 16 kHz × 2 s,
+    // refilled at 10 Hz, so this avoids ~640 KB/s of churn.
+    let cap = (cfg.predict_window_ms as usize) * (SAMPLE_RATE_HZ as usize) / 1000;
+    let mut snapshot_buf: Vec<i16> = Vec::with_capacity(cap);
+
     loop {
         tick.tick().await;
 
@@ -160,16 +182,16 @@ async fn predict_loop(
         // the configured window yet — the model returns all-zero
         // scores below ~2 s, so calling predict() during warm-up is
         // pure overhead.
-        let (snapshot, window_end_epoch_ns) = {
+        let window_end_epoch_ns = {
             let r = ring.lock().expect("ring poisoned");
             if r.samples.len() < r.capacity {
                 continue;
             }
-            (
-                r.samples.iter().copied().collect::<Vec<i16>>(),
-                r.latest_end_epoch_ns,
-            )
+            snapshot_buf.clear();
+            snapshot_buf.extend(r.samples.iter().copied());
+            r.latest_end_epoch_ns
         };
+        let snapshot = std::mem::replace(&mut snapshot_buf, Vec::with_capacity(cap));
 
         let audio_lag_ms = ns_diff_ms(epoch_ns_now(), window_end_epoch_ns);
         debug!(
@@ -181,23 +203,32 @@ async fn predict_loop(
         let predict_started = Instant::now();
 
         let model_clone = Arc::clone(&model);
-        let scores: HashMap<String, f32> =
-            match tokio::task::spawn_blocking(move || {
+        // Send the snapshot Vec into spawn_blocking and get it back so
+        // the next iteration can reuse the allocation. Without this we
+        // alloc/free ~64 KB × predict_interval_hz per second forever.
+        let join = tokio::task::spawn_blocking(move || {
+            let result = {
                 let mut m = model_clone.lock().expect("model mutex poisoned");
                 m.predict(&snapshot)
-            })
-            .await
-            {
-                Ok(Ok(s)) => s,
-                Ok(Err(e)) => {
-                    warn!("predict failed: {e:?}");
-                    continue;
-                }
-                Err(e) => {
-                    warn!("predict join error: {e}");
-                    continue;
-                }
             };
+            (result, snapshot)
+        })
+        .await;
+        let scores: HashMap<String, f32> = match join {
+            Ok((Ok(s), buf)) => {
+                snapshot_buf = buf;
+                s
+            }
+            Ok((Err(e), buf)) => {
+                snapshot_buf = buf;
+                warn!("predict failed: {e:?}");
+                continue;
+            }
+            Err(e) => {
+                warn!("predict join error: {e}");
+                continue;
+            }
+        };
 
         let predict_dur_ms = predict_started.elapsed().as_millis() as u64;
         let e2e_lag_ms = ns_diff_ms(epoch_ns_now(), window_end_epoch_ns);

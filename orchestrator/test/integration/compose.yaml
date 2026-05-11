@@ -168,7 +168,7 @@ services:
 
   wake-word-detection:
     build:
-      context: ../../../wake-word-detection
+      context: ../../../wake-word-detection/openwakeword
     container_name: kklocalagent-test-int-wwd
     environment:
       WW_MIC_URL: ws://mic-stub:7010/mic

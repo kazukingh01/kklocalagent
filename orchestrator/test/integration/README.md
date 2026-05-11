@@ -55,7 +55,7 @@ diagnosis.
 |---|---|---|
 | ASR | `ggml-small-q8_0.bin` (~252 MB) | `automatic-speech-recognition/test/compose.offline.yaml` |
 | LLM | `gemma3:1b` (~815 MB) | `llm/test/compose.yaml` |
-| Wake | `alexa` (bundled, ~860 KB) | `wake-word-detection/test/compose.yaml` |
+| Wake | `alexa` (bundled, ~860 KB) | `wake-word-detection/openwakeword/test/compose.yaml` |
 | TTS | VOICEVOX `cpu-latest` ONNX | `text-to-speech/Dockerfile` (default speaker = 3, ずんだもん) |
 
 The whisper model is fetched into a named volume (`asr-models`) by an
@@ -67,7 +67,7 @@ runs reuse the cached file.
 
 | File | Source | Role |
 |---|---|---|
-| `alexa_test.wav` | `wake-word-detection/test/data/` (committed) | wake-word trigger (English, ~0.6 s) |
+| `alexa_test.wav` | `wake-word-detection/openwakeword/test/data/` (committed) | wake-word trigger (English, ~0.6 s) |
 | `jfk.wav` | `whisper.cpp/samples/` (downloaded at image build) | the user utterance for ASR + LLM (~11 s) |
 
 Both are baked into the `mic-stub` image at build time. The stream is:

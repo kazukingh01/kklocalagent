@@ -10,7 +10,13 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends pkg-config build-essential \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
+# Two-step copy so editing src/ doesn't bust the (slow) deps build.
 COPY Cargo.toml Cargo.lock* ./
+RUN mkdir -p src \
+    && echo 'fn main() {}' > src/main.rs \
+    && cargo build --release --bin tts-streamer \
+    && rm -rf src target/release/deps/tts_streamer* \
+              target/release/tts-streamer*
 COPY src ./src
 RUN cargo build --release --bin tts-streamer
 

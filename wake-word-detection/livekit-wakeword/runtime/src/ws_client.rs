@@ -72,6 +72,9 @@ pub async fn run(
                             };
                             if tx.send(frame).await.is_err() {
                                 // detector dropped — runtime is shutting down.
+                                // Clear connected so /health stops claiming
+                                // the WS is up while the runtime tears down.
+                                connected.store(false, Ordering::Relaxed);
                                 return Ok(());
                             }
                         }
@@ -104,8 +107,16 @@ pub async fn run(
 }
 
 fn ensure_ts_query(url: &str) -> String {
-    if url.contains("ts=1") {
-        return url.to_string();
+    // Look for ts=1 as an actual query parameter, not just a substring.
+    // The naive `url.contains("ts=1")` matches `?footsie=1` etc., which
+    // would silently skip the auto-append for an oddly-named foreign
+    // parameter and we'd end up without the per-frame epoch-ns header.
+    if let Some((_, query)) = url.split_once('?') {
+        for pair in query.split('&') {
+            if pair == "ts=1" || pair.starts_with("ts=1#") {
+                return url.to_string();
+            }
+        }
     }
     let sep = if url.contains('?') { '&' } else { '?' };
     format!("{url}{sep}ts=1")
@@ -134,6 +145,22 @@ mod tests {
     #[test]
     fn ensure_ts_idempotent() {
         let u = "ws://x/mic?ts=1";
+        assert_eq!(ensure_ts_query(u), u);
+    }
+
+    #[test]
+    fn ensure_ts_substring_false_positive_rejected() {
+        // `ts=1` appears as a substring of `footsie=1` but is not the
+        // actual `ts` parameter — we still need to append our own.
+        assert_eq!(
+            ensure_ts_query("ws://x/mic?footsie=1"),
+            "ws://x/mic?footsie=1&ts=1"
+        );
+    }
+
+    #[test]
+    fn ensure_ts_among_other_params() {
+        let u = "ws://x/mic?foo=bar&ts=1&baz=qux";
         assert_eq!(ensure_ts_query(u), u);
     }
 }

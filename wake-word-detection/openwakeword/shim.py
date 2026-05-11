@@ -307,8 +307,21 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    # WW_LOG_LEVEL accepts the standard logging level names
+    # (DEBUG/INFO/WARNING/ERROR/CRITICAL); unknown values fall back to
+    # INFO with a warning. The compose stacks (test/compose.online.yaml,
+    # the production compose) document `WW_LOG_LEVEL=DEBUG` as the way
+    # to surface `e2e_lag_ms` etc., so this honours that contract.
+    raw_level = os.environ.get("WW_LOG_LEVEL", "INFO").upper()
+    level = logging.getLevelName(raw_level)
+    if not isinstance(level, int):
+        print(
+            f"WW_LOG_LEVEL={raw_level!r} not recognised; defaulting to INFO",
+            file=sys.stderr,
+        )
+        level = logging.INFO
     logging.basicConfig(
-        level=logging.INFO,
+        level=level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stdout,
     )

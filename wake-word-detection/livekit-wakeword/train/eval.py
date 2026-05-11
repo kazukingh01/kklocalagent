@@ -87,7 +87,28 @@ def main() -> int:
     p.add_argument("--model", required=True, type=Path)
     p.add_argument("--recordings", required=True, type=Path,
                    help="directory of <label>_NN.wav files")
+    p.add_argument(
+        "--allow-stub",
+        action="store_true",
+        help="bypass the M3 guard. Required because max_score() currently "
+             "passes raw i16 PCM directly to the classifier, skipping the "
+             "mel + embedding pipeline the runtime applies. Numbers from "
+             "this stub are NOT comparable to the runtime's scores and "
+             "should never be used to decide whether to publish a model. "
+             "Use this only to smoke-test the eval harness wiring itself.",
+    )
     args = p.parse_args()
+
+    if not args.allow_stub:
+        print(
+            "eval.py: refusing to run — current implementation is a "
+            "pre-M3 stub that feeds raw PCM to the classifier, bypassing "
+            "the mel + embedding pipeline. Outputs do NOT reflect the "
+            "runtime's behaviour. See the docstring on max_score(); "
+            "pass --allow-stub to override for harness testing.",
+            file=sys.stderr,
+        )
+        return 2
 
     if not args.model.exists():
         print(f"model not found: {args.model}", file=sys.stderr)
@@ -105,8 +126,20 @@ def main() -> int:
     for wav in sorted(args.recordings.glob("*.wav")):
         pcm = load_pcm(wav)
         peak = max_score(session, pcm)
+        # Strict label match: anything that isn't exactly "positive" or
+        # "negative" is rejected so a typo (e.g. "postive_03.wav") fails
+        # loud rather than silently being counted as a negative — the
+        # original startswith("pos") check would have skewed FPPH by
+        # treating mislabelled positives as negatives.
         label = wav.stem.split("_", 1)[0].lower()
-        if label.startswith("pos"):
+        if label not in {"positive", "negative"}:
+            print(
+                f"{wav.name}: unrecognised label prefix {label!r} "
+                f"(expected 'positive' or 'negative')",
+                file=sys.stderr,
+            )
+            return 1
+        if label == "positive":
             pos_scores.append(peak)
             print(f"[positive] {wav.name}: peak={peak:.3f}")
         else:

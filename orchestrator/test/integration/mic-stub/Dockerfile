@@ -22,8 +22,8 @@ RUN mkdir -p /samples && \
         -o /samples/jfk.wav \
         https://github.com/ggerganov/whisper.cpp/raw/master/samples/jfk.wav
 
-# alexa_test.wav is committed under wake-word-detection/test/data/.
-COPY wake-word-detection/test/data/alexa_test.wav /samples/alexa.wav
+# alexa_test.wav is committed under wake-word-detection/openwakeword/test/data/.
+COPY wake-word-detection/openwakeword/test/data/alexa_test.wav /samples/alexa.wav
 
 # Reuse the upstream stub.py (which already supports SAMPLE_PATHS for
 # multi-clip playback). One source of truth — the integration smoke

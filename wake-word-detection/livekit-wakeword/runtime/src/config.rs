@@ -72,12 +72,33 @@ impl Config {
 
         let raw_models = std::env::var("WW_MODELS")
             .unwrap_or_else(|_| DEFAULT_CLASSIFIER_FILENAME.to_string());
-        let model_paths: Vec<PathBuf> = raw_models
+        // Each entry must be a plain filename inside `models_dir`. Reject
+        // path separators and `..` components so an operator can't
+        // (accidentally or otherwise) escape the bind-mounted models dir
+        // and load arbitrary files from the container.
+        let names: Vec<&str> = raw_models
             .split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(|name| models_dir.join(name))
             .collect();
+        for name in &names {
+            let p = std::path::Path::new(name);
+            let escapes = p.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            });
+            if escapes || name.contains('/') || name.contains('\\') {
+                return Err(anyhow!(
+                    "WW_MODELS entry {name:?} must be a plain filename \
+                     under WW_MODELS_DIR (no '/', '\\\\', or '..')"
+                ));
+            }
+        }
+        let model_paths: Vec<PathBuf> = names.iter().map(|n| models_dir.join(n)).collect();
         if model_paths.is_empty() {
             return Err(anyhow!(
                 "WW_MODELS resolved to no filenames (raw: {raw_models:?})"

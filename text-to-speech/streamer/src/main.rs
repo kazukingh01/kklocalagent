@@ -551,12 +551,31 @@ async fn push_to_spk(spk_url: &str, pcm: &[u8], cadence_ms: u64) -> Result<usize
         let mut late_ticks: u32 = 0;
         for (i, batch) in batches.into_iter().enumerate() {
             if i >= PREBUFFER_BATCHES {
+                // Pacing model: keep ~5 s of audio in audio-io's ring at
+                // steady state. After the prebuffer burst, audio-io is at
+                // (PREBUFFER_BATCHES * BATCH_MS) of buffered audio; the
+                // consumer has been draining at realtime since the first
+                // batch arrived, so by t=cadence_ms the ring is at
+                // ((PREBUFFER_BATCHES * BATCH_MS) - cadence_ms) and we
+                // top it up by BATCH_MS each tick.
+                //
+                // This is NOT strict just-in-time pacing (= send batch i
+                // at t=i*cadence_ms). That model would let the prebuffer
+                // fully drain before the next send → ring at 0 ms = high
+                // underrun risk. The +1 here is intentional: the first
+                // paced send happens at t=cadence_ms (one cadence after
+                // the burst), keeping the ring topped up rather than
+                // letting it deplete first.
+                //
                 // Cadence is env-overridable so an operator can compensate
                 // for measured environment drift (cf. WS_PACING_MS in
                 // Config). cadence_ms < BATCH_MS = overrate (each batch
                 // delivers BATCH_MS of audio in cadence_ms wall-clock),
-                // which steadily fills audio-io's ring and tolerates a
-                // faster-than-reported cpal hardware clock.
+                // which steadily fills audio-io's ring above the steady
+                // state and tolerates a faster-than-reported cpal hardware
+                // clock. NB: overrate cannot "recover" the prebuffer's 5 s
+                // head start in any short time — it only catches up at
+                // (BATCH_MS - cadence_ms) per tick, which is by design.
                 let offset_ms = (i - PREBUFFER_BATCHES + 1) as u64 * cadence_ms;
                 let target = start_wall + Duration::from_millis(offset_ms);
                 loop {
@@ -566,6 +585,13 @@ async fn push_to_spk(spk_url: &str, pcm: &[u8], cadence_ms: u64) -> Result<usize
                     if remaining.is_zero() {
                         break;
                     }
+                    // 5 ms cap on Linux is fine — tokio's timer runs at
+                    // ~1 ms granularity. On Windows the default tokio
+                    // timer resolution is ~15.6 ms, so this nap may
+                    // overshoot by ~10 ms per iteration and inflate
+                    // `late_ticks_ge_5ms`. The streamer is only
+                    // expected to run in Linux containers (compose),
+                    // so we don't paper over that here.
                     let nap = remaining.min(Duration::from_millis(5));
                     sleep(nap).await;
                 }
@@ -678,6 +704,18 @@ async fn push_to_spk(spk_url: &str, pcm: &[u8], cadence_ms: u64) -> Result<usize
 /// cpal output ring has been fully consumed by the device, so this
 /// function's return is the precise moment the speaker fell silent.
 async fn drain_handshake(spk_url: &str) -> Result<()> {
+    // Bound the whole handshake on top of the per-recv timeout so a
+    // misbehaving peer can't keep us alive indefinitely with a steady
+    // stream of non-drained text frames. ~12 s is comfortably above
+    // the worst-case real drain (10 s ring at 1× playback rate + WS
+    // overhead) and short enough to surface a stuck peer.
+    const DRAIN_DEADLINE: Duration = Duration::from_secs(12);
+    timeout(DRAIN_DEADLINE, drain_handshake_inner(spk_url))
+        .await
+        .context("drain handshake overall deadline exceeded")?
+}
+
+async fn drain_handshake_inner(spk_url: &str) -> Result<()> {
     let (mut ws, _resp) = tokio_tungstenite::connect_async(spk_url)
         .await
         .with_context(|| format!("connect WS {}", spk_url))?;

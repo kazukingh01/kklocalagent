@@ -47,7 +47,11 @@ pub async fn run(cfg: Config, mut rx: mpsc::Receiver<Detection>) -> Result<()> {
                         info!(model = %det.model, score = det.score, "fired event");
                     } else {
                         let body = resp.text().await.unwrap_or_default();
-                        let trim = &body[..body.len().min(200)];
+                        // chars().take() instead of byte slicing — the
+                        // orchestrator can return non-ASCII bodies (日本語
+                        // error messages from upstream FastAPI etc.) and
+                        // a byte index landing mid-codepoint would panic.
+                        let trim: String = body.chars().take(200).collect();
                         warn!(%status, body = %trim, "POST /events non-2xx");
                     }
                 }

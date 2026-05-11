@@ -56,7 +56,7 @@ sudo docker run --rm \
 
 | Var | Default |
 |---|---|
-| `WW_MIC_URL` | `ws://audio-io:7010/mic?ts=1` (`?ts=1` enables the per-frame epoch-ns header for `e2e_lag_ms`; auto-appended if you override without it) |
+| `WW_MIC_URL` | `ws://audio-io:7010/mic?ts=1` (`?ts=1` enables the per-frame epoch-ns header for `e2e_lag_ms`; this Rust runtime auto-appends it if you override without it. NB: the openwakeword Python shim under `../openwakeword/` does not auto-append — set ?ts=1 explicitly there.) |
 | `WW_ORCHESTRATOR_URL` | `http://orchestrator:7000/events` |
 | `WW_MODELS` | `hey_livekit.onnx` (comma-separated classifier ONNX **filenames** under `WW_MODELS_DIR`) |
 | `WW_MODELS_DIR` | `/opt/models` — must contain the classifier ONNX(s) named in `WW_MODELS` plus `melspectrogram.onnx` + `embedding_model.onnx` (filenames hardcoded). |
