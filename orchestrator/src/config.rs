@@ -427,6 +427,7 @@ mod tests {
         // permit.
         let mut cfg = Config::default();
         cfg.tts.url = "http://tts:7070/speak".into();
+        cfg.tts.append_url = "http://tts:7070/append".into();
         cfg.tts.stop_url = String::new();
         cfg.wake.barge_in = true;
         let err = cfg.validate().expect_err("should reject barge_in without stop_url");
