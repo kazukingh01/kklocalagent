@@ -56,35 +56,39 @@ done
 #   26B / 31B → datacenter cards only.
 #
 # Pre-quantised gemma4 MTP tags in the Ollama library (e.g. the
-# existing `gemma4:31b-coding-mtp-bf16`) will eventually obviate
-# this whole branch; until then this is the only way on Linux.
+# existing `gemma4:31b-coding-mtp-bf16`) will eventually obviate this
+# whole branch; until then this is the only way on Linux.
+#
+# Match the four known "build-from-HF" tags exactly. Anything else —
+# including future pre-quantised library tags like `*-mtp-bf16` — falls
+# through to plain `ollama pull` so a glob like `*-mtp-*` doesn't trap
+# them into the build path and exit 1 on what is really an off-the-shelf
+# pull.
+#
+# Recommended num_speculative_tokens per variant (for future re-wiring
+# once upstream surfaces the knob in `ollama create`'s allowlist):
+#   gemma4:e2b-mtp   → 2
+#   gemma4:e4b-mtp   → 4
+#   gemma4:26b-mtp   → 4
+#   gemma4:31b-mtp   → 4
 case "${MODEL}" in
-    *-mtp|*-mtp-*)
+    gemma4:e4b-mtp|gemma4:e2b-mtp|gemma4:26b-mtp|gemma4:31b-mtp)
         case "${MODEL}" in
             gemma4:e4b-mtp)
                 TARGET_REPO="google/gemma-4-E4B-it"
                 DRAFT_REPO="google/gemma-4-E4B-it-assistant"
-                NUM_SPEC_TOKENS=4
                 ;;
             gemma4:e2b-mtp)
                 TARGET_REPO="google/gemma-4-E2B-it"
                 DRAFT_REPO="google/gemma-4-E2B-it-assistant"
-                NUM_SPEC_TOKENS=2
                 ;;
             gemma4:26b-mtp)
                 TARGET_REPO="google/gemma-4-26B-A4B-it"
                 DRAFT_REPO="google/gemma-4-26B-A4B-it-assistant"
-                NUM_SPEC_TOKENS=4
                 ;;
             gemma4:31b-mtp)
                 TARGET_REPO="google/gemma-4-31B-it"
                 DRAFT_REPO="google/gemma-4-31B-it-assistant"
-                NUM_SPEC_TOKENS=4
-                ;;
-            *)
-                echo "[init] unrecognised MTP model tag: ${MODEL}" >&2
-                kill "${SERVE_PID}" 2>/dev/null || true
-                exit 1
                 ;;
         esac
 
@@ -110,10 +114,9 @@ case "${MODEL}" in
                 --local-dir-use-symlinks False
             # Modelfile is intentionally minimal:
             #   * `PARAMETER num_speculative_tokens` is not in 0.23.2's
-            #     allowlist ("unknown parameter") — NUM_SPEC_TOKENS is
-            #     kept above as documentation of the recommended value
-            #     per variant, ready to re-wire once upstream surfaces
-            #     the knob.
+            #     allowlist ("unknown parameter") — the recommended
+            #     per-variant values are kept in the case-block comment
+            #     above, ready to re-wire once upstream surfaces the knob.
             #   * No `--quantize` on `ollama create` because that path
             #     requires MLX (Apple Silicon only); on Linux/CUDA the
             #     model lands as native BF16.

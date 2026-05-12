@@ -204,12 +204,13 @@ impl BurstBudget {
         self.at = Instant::now();
     }
 
-    /// Record a paced span of `_secs` seconds at realtime cadence. The
-    /// ring depth is unchanged (feed rate ≈ drain rate during pacing),
-    /// but `at` jumps forward so subsequent `current_depth_s()` calls
-    /// don't double-count the wall-clock spent pacing as additional
-    /// drain time.
-    fn record_paced(&mut self, _secs: f32) {
+    /// Record that a paced span just finished. The ring depth is
+    /// unchanged (feed rate ≈ drain rate during pacing), but `at` snaps
+    /// to now so subsequent `current_depth_s()` calls don't double-count
+    /// the wall-clock spent pacing as additional drain time. The actual
+    /// pacing duration is irrelevant to the budget arithmetic (only the
+    /// "now" anchor matters), so no `secs` argument.
+    fn record_paced(&mut self) {
         self.at = Instant::now();
     }
 
@@ -781,12 +782,11 @@ async fn push_to_spk(
     let burst_batches = ((available_s * 1000.0 / BATCH_MS as f32) as usize).min(total_batches);
     let paced_batches = total_batches - burst_batches;
     let burst_secs = burst_batches as f32 * BATCH_MS as f32 / 1000.0;
-    let paced_secs = paced_batches as f32 * BATCH_MS as f32 / 1000.0;
     info!(
         total_batches,
         burst_batches,
         paced_batches,
-        available_s = (available_s * 100.0).round() / 100.0,
+        available_s = format!("{:.2}", available_s),
         "burst plan"
     );
 
@@ -827,7 +827,7 @@ async fn push_to_spk(
             bb_for_pacing.lock().await.record_burst(burst_secs);
             info!(
                 burst_batches,
-                burst_secs = (burst_secs * 100.0).round() / 100.0,
+                burst_secs = format!("{:.2}", burst_secs),
                 "burst phase done"
             );
         }
@@ -941,7 +941,7 @@ async fn push_to_spk(
         // same rate audio-io drains, so the ring depth right after
         // pacing matches the depth right after the burst.
         if paced_batches > 0 {
-            bb_for_pacing.lock().await.record_paced(paced_secs);
+            bb_for_pacing.lock().await.record_paced();
         }
         // Both clocks reported so the operator can confirm the WSL2
         // wall-vs-monotonic skew: a healthy run has both within a few
@@ -1111,7 +1111,7 @@ mod tests {
         let burst3 = 2.0f32.min(avail3);
         assert!((burst3 - 1.0).abs() < 0.05);
         b.record_burst(burst3);
-        b.record_paced(2.0 - burst3);
+        b.record_paced();
 
         // Call 4 (api②): immediate after pacing kept depth at 5 →
         // 0 headroom, full 2 s is paced.
