@@ -31,6 +31,7 @@
 //! task surfaces as 499 Client Closed Request so the caller can
 //! distinguish "interrupted" from synth/network errors.
 
+use std::collections::VecDeque;
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -118,9 +119,19 @@ struct AppState {
     // owned by the awaiting handler. This is what lets the cancelled
     // request return 499 cleanly while the new request awaits its
     // own task.
-    current_task: Arc<Mutex<Option<AbortHandle>>>,
+    //
+    // FIFO of every in-flight + permit-waiting task's abort handle.
+    // `/speak` (barge-in) drains the whole queue and aborts each —
+    // not just the running task, but also any `/append`s queued
+    // behind speak_permit, so a barge-in really cuts everything that
+    // was scheduled for the previous turn. `/append` only pushes its
+    // own handle (it must NOT abort the previous task — that's the
+    // whole point of api②). Completed handles are reaped lazily on
+    // each push via `retain(!is_finished())` so the queue doesn't
+    // grow without bound during long sessions.
+    barge_in_targets: Arc<Mutex<VecDeque<AbortHandle>>>,
     // Single-permit semaphore around speak_one. A burst of /speak
-    // requests aborts the previous task via current_task.abort(), but
+    // requests aborts the previous tasks via barge_in_targets, but
     // the abort signal only takes effect at the next .await point —
     // a request mid-`reqwest::send().await` keeps running until the
     // network resolves. The semaphore makes the new request wait for
@@ -253,7 +264,7 @@ async fn main() -> Result<()> {
             .timeout(Duration::from_secs(60))
             .build()
             .context("build reqwest client")?,
-        current_task: Arc::new(Mutex::new(None)),
+        barge_in_targets: Arc::new(Mutex::new(VecDeque::new())),
         speak_permit: Arc::new(Semaphore::new(1)),
         burst_budget: Arc::new(Mutex::new(BurstBudget::new(BURST_CAPACITY_S))),
     };
@@ -327,50 +338,54 @@ async fn enter_speak(state: AppState, text: String, mode: ApiMode) -> Response {
     }
 
     if mode == ApiMode::Speak {
-        // Barge-in: tear down the in-flight task and the audio already
-        // queued in audio-io's ring, then reset the burst budget so
-        // the new utterance starts from a full 5 s headroom.
+        // Barge-in: tear down EVERY task scheduled for the previous
+        // turn — the one currently holding speak_permit AND any
+        // /appends queued behind it — plus the audio already buffered
+        // in audio-io's ring. Then reset the burst budget so the new
+        // utterance starts from a full 5 s headroom.
         //
-        // current_task may hold the AbortHandle of a task that has
-        // already completed normally (we don't proactively clear it
-        // when speak_one returns). Calling /spk/stop on that branch
-        // sets audio-io's flush flag, and the *new* utterance's
-        // first Frame then gets eaten by the cancellation path in
-        // playback_producer_task — manifesting as the head of the
-        // 2nd-turn 1st sentence being clipped to ~500 ms of silence
-        // (the "うん" → "ん" head-clip seen in production). Guard
-        // with is_finished() so /spk/stop only fires on a real
-        // barge-in (previous task still running).
-        let prev_abort = {
-            let mut guard = state.current_task.lock().await;
-            guard.take()
+        // Why drain the whole queue instead of just the head: if A is
+        // running and B/C are permit-waiting behind it, aborting only
+        // the latest (the old single-slot design) would leave A, B, C
+        // alive — A keeps pushing to /spk after our /spk/stop, and B/C
+        // run their full synth→push cycle after E acquires the permit.
+        // Both are barge-in regressions.
+        //
+        // is_finished() guards against firing /spk/stop on a "stale"
+        // queue — if every entry already completed normally, the new
+        // utterance's first Frame would otherwise be eaten by the
+        // cancellation path in playback_producer_task and the head of
+        // the 2nd-turn 1st sentence ends up clipped to ~500 ms of
+        // silence (the "うん" → "ん" head-clip seen in production).
+        let prev: Vec<AbortHandle> = {
+            let mut guard = state.barge_in_targets.lock().await;
+            guard.drain(..).collect()
         };
-        if let Some(prev) = prev_abort {
-            if !prev.is_finished() {
-                prev.abort();
-                // Drop already-buffered playback. The abort above stops
-                // further frames from being WS-pushed, but audio-io
-                // still has up to playback_buffer_ms of ring on the
-                // speaker — without /spk/stop the user keeps hearing
-                // the cancelled utterance for up to 10 s (fixes
-                // PR #15 review #27).
-                if let Some(base) = state.cfg.audio_io_base.as_deref() {
-                    match state
-                        .http
-                        .post(format!("{}/spk/stop", base))
-                        .timeout(Duration::from_secs(2))
-                        .send()
-                        .await
-                    {
-                        Ok(_) => {}
-                        Err(e) => warn!("POST /spk/stop after barge-in failed: {}", e),
-                    }
+        let mut had_active = false;
+        for handle in prev {
+            if !handle.is_finished() {
+                handle.abort();
+                had_active = true;
+            }
+        }
+        if had_active {
+            // Drop already-buffered playback. The aborts above stop
+            // further frames from being WS-pushed, but audio-io still
+            // has up to playback_buffer_ms of ring on the speaker —
+            // without /spk/stop the user keeps hearing the cancelled
+            // utterance for up to 10 s (fixes PR #15 review #27).
+            if let Some(base) = state.cfg.audio_io_base.as_deref() {
+                match state
+                    .http
+                    .post(format!("{}/spk/stop", base))
+                    .timeout(Duration::from_secs(2))
+                    .send()
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(e) => warn!("POST /spk/stop after barge-in failed: {}", e),
                 }
             }
-            // Else: previous task already finished, the stored
-            // AbortHandle is just a stale reference — drop it without
-            // touching audio-io. The new task's Frames will land in a
-            // clean ring with no flush flag racing them.
         }
         state.burst_budget.lock().await.reset();
     }
@@ -380,15 +395,14 @@ async fn enter_speak(state: AppState, text: String, mode: ApiMode) -> Response {
     let task = tokio::spawn(speak_one(state.clone(), text));
     let abort = task.abort_handle();
     {
-        // Store our abort handle so a subsequent /speak can cancel us.
-        // For ApiMode::Speak we already take()d above so this just
-        // installs ours; for ApiMode::Append the slot may hold a stale
-        // handle of a task that's already running (and which we must
-        // NOT abort — that's why Append doesn't call abort here).
-        // Replace either way: the stored handle's purpose is "what the
-        // NEXT /speak should abort", and that's us now.
-        let mut guard = state.current_task.lock().await;
-        guard.replace(abort);
+        // Append our handle so a future /speak can cancel us. Reap
+        // completed handles first so the queue doesn't grow with every
+        // /append in a long session (abort on a finished handle is a
+        // no-op, but we'd still walk over the dead entries on every
+        // barge-in).
+        let mut guard = state.barge_in_targets.lock().await;
+        guard.retain(|h| !h.is_finished());
+        guard.push_back(abort);
     }
 
     match task.await {
@@ -455,13 +469,18 @@ async fn finalize(State(state): State<AppState>) -> Response {
 
 async fn stop(State(state): State<AppState>) -> Json<Value> {
     let cancelled = {
-        let mut guard = state.current_task.lock().await;
-        if let Some(prev) = guard.take() {
-            prev.abort();
-            true
-        } else {
-            false
+        let prev: Vec<AbortHandle> = {
+            let mut guard = state.barge_in_targets.lock().await;
+            guard.drain(..).collect()
+        };
+        let mut any_live = false;
+        for handle in prev {
+            if !handle.is_finished() {
+                handle.abort();
+                any_live = true;
+            }
         }
+        any_live
     };
     // Drop already-buffered playback. The abort above stops further
     // frames from being WS-pushed, but audio-io still has a few
