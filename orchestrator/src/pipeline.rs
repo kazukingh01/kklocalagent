@@ -381,9 +381,9 @@ pub async fn run_turn(
 /// The first sentence of each turn goes to `tts.url` (`/speak` =
 /// api①, resets the burst budget on the streamer); subsequent
 /// sentences go to `tts.append_url` (`/append` = api②, reuses the
-/// budget). When `append_url` is empty we fall back to `url` for
-/// every sentence — pre-issue-#16 behaviour, kept so old deployments
-/// don't break before the streamer is updated.
+/// budget). `append_url` is validated as required at startup when
+/// `url` is set (see `Config::validate`), so we can dispatch
+/// continuation sentences unconditionally to it here.
 fn spawn_tts_consumer(
     backends: Arc<Backends>,
     wake: Arc<WakeMachine>,
@@ -405,9 +405,10 @@ fn spawn_tts_consumer(
                 continue;
             }
             // First sentence per turn → /speak (api①, resets budget).
-            // Subsequent sentences → /append (api②) if configured,
-            // else fall back to /speak.
-            let (api_label, target_url) = if is_first || backends.tts.append_url.is_empty() {
+            // Subsequent sentences → /append (api②). append_url is
+            // required at startup when url is set, so the second
+            // branch is always wired.
+            let (api_label, target_url) = if is_first {
                 ("speak", &backends.tts.url)
             } else {
                 ("append", &backends.tts.append_url)
@@ -422,8 +423,8 @@ fn spawn_tts_consumer(
 /// Inner POST. Permit management is the caller's responsibility — see
 /// `spawn_tts_consumer` (per-turn permit) for the streaming path.
 /// `api` is "speak" or "append" (set by the consumer based on
-/// is_first/append_url); it's only used for log clarity — the actual
-/// dispatch is by `url`.
+/// is_first); it's only used for log clarity — the actual dispatch
+/// is by `url`.
 async fn tts_speak_inner(backends: &Backends, api: &str, url: &str, text: &str) {
     info!(
         target: "orch::pipeline",

@@ -103,6 +103,10 @@ case "${MODEL}" in
                 exit 1
             fi
             BUILD_DIR="/tmp/mtp-build-$$"
+            # set -e で huggingface-cli / ollama create が落ちると後段の
+            # `rm -rf "${BUILD_DIR}"` を踏まずに抜けるため、~20 GiB の
+            # safetensors が /tmp に残留する。trap で確実に掃除する。
+            trap 'rm -rf "${BUILD_DIR:-}"' EXIT
             mkdir -p "${BUILD_DIR}/target" "${BUILD_DIR}/draft"
             echo "[init] downloading target ${TARGET_REPO}"
             HF_TOKEN="${HF_TOKEN}" huggingface-cli download "${TARGET_REPO}" \
