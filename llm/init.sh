@@ -39,10 +39,25 @@ done
 # Model-name convention: `gemma4:<variant>-mtp` triggers the MTP build
 # path. Anything else falls through to plain `ollama pull`.
 #
-# MTP needs target + drafter safetensors (not GGUF) because PR #15980
-# only wires the DRAFT directive through Ollama's safetensors import
-# path. The variants below mirror Google's HF org layout
-# (https://huggingface.co/google).
+# Layout: both target and drafter are downloaded from Hugging Face as
+# safetensors. `ollama create --experimental` only accepts safetensors
+# directories under `FROM` (the GGUF-tag-as-FROM fallback was tested
+# and rejected with "not a supported model directory"). On Linux/CUDA
+# the `--quantize` flag also requires MLX (Apple Silicon), so the
+# import lands as native BF16.
+#
+# VRAM footprint (measured / HF):
+#   E2B BF16 ~10 GiB on disk → ~13-14 GiB at inference (weights + Q8
+#                              KV cache @ 32k + activations). Tight
+#                              but feasible on a 16 GiB consumer GPU;
+#                              drop OLLAMA_CONTEXT_LENGTH to 8k/4k
+#                              if it OOMs at warm-up.
+#   E4B BF16 ~22 GiB on disk → ~28 GiB at inference. Needs 32 GiB+ GPU.
+#   26B / 31B → datacenter cards only.
+#
+# Pre-quantised gemma4 MTP tags in the Ollama library (e.g. the
+# existing `gemma4:31b-coding-mtp-bf16`) will eventually obviate
+# this whole branch; until then this is the only way on Linux.
 case "${MODEL}" in
     *-mtp|*-mtp-*)
         case "${MODEL}" in
@@ -93,39 +108,21 @@ case "${MODEL}" in
             HF_TOKEN="${HF_TOKEN}" huggingface-cli download "${DRAFT_REPO}" \
                 --local-dir "${BUILD_DIR}/draft" \
                 --local-dir-use-symlinks False
-            # Modelfile is intentionally minimal: PARAMETER
-            # `num_speculative_tokens` is not in 0.23.2's allowlist
-            # ("unknown parameter") even though the PR conversation
-            # mentioned it. Letting Ollama use its default count is
-            # fine for now; revisit when the upstream surfaces the
-            # knob (env var or per-request option). NUM_SPEC_TOKENS
-            # is kept above as documentation of the recommended
-            # value per variant.
+            # Modelfile is intentionally minimal:
+            #   * `PARAMETER num_speculative_tokens` is not in 0.23.2's
+            #     allowlist ("unknown parameter") — NUM_SPEC_TOKENS is
+            #     kept above as documentation of the recommended value
+            #     per variant, ready to re-wire once upstream surfaces
+            #     the knob.
+            #   * No `--quantize` on `ollama create` because that path
+            #     requires MLX (Apple Silicon only); on Linux/CUDA the
+            #     model lands as native BF16.
             cat > "${BUILD_DIR}/Modelfile" <<EOF
 FROM ${BUILD_DIR}/target
 DRAFT ${BUILD_DIR}/draft
 EOF
-            # Quantize at import time. The PR conversation noted that
-            # unquantized BF16 has the best output quality but the
-            # target weights alone (~14 GiB for E4B BF16) plus KV
-            # cache + activations push past 16 GiB on a 4090 Laptop.
-            # q8_0 halves the model size at near-lossless quality and
-            # leaves headroom for the 32 k context KV cache. Override
-            # with `MTP_QUANTIZE=` (empty) to keep BF16 on a card with
-            # ≥ 24 GiB, or with e.g. `q4_K_M` for tighter memory at
-            # some quality cost.
-            # Ollama 0.23.2 only exposes `--quantize` (applies to the
-            # target model). `--quantize-draft` was mentioned in the
-            # PR thread but isn't on the CLI yet — the drafter stays
-            # at its native dtype, which is fine because it's tiny
-            # (the 4-layer assistant is a few hundred MB regardless).
-            QUANTIZE="${MTP_QUANTIZE-q8_0}"
-            QUANTIZE_FLAGS=()
-            if [ -n "${QUANTIZE}" ]; then
-                QUANTIZE_FLAGS+=(--quantize "${QUANTIZE}")
-            fi
-            echo "[init] ollama create --experimental ${MODEL} (quantize=${QUANTIZE:-bf16})"
-            ollama create --experimental "${MODEL}" -f "${BUILD_DIR}/Modelfile" "${QUANTIZE_FLAGS[@]}"
+            echo "[init] ollama create --experimental ${MODEL} (native BF16)"
+            ollama create --experimental "${MODEL}" -f "${BUILD_DIR}/Modelfile"
             # Cleanup: ollama create copied the weights into its own
             # blob store under /root/.ollama; the staging dir is no
             # longer needed and would otherwise waste ~10 GB per build.
