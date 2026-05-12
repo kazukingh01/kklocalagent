@@ -431,90 +431,147 @@ async fn playback_producer_task(
         }
     };
     let ring_capacity = producer.capacity().get();
+    // Idle silence keep-alive threshold. When no Frame messages are
+    // arriving, top up the ring with 0.0 samples so the OS-level
+    // audio pipeline (WASAPI prefetch / ALSA period buffer) stays warm
+    // — without this, the first sentence of the second-and-later turns
+    // was head-clipped because the pipeline had gone cold during the
+    // inter-turn idle period. 50ms is enough margin to absorb the
+    // ~10ms cpal callback jitter without delaying real audio (the
+    // top-up only fires while ring_depth < threshold; real audio
+    // pushes the depth far above this).
+    let keep_alive_threshold = (native_rate as usize) * (native_channels as usize) * 50 / 1000;
     let mut total_dropped: u64 = 0;
     let mut drops_since_log: u32 = 0;
-    while let Some(msg) = spk_rx.recv().await {
-        if flush.producer.swap(false, Ordering::Relaxed) {
-            // Cancellation (barge-in) — drain everything queued and
-            // reset the framer. Any in-flight Eos requests get their
-            // drain_done fired immediately because the cancel itself
-            // is the "no more audio is coming" signal that the
-            // upstream is waiting for.
-            while let Ok(pending) = spk_rx.try_recv() {
-                if let PlaybackMessage::Eos { drain_done } = pending {
-                    let _ = drain_done.send(());
+    loop {
+        tokio::select! {
+            // Frame / Eos / shutdown gets strictly preferred over the
+            // idle keep-alive: if a Frame is ready, we'd rather push
+            // real audio than synthetic silence. `biased` means tokio
+            // polls the `recv` arm first every iteration before even
+            // looking at the keep-alive sleep.
+            biased;
+            recv = spk_rx.recv() => {
+                let Some(msg) = recv else { break; };
+                if flush.producer.swap(false, Ordering::Relaxed) {
+                    // Cancellation (barge-in) — drain everything queued
+                    // and reset the framer. Any in-flight Eos requests
+                    // get their drain_done fired immediately because
+                    // the cancel itself is the "no more audio is
+                    // coming" signal that the upstream is waiting for.
+                    while let Ok(pending) = spk_rx.try_recv() {
+                        if let PlaybackMessage::Eos { drain_done } = pending {
+                            let _ = drain_done.send(());
+                        }
+                    }
+                    framer.flush();
+                    if let PlaybackMessage::Eos { drain_done } = msg {
+                        let _ = drain_done.send(());
+                    }
+                    continue;
+                }
+                match msg {
+                    PlaybackMessage::Frame(bytes) => {
+                        // Mark this tick as "audio flowing" so the
+                        // underrun logger emits warns gated on actual
+                        // sender activity instead of spamming while
+                        // idle.
+                        stats.audio_seen.store(true, Ordering::Relaxed);
+                        let samples = framer.push_s16le(&bytes);
+                        let mut overflow = false;
+                        let mut dropped_this_batch: usize = 0;
+                        for s in samples {
+                            if overflow {
+                                dropped_this_batch += 1;
+                                continue;
+                            }
+                            if producer.try_push(s).is_err() {
+                                overflow = true;
+                                dropped_this_batch += 1;
+                            }
+                        }
+                        if dropped_this_batch > 0 {
+                            total_dropped =
+                                total_dropped.saturating_add(dropped_this_batch as u64);
+                            // Per-batch debug line so an operator
+                            // running with `RUST_LOG=audio_io::playback=debug`
+                            // (or just =debug) can confirm whether
+                            // their WS sender is overpacing the cpal
+                            // consumer — even a single dropped sample
+                            // shows up here, which the rate-limited
+                            // warn below hides until 50 batches have
+                            // piled up.
+                            debug!(
+                                dropped_this_batch,
+                                total_dropped,
+                                "playback ring full; dropping samples (WS arriving faster than cpal consumes)"
+                            );
+                            drops_since_log += 1;
+                            // Rate-limit: roughly once per ~1s at
+                            // 20ms/frame.
+                            if drops_since_log >= 50 {
+                                warn!(
+                                    total_dropped,
+                                    "playback ring buffer full; dropping samples (consumer slower than producer)"
+                                );
+                                drops_since_log = 0;
+                            }
+                        }
+                    }
+                    PlaybackMessage::Eos { drain_done } => {
+                        // Wait for the cpal output thread to consume
+                        // every real sample we've pushed. The Eos arm
+                        // runs inside the select; once tokio picks
+                        // this branch it polls *only* this future
+                        // until it returns Poll::Ready — the inner
+                        // `sleep(5ms).await` is a yield point within
+                        // the same future, not a re-entry into the
+                        // select, so the idle keep-alive arm is NOT
+                        // polled and cannot race silence top-ups into
+                        // the ring we're trying to drain to empty.
+                        //
+                        // A flush mid-wait is treated as "drained now"
+                        // — the cancel path drained the ring on our
+                        // behalf.
+                        let drain_start = Instant::now();
+                        while producer.vacant_len() < ring_capacity {
+                            if flush.producer.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                        let drain_ms = drain_start.elapsed().as_millis();
+                        info!(drain_ms, "playback ring drained, signaling client");
+                        let _ = drain_done.send(());
+                        // Note: on the next loop iteration the
+                        // keep-alive arm will see an empty ring and
+                        // refill up to keep_alive_threshold (50 ms of
+                        // silence). The drain handshake has already
+                        // fired so the upstream is unblocked; that 50
+                        // ms tail is harmless filler. The subsequent
+                        // /speak path POSTs /spk/stop, which sets the
+                        // flush flag and erases this filler before the
+                        // next real Frame is pushed — so no head-clip
+                        // risk for the next turn.
+                    }
                 }
             }
-            framer.flush();
-            if let PlaybackMessage::Eos { drain_done } = msg {
-                let _ = drain_done.send(());
-            }
-            continue;
-        }
-        match msg {
-            PlaybackMessage::Frame(bytes) => {
-                // Mark this tick as "audio flowing" so the underrun
-                // logger emits warns gated on actual sender activity
-                // instead of spamming while idle.
-                stats.audio_seen.store(true, Ordering::Relaxed);
-                let samples = framer.push_s16le(&bytes);
-                let mut overflow = false;
-                let mut dropped_this_batch: usize = 0;
-                for s in samples {
-                    if overflow {
-                        dropped_this_batch += 1;
-                        continue;
-                    }
-                    if producer.try_push(s).is_err() {
-                        overflow = true;
-                        dropped_this_batch += 1;
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                // Idle keep-alive: when the ring drops below
+                // keep_alive_threshold (50 ms), top it up to that
+                // threshold with 0.0 silence. Keeps the OS audio
+                // pipeline pre-fetched so the next real audio doesn't
+                // pay a wake-up latency on the speaker. Cheap no-op
+                // while real audio is flowing (ring depth >> 50 ms).
+                let depth = ring_capacity - producer.vacant_len();
+                if depth < keep_alive_threshold {
+                    let need = keep_alive_threshold - depth;
+                    for _ in 0..need {
+                        if producer.try_push(0.0).is_err() {
+                            break;
+                        }
                     }
                 }
-                if dropped_this_batch > 0 {
-                    total_dropped = total_dropped.saturating_add(dropped_this_batch as u64);
-                    // Per-batch debug line so an operator running with
-                    // `RUST_LOG=audio_io::playback=debug` (or just =debug)
-                    // can confirm whether their WS sender is overpacing
-                    // the cpal consumer — even a single dropped sample
-                    // shows up here, which the rate-limited warn below
-                    // hides until 50 batches have piled up.
-                    debug!(
-                        dropped_this_batch,
-                        total_dropped,
-                        "playback ring full; dropping samples (WS arriving faster than cpal consumes)"
-                    );
-                    drops_since_log += 1;
-                    // Rate-limit: roughly once per ~1s at 20ms/frame.
-                    if drops_since_log >= 50 {
-                        warn!(
-                            total_dropped,
-                            "playback ring buffer full; dropping samples (consumer slower than producer)"
-                        );
-                        drops_since_log = 0;
-                    }
-                }
-            }
-            PlaybackMessage::Eos { drain_done } => {
-                // Wait for the cpal output thread to consume every
-                // sample we've pushed. Polling vacant_len from the
-                // producer side reads how much room is available; when
-                // it equals capacity, the ring is empty and the cpal
-                // callback has just emitted (or is about to emit) its
-                // last non-zero sample. 5 ms granularity is well below
-                // a 20 ms frame so the upstream sees the drained
-                // signal within ~one cpal callback of true silence.
-                // A flush mid-wait is treated as "drained now" — the
-                // cancel path drained the ring on our behalf.
-                let drain_start = Instant::now();
-                while producer.vacant_len() < ring_capacity {
-                    if flush.producer.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-                let drain_ms = drain_start.elapsed().as_millis();
-                info!(drain_ms, "playback ring drained, signaling client");
-                let _ = drain_done.send(());
             }
         }
     }

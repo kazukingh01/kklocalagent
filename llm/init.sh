@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Start `ollama serve` in the background, wait for the API to accept
-# requests, then pull ${LLM_MODEL} so the first /api/chat against this
-# container doesn't 404. Hand PID back to `ollama serve` via `wait` so
-# SIGTERM propagates cleanly at container stop.
+# requests, then make ${LLM_MODEL} available (either via `ollama pull`
+# for library tags, or via `ollama create` from Hugging Face
+# safetensors for the MTP variants). Hand PID back to `ollama serve`
+# via `wait` so SIGTERM propagates cleanly at container stop.
 #
 # Idempotent w.r.t. the model cache: if the model is already present in
-# the mounted volume, `ollama pull` is a no-op and the API is serving
+# the mounted volume, both paths short-circuit and the API is serving
 # within ~2 s.
 set -euo pipefail
 
@@ -35,9 +36,113 @@ for i in $(seq 1 60); do
     sleep 1
 done
 
-echo "[init] pulling model: ${MODEL}"
-ollama pull "${MODEL}"
-echo "[init] model ready: ${MODEL}"
+# Model-name convention: `gemma4:<variant>-mtp` triggers the MTP build
+# path. Anything else falls through to plain `ollama pull`.
+#
+# Layout: both target and drafter are downloaded from Hugging Face as
+# safetensors. `ollama create --experimental` only accepts safetensors
+# directories under `FROM` (the GGUF-tag-as-FROM fallback was tested
+# and rejected with "not a supported model directory"). On Linux/CUDA
+# the `--quantize` flag also requires MLX (Apple Silicon), so the
+# import lands as native BF16.
+#
+# VRAM footprint (measured / HF):
+#   E2B BF16 ~10 GiB on disk → ~13-14 GiB at inference (weights + Q8
+#                              KV cache @ 32k + activations). Tight
+#                              but feasible on a 16 GiB consumer GPU;
+#                              drop OLLAMA_CONTEXT_LENGTH to 8k/4k
+#                              if it OOMs at warm-up.
+#   E4B BF16 ~22 GiB on disk → ~28 GiB at inference. Needs 32 GiB+ GPU.
+#   26B / 31B → datacenter cards only.
+#
+# Pre-quantised gemma4 MTP tags in the Ollama library (e.g. the
+# existing `gemma4:31b-coding-mtp-bf16`) will eventually obviate this
+# whole branch; until then this is the only way on Linux.
+#
+# Match the four known "build-from-HF" tags exactly. Anything else —
+# including future pre-quantised library tags like `*-mtp-bf16` — falls
+# through to plain `ollama pull` so a glob like `*-mtp-*` doesn't trap
+# them into the build path and exit 1 on what is really an off-the-shelf
+# pull.
+#
+# Recommended num_speculative_tokens per variant (for future re-wiring
+# once upstream surfaces the knob in `ollama create`'s allowlist):
+#   gemma4:e2b-mtp   → 2
+#   gemma4:e4b-mtp   → 4
+#   gemma4:26b-mtp   → 4
+#   gemma4:31b-mtp   → 4
+case "${MODEL}" in
+    gemma4:e4b-mtp|gemma4:e2b-mtp|gemma4:26b-mtp|gemma4:31b-mtp)
+        case "${MODEL}" in
+            gemma4:e4b-mtp)
+                TARGET_REPO="google/gemma-4-E4B-it"
+                DRAFT_REPO="google/gemma-4-E4B-it-assistant"
+                ;;
+            gemma4:e2b-mtp)
+                TARGET_REPO="google/gemma-4-E2B-it"
+                DRAFT_REPO="google/gemma-4-E2B-it-assistant"
+                ;;
+            gemma4:26b-mtp)
+                TARGET_REPO="google/gemma-4-26B-A4B-it"
+                DRAFT_REPO="google/gemma-4-26B-A4B-it-assistant"
+                ;;
+            gemma4:31b-mtp)
+                TARGET_REPO="google/gemma-4-31B-it"
+                DRAFT_REPO="google/gemma-4-31B-it-assistant"
+                ;;
+        esac
+
+        # Skip the build if `ollama list` already shows the tag — keeps
+        # `docker compose restart` snappy after the first cold create.
+        if ollama list 2>/dev/null | awk '{print $1}' | grep -Fxq "${MODEL}"; then
+            echo "[init] MTP model already present: ${MODEL}"
+        else
+            if [ -z "${HF_TOKEN:-}" ]; then
+                echo "[init] HF_TOKEN is required to build ${MODEL} (target + drafter are gated Gemma models on HF)" >&2
+                kill "${SERVE_PID}" 2>/dev/null || true
+                exit 1
+            fi
+            BUILD_DIR="/tmp/mtp-build-$$"
+            # set -e で huggingface-cli / ollama create が落ちると後段の
+            # `rm -rf "${BUILD_DIR}"` を踏まずに抜けるため、~20 GiB の
+            # safetensors が /tmp に残留する。trap で確実に掃除する。
+            trap 'rm -rf "${BUILD_DIR:-}"' EXIT
+            mkdir -p "${BUILD_DIR}/target" "${BUILD_DIR}/draft"
+            echo "[init] downloading target ${TARGET_REPO}"
+            HF_TOKEN="${HF_TOKEN}" huggingface-cli download "${TARGET_REPO}" \
+                --local-dir "${BUILD_DIR}/target" \
+                --local-dir-use-symlinks False
+            echo "[init] downloading drafter ${DRAFT_REPO}"
+            HF_TOKEN="${HF_TOKEN}" huggingface-cli download "${DRAFT_REPO}" \
+                --local-dir "${BUILD_DIR}/draft" \
+                --local-dir-use-symlinks False
+            # Modelfile is intentionally minimal:
+            #   * `PARAMETER num_speculative_tokens` is not in 0.23.2's
+            #     allowlist ("unknown parameter") — the recommended
+            #     per-variant values are kept in the case-block comment
+            #     above, ready to re-wire once upstream surfaces the knob.
+            #   * No `--quantize` on `ollama create` because that path
+            #     requires MLX (Apple Silicon only); on Linux/CUDA the
+            #     model lands as native BF16.
+            cat > "${BUILD_DIR}/Modelfile" <<EOF
+FROM ${BUILD_DIR}/target
+DRAFT ${BUILD_DIR}/draft
+EOF
+            echo "[init] ollama create --experimental ${MODEL} (native BF16)"
+            ollama create --experimental "${MODEL}" -f "${BUILD_DIR}/Modelfile"
+            # Cleanup: ollama create copied the weights into its own
+            # blob store under /root/.ollama; the staging dir is no
+            # longer needed and would otherwise waste ~10 GB per build.
+            rm -rf "${BUILD_DIR}"
+            echo "[init] MTP model ready: ${MODEL}"
+        fi
+        ;;
+    *)
+        echo "[init] pulling model: ${MODEL}"
+        ollama pull "${MODEL}"
+        echo "[init] model ready: ${MODEL}"
+        ;;
+esac
 
 # Warm the model into VRAM so the first /api/chat from the
 # orchestrator doesn't pay a 5–15 s cold-load tax (model load shows up

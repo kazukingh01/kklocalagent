@@ -37,7 +37,18 @@ max_inflight = 1
 # logged but not voiced. Production wires this at the `tts-streamer`
 # service which fronts VOICEVOX + the audio-io /spk push.
 [tts]
+# `/speak` (api①) — POSTed for the first sentence of each turn.
+# Cancels any in-flight utterance, drops audio-io's ring, and starts
+# fresh with a full 5 s burst budget.
 url = "http://tts-streamer:7070/speak"
+# `/append` (api②) — POSTed for the second and later sentences of
+# the same turn. Doesn't cancel or reset; reuses whatever burst
+# budget remains so back-to-back sentences don't re-prebuffer 5 s
+# each and overflow audio-io's ring (issue #16). Required when
+# `url` is set — the streamer's `/speak` now FIFO-aborts the
+# previous task, so a fallback through `/speak` would cut sentence
+# N mid-utterance when sentence N+1 arrives.
+append_url = "http://tts-streamer:7070/append"
 # Cancel-in-flight URL. Used by `wake.barge_in` to interrupt a
 # TTS reply when the operator says the wake word again. Empty
 # disables the cancel side-effect.

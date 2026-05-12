@@ -151,12 +151,22 @@ services:
       # cache vs the f16 default at negligible quality loss. Needs
       # OLLAMA_FLASH_ATTENTION=1.
       OLLAMA_KV_CACHE_TYPE: "q8_0"
-      # Context window. Voice multi-turn benefits from a longer
-      # window so the agent's checkpointed history isn't truncated
-      # after a handful of turns. 32k at q8_0 KV ≈ ~1 GiB of cache —
-      # well inside the 4090-Laptop's headroom (gemma4:e4b weights
-      # are ~9 GiB, leaving ~3 GiB free at 4096; 32k still fits).
-      OLLAMA_CONTEXT_LENGTH: "${OLLAMA_CONTEXT_LENGTH:-32768}"
+      # Context window. Voice multi-turn benefits from a long enough
+      # window to keep a handful of turns in checkpointed history, but
+      # the cost is KV cache size + per-token attention compute.
+      # 8 k @ q8 KV ≈ ~250 MiB cache (vs ~1 GiB at 32k) and trims
+      # ~5-10 % off per-token latency on a 4090 Laptop. Voice replies
+      # almost never need more than a few hundred tokens of context
+      # for the agent to keep state coherent, so 8 k is the sweet
+      # spot for this workload. Bump if you find the agent forgetting
+      # mid-conversation.
+      OLLAMA_CONTEXT_LENGTH: "${OLLAMA_CONTEXT_LENGTH:-8192}"
+      # Force the quantised matrix-multiplication CUDA kernel (MMQ)
+      # instead of the cuBLAS-on-dequantised path. For Q4_K_M models
+      # on Ada (RTX 4090 / 4090 Laptop, compute 8.9) MMQ is reliably
+      # 10-30 % faster at token generation. The flag is harmless on
+      # GPUs where MMQ isn't a win — ggml falls back gracefully.
+      GGML_CUDA_FORCE_MMQ: "1"
       # One inference at a time — the orchestrator already serialises
       # turns at max_inflight=1, so allowing parallel slots would only
       # split the KV cache and hurt single-turn latency.
@@ -164,6 +174,11 @@ services:
       # Don't let a stray /api/show or warm-pull hold a second model
       # resident: voice agent only needs the one configured weight.
       OLLAMA_MAX_LOADED_MODELS: "1"
+      # Forwarded to huggingface-cli inside init.sh — only consulted
+      # when LLM_MODEL ends in `-mtp` (target + drafter safetensors
+      # for the MTP build path are gated Gemma weights). Plain ollama
+      # pull tags (e.g. `gemma4:e4b`) don't need this.
+      HF_TOKEN: "${HF_TOKEN:-}"
     volumes:
       - ollama-data:/root/.ollama
     ports:
@@ -359,7 +374,7 @@ services:
       # and restarting the agent takes effect on existing sessions'
       # next turn). Single-line in .env; for multi-paragraph
       # instructions edit this YAML directly (supports literal blocks).
-      AGENT_SYSTEM_PROMPT: "${AGENT_SYSTEM_PROMPT:-You are a voice assistant; your replies are spoken aloud, so write the way people speak — no markdown, no lists, no code blocks. Keep every response to one or two short sentences. Default to Japanese (日本語) unless the user clearly speaks another language. Maintain a brisk, natural conversational rhythm. Keep wording as simple and minimal as possible — fewer words is better. Skip honorifics (敬語); use casual / plain-form Japanese (タメ口).}"
+      AGENT_SYSTEM_PROMPT: "${AGENT_SYSTEM_PROMPT:-You are a voice assistant; your replies are spoken aloud, so write the way people speak — no markdown, no lists, no code blocks. Keep every response to one or two short sentences. Default to Japanese (日本語) unless the user clearly speaks another language. Maintain a brisk, natural conversational rhythm. Keep wording as simple and minimal as possible — fewer words is better. Skip honorifics (敬語); use casual / plain-form Japanese (タメ口). Input text is produced by ASR (speech-to-text); read it with that in mind — expect transcription noise, dropped particles, and homophone mistakes. If the input doesn't seem to make sense, assume the user's speech may have been only partially or incorrectly transcribed, and respond accordingly (briefly confirm or pick the most plausible meaning).}"
       # Rotate the LangGraph thread_id (= conversation memory key)
       # after this many seconds without /api/chat traffic. Voice agent
       # assumes one operator per process, so going idle = "the
@@ -405,6 +420,11 @@ services:
       # anyway, but keeping this empty makes the contract explicit.
       ORCH_LLM_SYSTEM_PROMPT: ""
       ORCH_TTS_URL: http://tts-streamer:7070/speak
+      # /append (api②) — used for the 2nd-and-later sentences of each
+      # turn so the streamer reuses its burst budget instead of
+      # re-prebuffering 5 s every sentence (which overflows audio-io's
+      # ring; issue #16). Empty falls back to /speak for every sentence.
+      ORCH_TTS_APPEND_URL: http://tts-streamer:7070/append
       ORCH_TTS_STOP_URL: http://tts-streamer:7070/stop
       # Drain handshake target. Called once per turn after the last
       # /speak — tts-streamer's response is the precise speaker-
@@ -458,3 +478,19 @@ volumes:
   asr-models:
   ollama-data:
   agent-data:
+
+# Pin the default bridge subnet so the UFW rule that allows
+# `audio-io` (host port 7010) inbound stays valid across
+# `docker compose down/up`. Without an explicit ipam.config, Docker
+# picks a free subnet each time the network is recreated — the rule
+# would silently stop matching and containers would lose audio-io
+# again. Gateway 172.25.0.1 is the host's br-xxxxx IP that ssh -R
+# binds to.
+networks:
+  default:
+    name: kklocalagent_default
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.25.0.0/16
+          gateway: 172.25.0.1

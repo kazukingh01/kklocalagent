@@ -101,8 +101,22 @@ pub struct LlmConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct TtsConfig {
-    /// `tts-streamer` `/speak` URL. Empty disables the stage.
+    /// `tts-streamer` `/speak` URL. Empty disables the stage. POSTed
+    /// for the **first** sentence of each turn — `/speak` is api①: it
+    /// cancels any in-flight utterance, drops audio-io's ring, and
+    /// starts the new audio with a full 5 s burst budget.
     pub url: String,
+    /// `tts-streamer` `/append` URL. POSTed for the **second and
+    /// later** sentences of the same turn. `/append` is api②: it
+    /// doesn't cancel or reset, just consumes whatever burst budget
+    /// is left after realtime drain — preventing the audio-io ring
+    /// overflow that issue #16 describes (re-bursting 5 s every
+    /// sentence caused dropouts). Required when `url` is set; the
+    /// pre-#16 fallback (route every sentence through `/speak`) is
+    /// no longer equivalent because the streamer's `/speak` now
+    /// FIFO-aborts the previous task, so a fallback would cut
+    /// sentence N mid-stream when sentence N+1 arrives.
+    pub append_url: String,
     /// `tts-streamer` `/stop` URL. Used for barge-in (`wake.barge_in`)
     /// — orchestrator POSTs here when a new WakeWordDetected arrives
     /// while a previous turn's TTS is still streaming. Empty disables
@@ -245,6 +259,7 @@ impl Default for TtsConfig {
             // this; dev / CI runs without `tts-streamer` leave it empty
             // so the pipeline still completes without trying to speak.
             url: String::new(),
+            append_url: String::new(),
             stop_url: String::new(),
             finalize_url: String::new(),
             timeout_ms: 60_000,
@@ -321,6 +336,17 @@ impl Config {
             }
             if self.tts.max_inflight == 0 {
                 anyhow::bail!("tts.max_inflight must be >= 1 when url is set");
+            }
+            // append_url は issue #16 の本丸。空フォールバックを許すと
+            // 全文が /speak に流れ、streamer 側の FIFO abort が文 N を
+            // 文 N+1 で中断してしまう（pre-#16 と等価ではない）。url を
+            // 設定する以上 append_url も必須にする。
+            if self.tts.append_url.is_empty() {
+                anyhow::bail!(
+                    "tts.append_url must be set when tts.url is set \
+                     (issue #16: /append routes continuation sentences so /speak's \
+                     FIFO-abort doesn't cut mid-utterance)"
+                );
             }
         }
         if self.wake.required {
@@ -401,6 +427,7 @@ mod tests {
         // permit.
         let mut cfg = Config::default();
         cfg.tts.url = "http://tts:7070/speak".into();
+        cfg.tts.append_url = "http://tts:7070/append".into();
         cfg.tts.stop_url = String::new();
         cfg.wake.barge_in = true;
         let err = cfg.validate().expect_err("should reject barge_in without stop_url");
@@ -425,6 +452,20 @@ mod tests {
         cfg.tts.url = "http://tts:7070/speak".into();
         cfg.tts.stop_url = "http://tts:7070/stop".into();
         cfg.wake.barge_in = true;
+        cfg.tts.append_url = "http://tts:7070/append".into();
         cfg.validate().expect("barge_in + stop_url is valid");
+    }
+
+    #[test]
+    fn tts_url_without_append_url_is_rejected() {
+        // issue #16 の追補: url を入れた以上 append_url も必須。空のままだと
+        // pipeline.rs が全文を /speak に流し、streamer の FIFO-abort が
+        // 文 N+1 で文 N を中断してしまう。
+        let mut cfg = Config::default();
+        cfg.tts.url = "http://tts:7070/speak".into();
+        cfg.tts.append_url = String::new();
+        let err = cfg.validate().expect_err("should reject url without append_url");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("append_url"), "unexpected error: {msg}");
     }
 }

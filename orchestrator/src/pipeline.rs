@@ -377,6 +377,13 @@ pub async fn run_turn(
 /// TTS consumer task: drains the sentence channel, calling
 /// `tts_speak_inner` serially per sentence while the turn is still
 /// active. Holds the turn-level TTS permit until the channel closes.
+///
+/// The first sentence of each turn goes to `tts.url` (`/speak` =
+/// api①, resets the burst budget on the streamer); subsequent
+/// sentences go to `tts.append_url` (`/append` = api②, reuses the
+/// budget). `append_url` is validated as required at startup when
+/// `url` is set (see `Config::validate`), so we can dispatch
+/// continuation sentences unconditionally to it here.
 fn spawn_tts_consumer(
     backends: Arc<Backends>,
     wake: Arc<WakeMachine>,
@@ -384,6 +391,7 @@ fn spawn_tts_consumer(
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut is_first = true;
         while let Some(sentence) = rx.recv().await {
             // Drain the rest after barge-in so the LLM sender can
             // finish without blocking, but skip the actual /speak.
@@ -396,19 +404,40 @@ fn spawn_tts_consumer(
             if permit.is_none() || backends.tts.url.is_empty() || sentence.is_empty() {
                 continue;
             }
-            tts_speak_inner(&backends, &sentence).await;
+            // First sentence per turn → /speak (api①, resets budget).
+            // Subsequent sentences → /append (api②). append_url is
+            // required at startup when url is set, so the second
+            // branch is always wired.
+            let (api_label, target_url) = if is_first {
+                ("speak", &backends.tts.url)
+            } else {
+                ("append", &backends.tts.append_url)
+            };
+            tts_speak_inner(&backends, api_label, target_url, &sentence).await;
+            is_first = false;
         }
         drop(permit);
     })
 }
 
-/// Inner /speak POST. Permit management is the caller's responsibility
-/// — see `spawn_tts_consumer` (per-turn permit) for the streaming path.
-async fn tts_speak_inner(backends: &Backends, text: &str) {
+/// Inner POST. Permit management is the caller's responsibility — see
+/// `spawn_tts_consumer` (per-turn permit) for the streaming path.
+/// `api` is "speak" or "append" (set by the consumer based on
+/// is_first); it's only used for log clarity — the actual dispatch
+/// is by `url`.
+async fn tts_speak_inner(backends: &Backends, api: &str, url: &str, text: &str) {
+    info!(
+        target: "orch::pipeline",
+        api,
+        url,
+        chars = text.chars().count(),
+        "TTS POST: {:?}",
+        text.chars().take(40).collect::<String>()
+    );
     let body = json!({ "text": text });
     let res = backends
         .http
-        .post(&backends.tts.url)
+        .post(url)
         .json(&body)
         .timeout(std::time::Duration::from_millis(backends.tts.timeout_ms))
         .send()
@@ -422,18 +451,19 @@ async fn tts_speak_inner(backends: &Backends, text: &str) {
             // so it doesn't pollute production logs every time the
             // user interrupts the assistant.
             if status.is_success() || status.as_u16() == 499 {
-                info!(target: "orch::pipeline", "TTS ok ({status})");
+                info!(target: "orch::pipeline", api, "TTS ok ({status})");
             } else {
                 let body = resp.text().await.unwrap_or_default();
                 warn!(
                     target: "orch::pipeline",
+                    api,
                     "TTS responded {}: {}",
                     status,
                     body.chars().take(200).collect::<String>()
                 );
             }
         }
-        Err(e) => warn!(target: "orch::pipeline", "TTS POST failed: {e:#}"),
+        Err(e) => warn!(target: "orch::pipeline", api, "TTS POST failed: {e:#}"),
     }
 }
 
