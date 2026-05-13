@@ -257,6 +257,14 @@ async def stream_chat(graph, sessions: SessionManager, user_text: str
     # would feel repetitive on the speaker).
     last_acked_tool: str | None = None
 
+    # Whether any *real* LLM-produced text was yielded (acks don't count).
+    # If a turn ends with this still False — e.g. the LLM called a tool,
+    # got back a `[denied]` ToolMessage, and silently stopped without
+    # generating an apology — we emit `RECURSION_FALLBACK_TEXT` at the
+    # end so the operator never hears total silence. Observed with
+    # gemma4:e4b when allowlist-rejected shell commands feed back.
+    real_content_yielded = False
+
     try:
         async for chunk, _meta in graph.astream(
             input_state, config=config, stream_mode="messages"
@@ -286,6 +294,7 @@ async def stream_chat(graph, sessions: SessionManager, user_text: str
             # `list[ContentBlock]` for multimodal — we ignore those
             # because the orchestrator's parser expects str.
             if isinstance(chunk.content, str) and chunk.content:
+                real_content_yielded = True
                 yield {"message": {"content": chunk.content}, "done": False}
     except GraphRecursionError:
         # ReAct loop ran past `recursion_limit` without producing a
@@ -295,6 +304,18 @@ async def stream_chat(graph, sessions: SessionManager, user_text: str
         log.warning(
             "recursion limit %d reached for session %s; emitting fallback",
             RECURSION_LIMIT, session_id,
+        )
+        yield {"message": {"content": RECURSION_FALLBACK_TEXT}, "done": False}
+        real_content_yielded = True
+
+    if not real_content_yielded:
+        # Stream ended normally but the LLM produced no text — typically
+        # after a tool error returned `[denied]` / `[error]` content that
+        # the LLM decided not to comment on. Voice agent must always say
+        # SOMETHING; emit the fallback so the speaker isn't dead.
+        log.warning(
+            "no LLM text yielded for session %s; emitting fallback",
+            session_id,
         )
         yield {"message": {"content": RECURSION_FALLBACK_TEXT}, "done": False}
 
