@@ -83,12 +83,19 @@ def get_current_datetime() -> str:
 
 async def _run_shell_impl(command: str) -> str:
     """run_shell の本体。例外は raise する — `run_shell` 側で catch して
-    文字列化する。テスト容易性のため `@tool` ラッパとは分離している。"""
+    文字列化する。テスト容易性のため `@tool` ラッパとは分離している。
+
+    cwd は `_FILE_ROOT` (set されていれば) に揃える。`read_file` が
+    `_FILE_ROOT` 相対のパスを取るのと意味論を合わせ、LLM が `ls` / `cat`
+    を引数なし or 相対パスで呼んだときに同じ場所を見るようにする
+    (未設定なら inherited = `/app`、agent 本体のコードが見える点は現状維持)。
+    """
     argv = ensure_command_allowed(command, _SHELL_ALLOWLIST)
     proc = await asyncio.create_subprocess_exec(
         *argv,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        cwd=_FILE_ROOT or None,
     )
     try:
         stdout_b, stderr_b = await asyncio.wait_for(
@@ -136,13 +143,22 @@ def _build_run_shell_description() -> str:
         avail = f"許可されているコマンド名は **{listed}** のみ"
     else:
         avail = "現在は何も許可されていない (AGENT_SHELL_ALLOWLIST が空)"
+    cwd_hint = (
+        f"カレントディレクトリは `{_FILE_ROOT}` (= read_file のルート)。"
+        "相対パスで呼ぶとこの配下を見る (例: `ls`, `cat memo.txt`)。"
+        "他の場所を見たいときは絶対パスを渡す (例: `ls /etc`)。"
+        if _FILE_ROOT
+        else "カレントディレクトリは agent コンテナの `/app`。"
+        "ファイルを指定するときは絶対パスを渡す (例: `ls /etc`)。"
+    )
     return (
         "Linux のシェルコマンドを 1 つ実行して標準出力を返す。\n\n"
         f"{avail}。これ以外を渡すと [denied] エラーが返る。\n"
         "パイプ (`|`)、リダイレクト (`>`)、複数コマンドの連結 (`;`, `&&`) は"
         "構造的に使えない (`shell=True` 不使用)。\n\n"
+        f"{cwd_hint}\n\n"
         "command にはコマンド本体と引数をスペース区切りで渡す "
-        "(例: `\"date\"`, `\"ls /workspace\"`)。実行は 5 秒で打ち切られ、"
+        "(例: `\"date\"`, `\"ls\"`)。実行は 5 秒で打ち切られ、"
         "stdout は 3KB を超えると末尾省略される。"
     )
 
