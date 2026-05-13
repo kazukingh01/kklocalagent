@@ -380,6 +380,17 @@ services:
       # assumes one operator per process, so going idle = "the
       # operator walked away" → next turn is a fresh conversation.
       AGENT_SESSION_IDLE_SEC: "${AGENT_SESSION_IDLE_SEC:-600}"
+      # Feature flag for tool-calling (issue #19). Default off so this
+      # is a strict no-op until you opt in. When on, the chat graph
+      # becomes a ReAct agent (LLM ↔ tool loop) with the tools defined
+      # in agent/tools.py; when off, the legacy single-node chat graph
+      # is used (bit-for-bit identical to pre-#19 behaviour).
+      AGENT_TOOLS_ENABLED: "${AGENT_TOOLS_ENABLED:-false}"
+      # Caps the agent_node → tools → agent_node loop per turn. 6 ≈ up
+      # to 3 chained tool calls before we surface the fallback line
+      # below. Prevents an infinite retry loop on a tool that always
+      # fails. Ignored when AGENT_TOOLS_ENABLED=false.
+      AGENT_TOOL_RECURSION_LIMIT: "${AGENT_TOOL_RECURSION_LIMIT:-6}"
     volumes:
       - agent-data:/data
     # No `ports:` publish — agent is reached by orchestrator via the
