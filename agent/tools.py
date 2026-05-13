@@ -28,9 +28,14 @@ ack phrase は tool 実行中の無音をカバーする目的の合成 chunk。
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import time
+import wave
+from pathlib import Path
 
+import aiohttp
 from langchain_core.tools import tool
 
 from sandbox import SandboxError, ensure_command_allowed, ensure_path_in_root
@@ -50,12 +55,33 @@ _SHELL_ALLOWLIST: set[str] = {
 # read_file 自体が「未設定」エラーで raise (= tool が事実上 disabled)。
 _FILE_ROOT: str = os.environ.get("AGENT_FILE_ROOT", "")
 
+# play_audio_file: audio-io の /spk WebSocket URL (track 番号も含む)。
+# 例: ws://host.docker.internal:7010/spk?track=1
+# 空なら tool の description が「現在使用不可」と LLM に伝え、呼ばれても
+# 即 [error] で返す。
+_AUDIO_IO_SPK_URL: str = os.environ.get("AGENT_AUDIO_IO_SPK_URL", "")
+# audio-io の wire format。WAV のサンプルレート / チャンネル数がこれと
+# 一致しない場合は再生を拒否する (一致しないまま送ると framer が誤解釈
+# して早回し / 遅回しの音が出るため)。defaults はプロジェクト標準。
+_AUDIO_IO_WIRE_RATE: int = int(os.environ.get("AGENT_AUDIO_IO_WIRE_RATE", "16000"))
+_AUDIO_IO_WIRE_CHANNELS: int = int(os.environ.get("AGENT_AUDIO_IO_WIRE_CHANNELS", "1"))
+# 単一再生の壁時計上限 (秒)。1 時間の WAV をうっかり渡されると tool が
+# その間 block するので DoS 対策。
+_AUDIO_PLAY_MAX_S: float = float(os.environ.get("AGENT_AUDIO_PLAY_MAX_S", "300"))
+
 # 出力サイズ上限 (issue #19 設計の「個別 tool ごと truncate」決定に基づく)。
 _SHELL_STDOUT_MAX = 3000
 _FILE_READ_MAX = 51200  # 50 KB
 _WEB_SEARCH_MAX_RESULTS = 5      # top-N 件
 _WEB_SEARCH_SNIPPET_MAX = 120    # 各件 snippet の文字数上限
 _WEB_SEARCH_TOTAL_MAX = 1500     # 全体上限 (≈ context 圧迫を避ける)
+# audio-io へ送る 1 batch (= 1 WS message) の長さ。20ms は audio-io の
+# 既定の frame_ms と合わせている。これより細かいと WS のオーバーヘッドが
+# 増え、これより粗いと barge-in (途中停止) のレスポンスが鈍る。
+_AUDIO_PLAY_FRAME_MS = 20
+# {"type":"eos"} を投げた後 {"type":"drained"} を待つ最大時間。長尾の
+# 最終文 (~30s) でも drain 完了するよう余裕をもたせる。
+_AUDIO_DRAIN_TIMEOUT_S = 30.0
 
 # subprocess の壁時計タイムアウト。voice agent としては即応が前提なので
 # 短めに切る。長く回したい操作は run_shell のスコープ外。
@@ -245,6 +271,153 @@ async def web_search(query: str) -> str:
     return await _safe_invoke("web_search", _web_search_impl(query))
 
 
+async def _play_audio_file_impl(path: str) -> str:
+    """play_audio_file 本体。audio-io の /spk (?track=N) WS に PCM を realtime
+    ペーシングで流し、`{"type":"eos"}` で drain handshake して終わる。
+
+    全例外は `_safe_invoke` で string 化される。barge-in は orchestrator が
+    /api/chat の HTTP を切ることで `asyncio.CancelledError` を伝播させて
+    アボートする — その時点で `async with` の context manager が WS を閉じ、
+    audio-io 側もリングが drain → close を見て後始末する。
+    """
+    if not _AUDIO_IO_SPK_URL:
+        raise RuntimeError(
+            "AGENT_AUDIO_IO_SPK_URL is not set — audio playback is disabled"
+        )
+    p = Path(path)
+    if not p.is_absolute():
+        raise ValueError(f"path must be absolute, got: {path!r}")
+    if not p.is_file():
+        raise FileNotFoundError(f"not a file: {path}")
+
+    # WAV パースは sync I/O なので thread にオフロード。WAV 形式の検証も
+    # ここで一括 (チャンネル数 / レート / 圧縮 / 長さ / sample width)。
+    def _read_wav() -> tuple[bytes, int, int, int]:
+        with wave.open(str(p), "rb") as wav:
+            comp = wav.getcomptype()
+            if comp != "NONE":
+                raise ValueError(
+                    f"compressed WAV ({comp}) is not supported; "
+                    "give uncompressed PCM (s16le)"
+                )
+            sw = wav.getsampwidth()
+            if sw != 2:
+                raise ValueError(
+                    f"unsupported sample width {sw * 8} bits; "
+                    "only 16-bit PCM (s16le) is supported"
+                )
+            fr = wav.getframerate()
+            ch = wav.getnchannels()
+            if fr != _AUDIO_IO_WIRE_RATE:
+                raise ValueError(
+                    f"sample rate {fr}Hz does not match audio-io wire "
+                    f"rate {_AUDIO_IO_WIRE_RATE}Hz — re-render the WAV to "
+                    f"{_AUDIO_IO_WIRE_RATE}Hz first"
+                )
+            if ch != _AUDIO_IO_WIRE_CHANNELS:
+                raise ValueError(
+                    f"channels {ch} does not match audio-io wire channels "
+                    f"{_AUDIO_IO_WIRE_CHANNELS}"
+                )
+            n = wav.getnframes()
+            duration_s = n / fr
+            if duration_s > _AUDIO_PLAY_MAX_S:
+                raise ValueError(
+                    f"duration {duration_s:.1f}s exceeds limit "
+                    f"{_AUDIO_PLAY_MAX_S:.0f}s"
+                )
+            return wav.readframes(n), n, ch, fr
+
+    pcm, nframes, nchannels, framerate = await asyncio.to_thread(_read_wav)
+    bytes_per_sample = 2 * nchannels
+    samples_per_frame = framerate * _AUDIO_PLAY_FRAME_MS // 1000
+    bytes_per_frame = samples_per_frame * bytes_per_sample
+    duration_s = nframes / framerate
+
+    log.info(
+        "play_audio_file: %s (%.1fs, %dHz, %dch) → %s",
+        p.name, duration_s, framerate, nchannels, _AUDIO_IO_SPK_URL,
+    )
+
+    # ws_connect の sock_connect で接続フェーズを短く (audio-io が居なければ
+    # ここで即落ちて [error] にする)。全体 timeout は意図的に None — 長尺
+    # 再生中ずっと send/recv するので。
+    client_timeout = aiohttp.ClientTimeout(total=None, sock_connect=10.0)
+    async with aiohttp.ClientSession(timeout=client_timeout) as session:
+        async with session.ws_connect(_AUDIO_IO_SPK_URL) as ws:
+            start = time.monotonic()
+            frame_idx = 0
+            offset = 0
+            while offset < len(pcm):
+                chunk = pcm[offset : offset + bytes_per_frame]
+                offset += len(chunk)
+                # audio-io は奇数バイトの WS frame を拒否する (s16le なので
+                # 通常は偶数だが、末尾の半端な chunk が来た場合だけパディング)。
+                if len(chunk) % 2 != 0:
+                    chunk = chunk + b"\x00"
+                await ws.send_bytes(chunk)
+                frame_idx += 1
+                # 実時間ペーシング。各 frame は frame_idx * FRAME_MS のタイミングで
+                # 送出する。audio-io 側の ring (deafult 10s) を溢れさせない目的。
+                target = start + frame_idx * _AUDIO_PLAY_FRAME_MS / 1000.0
+                sleep_for = target - time.monotonic()
+                if sleep_for > 0:
+                    await asyncio.sleep(sleep_for)
+            # Drain handshake: eos を送ってから "drained" が戻るまで待つ。
+            # これで audio-io の cpal リングが本当に空になったことが保証される。
+            await ws.send_str(json.dumps({"type": "eos"}))
+            try:
+                msg = await asyncio.wait_for(
+                    ws.receive(), timeout=_AUDIO_DRAIN_TIMEOUT_S
+                )
+                if msg.type != aiohttp.WSMsgType.TEXT:
+                    log.warning(
+                        "play_audio_file: drain reply was %s, not TEXT",
+                        msg.type,
+                    )
+            except asyncio.TimeoutError:
+                log.warning(
+                    "play_audio_file: drain handshake timed out after %.0fs",
+                    _AUDIO_DRAIN_TIMEOUT_S,
+                )
+    return f"played {duration_s:.1f}s from {p.name}"
+
+
+def _build_play_audio_description() -> str:
+    """Tool description を起動時の env (`_AUDIO_IO_SPK_URL` の有無) に応じて
+    動的に生成する。URL 未設定なら「無効」を明示し、LLM が呼ばずに状況を
+    user に伝えるよう誘導する。"""
+    if not _AUDIO_IO_SPK_URL:
+        return (
+            "Play a WAV audio file via the speaker.\n\n"
+            "**CURRENTLY UNAVAILABLE** — the AGENT_AUDIO_IO_SPK_URL env "
+            "is not set, so this feature is disabled in this environment. "
+            "Do NOT call this tool; instead, tell the user in one sentence "
+            "that audio playback is not configured here so they know the "
+            "limit is on the setup, not on their request."
+        )
+    return (
+        "Play a WAV audio file via the speaker.\n\n"
+        "`path` is an **absolute** filesystem path to a WAV file. The file "
+        f"must be uncompressed 16-bit PCM (s16le) at "
+        f"{_AUDIO_IO_WIRE_RATE}Hz with {_AUDIO_IO_WIRE_CHANNELS} channel(s) "
+        "(audio-io's wire format). Relative paths, compressed WAVs, and "
+        "mismatched sample rate / channels are rejected.\n\n"
+        "Call this when the user asks to play a specific audio file — "
+        "for example a pre-rendered news summary or notification produced "
+        "by another agent. The tool blocks until playback completes; if "
+        "the user interrupts via wake-word, playback aborts cleanly. "
+        f"Duration is capped at {_AUDIO_PLAY_MAX_S:.0f} seconds."
+    )
+
+
+@tool(description=_build_play_audio_description())
+async def play_audio_file(path: str) -> str:
+    # description は @tool(description=...) で動的注入。詳細は
+    # `_build_play_audio_description` の docstring を参照。
+    return await _safe_invoke("play_audio_file", _play_audio_file_impl(path))
+
+
 @tool
 async def read_file(path: str) -> str:
     """Read a file and return its contents verbatim.
@@ -293,18 +466,26 @@ def all_tools() -> list:
 
     issue #19 の段階的な追加に伴い後段の PR で別 tool が積まれる可能性あり。
     """
-    return [run_shell, read_file, web_search]
+    return [run_shell, read_file, web_search, play_audio_file]
 
 
 # tool name → ack phrase。None なら ack 挿入なし。
 #
-# 即応 tool (shell / file) は None でよく、遅い tool (web 検索) だけ ack を
-# 入れて voice agent の無音を埋める。文言は環境変数で上書き可能にしておくと
-# 運用しやすい。
+# 即応 tool (shell / file) は None でよく、遅い tool (web 検索 / 音声再生)
+# だけ ack を入れて voice agent の無音を埋める。文言は環境変数で上書き可能。
+#
+# play_audio_file は AGENT_AUDIO_IO_SPK_URL が未設定なら呼び出し即 [error]
+# になるので、その場合は ack も抑止しておく (「再生するね」と言った直後に
+# 失敗を返すと UX が混乱するため)。
 TOOL_ACK_PHRASES: dict[str, str | None] = {
     "run_shell": None,
     "read_file": None,
     "web_search": os.environ.get(
         "AGENT_TOOL_ACK_WEB_SEARCH", "ちょっと検索してみるね。"
+    ),
+    "play_audio_file": (
+        os.environ.get("AGENT_TOOL_ACK_PLAY_AUDIO", "音声を再生するね。")
+        if _AUDIO_IO_SPK_URL
+        else None
     ),
 }

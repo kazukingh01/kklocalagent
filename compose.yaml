@@ -424,6 +424,27 @@ services:
       # the ack (rare — the search is slow enough that the silence is
       # noticeable). The default is tuned for voice (タメ口, short).
       AGENT_TOOL_ACK_WEB_SEARCH: "${AGENT_TOOL_ACK_WEB_SEARCH:-ちょっと検索してみるね。}"
+      # play_audio_file tool — WebSocket URL of audio-io's /spk endpoint
+      # with `?track=N` so the agent's playback uses a parallel cpal
+      # stream and never stomps on tts-streamer's TTS stream. audio-io
+      # must be running on the Windows host with
+      # `runtime.playback_tracks >= 2`. Set empty in `.env` to disable
+      # the tool entirely — the tool description then tells the LLM the
+      # feature is unavailable so it can answer the user gracefully
+      # instead of trying and failing.
+      AGENT_AUDIO_IO_SPK_URL: "${AGENT_AUDIO_IO_SPK_URL:-ws://${WINDOWS_HOST:-host.docker.internal}:7010/spk?track=1}"
+      # Wire format audio-io expects on /spk. The PCM in the WAV file
+      # must match these — re-render the WAV if your audio-io is
+      # configured differently. Defaults match the project's standard
+      # audio-io setup (16 kHz mono 16-bit PCM s16le).
+      AGENT_AUDIO_IO_WIRE_RATE: "${AGENT_AUDIO_IO_WIRE_RATE:-16000}"
+      AGENT_AUDIO_IO_WIRE_CHANNELS: "${AGENT_AUDIO_IO_WIRE_CHANNELS:-1}"
+      # Hard cap on play_audio_file duration (seconds). Defensive against
+      # a long file blocking the agent for minutes. 300 s = 5 min covers
+      # typical news / weather briefings.
+      AGENT_AUDIO_PLAY_MAX_S: "${AGENT_AUDIO_PLAY_MAX_S:-300}"
+      # Filler ack spoken just before playback begins. Empty disables.
+      AGENT_TOOL_ACK_PLAY_AUDIO: "${AGENT_TOOL_ACK_PLAY_AUDIO:-音声を再生するね。}"
     volumes:
       - agent-data:/data
     # No `ports:` publish — agent is reached by orchestrator via the
