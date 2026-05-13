@@ -58,10 +58,16 @@ _FILE_ROOT: str = os.environ.get("AGENT_FILE_ROOT", "")
 # 出力サイズ上限 (issue #19 設計の「個別 tool ごと truncate」決定に基づく)。
 _SHELL_STDOUT_MAX = 3000
 _FILE_READ_MAX = 51200  # 50 KB
+_WEB_SEARCH_MAX_RESULTS = 5      # top-N 件
+_WEB_SEARCH_SNIPPET_MAX = 120    # 各件 snippet の文字数上限
+_WEB_SEARCH_TOTAL_MAX = 1500     # 全体上限 (≈ context 圧迫を避ける)
 
 # subprocess の壁時計タイムアウト。voice agent としては即応が前提なので
 # 短めに切る。長く回したい操作は run_shell のスコープ外。
 _SHELL_TIMEOUT_S = 5.0
+# DDG 検索のタイムアウト。voice agent は即応性が大事なので短め。rate limit
+# でレスポンスが詰まったら諦めて LLM に「失敗」を渡す方が UX が良い。
+_WEB_SEARCH_TIMEOUT_S = 5.0
 
 
 # --- tool 実装 ----------------------------------------------------------
@@ -147,6 +153,64 @@ async def _read_file_impl(path: str) -> str:
     return text
 
 
+async def _web_search_impl(query: str) -> str:
+    """web_search の本体。DDG の sync API を asyncio.to_thread で
+    オフロードしつつ全体を wait_for でラップして 5s で打ち切る。"""
+    query = (query or "").strip()
+    if not query:
+        raise ValueError("query is empty")
+
+    # 遅延 import: ddgs が requirements に無い古い環境でも tools モジュール
+    # 自体は import できるようにしておく (CI のすり抜け検知用)。
+    # 旧パッケージ名 `duckduckgo_search` は 2025 年に `ddgs` にリネーム
+    # されており、旧名で import すると検索が空 list を返す挙動になる。
+    from ddgs import DDGS
+
+    def _do_search() -> list[dict]:
+        # DDGS はコンテキストマネージャ。`text()` は generator/list を返す。
+        # max_results=N を渡せば最初の N 件で打ち切る。
+        with DDGS() as ddgs:
+            return list(ddgs.text(query, max_results=_WEB_SEARCH_MAX_RESULTS))
+
+    results = await asyncio.wait_for(
+        asyncio.to_thread(_do_search),
+        timeout=_WEB_SEARCH_TIMEOUT_S,
+    )
+    if not results:
+        return "(no search results)"
+
+    # 件ごとに title + snippet + href を整形。LLM はこれを context として
+    # 受け取り「要点を口頭でまとめて」読み上げる想定。href は短縮しない —
+    # LLM が引用 URL として言及できる方が voice agent として誠実。
+    parts: list[str] = []
+    for i, r in enumerate(results, start=1):
+        title = (r.get("title") or "").strip()
+        snippet = (r.get("body") or "").strip()
+        href = (r.get("href") or "").strip()
+        if len(snippet) > _WEB_SEARCH_SNIPPET_MAX:
+            snippet = snippet[:_WEB_SEARCH_SNIPPET_MAX] + "…"
+        parts.append(f"{i}. {title}\n   {snippet}\n   {href}")
+    text = "\n".join(parts)
+    if len(text) > _WEB_SEARCH_TOTAL_MAX:
+        text = text[:_WEB_SEARCH_TOTAL_MAX] + "\n[...truncated]"
+    return text
+
+
+@tool
+async def web_search(query: str) -> str:
+    """インターネットを検索して上位 5 件の概要を返す。
+
+    最新ニュース・商品情報・調べごとなど、自分の知識だけでは答えられないことを
+    聞かれたときに呼ぶ。query には自然文の検索クエリを渡す (例:
+    `"今日の東京の天気"`, `"Rust async runtime 比較"`)。
+
+    結果は各件 `N. タイトル / snippet / URL` 形式で最大 5 件、全体 1500 字を
+    超えると末尾省略。リアルタイムページ取得や本文全文は別 tool 範囲外なので、
+    snippet を見て要点を自然な言葉で要約して答える。
+    """
+    return await _safe_invoke("web_search", _web_search_impl(query))
+
+
 @tool
 async def read_file(path: str) -> str:
     """指定ファイルを読んで内容をそのまま返す。
@@ -193,20 +257,23 @@ async def _safe_invoke(name: str, coro) -> str:
 def all_tools() -> list:
     """登録 tool の一覧。`create_react_agent` に渡す。
 
-    issue #19 の段階的な追加に伴い後段の PR で `web_search` / `list_drive_files`
-    / `read_drive_file` が積まれる予定。
+    issue #19 の段階的な追加に伴い後段の PR で `list_drive_files` /
+    `read_drive_file` が積まれる予定。
     """
-    return [get_current_datetime, run_shell, read_file]
+    return [get_current_datetime, run_shell, read_file, web_search]
 
 
 # tool name → ack phrase。None なら ack 挿入なし。
 #
 # 即応 tool (date / shell / file) は None でよく、遅い tool (web 検索や Drive
 # アクセス) だけ ack を入れて voice agent の無音を埋める。文言は環境変数で
-# 上書き可能にしておくと運用しやすい — 各 tool 単位の ack 環境変数は対応する
-# tool が wire された PR で追加する。
+# 上書き可能にしておくと運用しやすい — Drive 系は対応 tool 追加の PR で同様に
+# AGENT_TOOL_ACK_DRIVE などを追加する想定。
 TOOL_ACK_PHRASES: dict[str, str | None] = {
     "get_current_datetime": None,
     "run_shell": None,
     "read_file": None,
+    "web_search": os.environ.get(
+        "AGENT_TOOL_ACK_WEB_SEARCH", "ちょっと検索してみるね。"
+    ),
 }

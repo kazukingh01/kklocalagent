@@ -409,6 +409,12 @@ services:
       # The `:ro` suffix is recommended — read_file never writes, and
       # ro guards against any future tool that might.
       AGENT_FILE_ROOT: "${AGENT_FILE_ROOT:-}"
+      # web_search tool — filler ack phrase the agent emits before the
+      # actual DuckDuckGo round-trip, so the voice agent doesn't go
+      # silent for the ~1-2 s search latency. Set empty to disable
+      # the ack (rare — the search is slow enough that the silence is
+      # noticeable). The default is tuned for voice (タメ口, short).
+      AGENT_TOOL_ACK_WEB_SEARCH: "${AGENT_TOOL_ACK_WEB_SEARCH:-ちょっと検索してみるね。}"
     volumes:
       - agent-data:/data
     # No `ports:` publish — agent is reached by orchestrator via the

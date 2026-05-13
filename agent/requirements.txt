@@ -4,3 +4,11 @@ langgraph>=0.2
 langchain-core>=0.3
 langchain-ollama>=0.2
 langgraph-checkpoint-sqlite>=2.0
+# issue #19 step 3 — web_search tool. DDG はキー不要で TOS が voice agent
+# のユースケースを許容する。rate limit はあるが偶発的失敗は ToolMessage を
+# LLM に渡して「諦めて謝る」経路で吸収する。
+#
+# 旧パッケージ `duckduckgo-search` は 2025 年中に `ddgs` へリネームされた。
+# 旧名で import すると deprecation warning + 検索が空になる挙動だったので
+# 新名のみを採用する。
+ddgs>=9.0
