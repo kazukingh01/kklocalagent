@@ -39,6 +39,15 @@ pub struct RuntimeConfig {
     pub autostart: bool,
     pub playback_buffer_ms: u32,
     pub mic_broadcast_frames: u32,
+    /// Number of parallel playback tracks. Each track owns its own cpal
+    /// output stream, ring buffer, producer task, and `FlushSignals`,
+    /// and is identified externally by integer id `0..playback_tracks`.
+    /// WASAPI shared mode (the Windows default) mixes the per-stream
+    /// outputs at the OS layer, so independent senders never interfere.
+    /// `/spk` (no query) defaults to track 0 for backwards compatibility
+    /// with the existing TTS-streamer client; new callers (e.g. an agent
+    /// playing pre-rendered audio files) pass `?track=1`.
+    pub playback_tracks: u32,
 }
 
 impl Default for Config {
@@ -86,6 +95,7 @@ impl Default for RuntimeConfig {
             autostart: true,
             playback_buffer_ms: 200,
             mic_broadcast_frames: 64,
+            playback_tracks: 2,
         }
     }
 }
@@ -123,6 +133,9 @@ impl Config {
         }
         if self.runtime.mic_broadcast_frames == 0 {
             anyhow::bail!("runtime.mic_broadcast_frames must be >= 1");
+        }
+        if self.runtime.playback_tracks == 0 {
+            anyhow::bail!("runtime.playback_tracks must be >= 1");
         }
         Ok(())
     }

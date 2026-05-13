@@ -135,6 +135,7 @@ struct PlaybackReady {
 }
 
 pub fn start_playback(
+    track_id: usize,
     device_name: &str,
     audio: AudioConfig,
     buffer_ms: u32,
@@ -148,10 +149,11 @@ pub fn start_playback(
     let stats_cb = stats.clone();
 
     let thread = std::thread::Builder::new()
-        .name("audio-playback".into())
+        .name(format!("audio-playback-{track_id}"))
         .spawn(move || {
             let ready_tx_clone = ready_tx.clone();
             if let Err(e) = run_playback(
+                track_id,
                 &device_name,
                 buffer_ms,
                 flush_cb,
@@ -159,7 +161,7 @@ pub fn start_playback(
                 ready_tx,
                 shutdown_rx,
             ) {
-                error!("playback thread error: {e:?}");
+                error!(track_id, "playback thread error: {e:?}");
                 let _ = ready_tx_clone.send(Err(e));
             }
         })?;
@@ -264,6 +266,7 @@ fn find_output_device(name: &str) -> Result<cpal::Device> {
 }
 
 fn run_playback(
+    track_id: usize,
     device_name: &str,
     buffer_ms: u32,
     flush: Arc<FlushSignals>,
@@ -281,6 +284,7 @@ fn run_playback(
     let stream_config: StreamConfig = default_config.into();
 
     info!(
+        track_id,
         device = ?device.name().ok(),
         native_rate,
         native_channels,

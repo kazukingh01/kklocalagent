@@ -18,7 +18,7 @@ use tokio::sync::{broadcast, Mutex};
 use tracing::info;
 
 use crate::config::Config;
-use crate::state::{AppState, FlushSignals, ServiceHandles};
+use crate::state::{AppState, ServiceHandles};
 
 pub async fn run(config: Config) -> Result<()> {
     config.validate().context("invalid config")?;
@@ -48,8 +48,7 @@ pub fn build_state(config: Config) -> AppState {
     AppState {
         config: Arc::new(config),
         mic_tx,
-        spk_tx: Arc::new(Mutex::new(None)),
-        flush: Arc::new(FlushSignals::new()),
+        spk_tracks: Arc::new(Mutex::new(Vec::new())),
         handles: Arc::new(Mutex::new(ServiceHandles::default())),
     }
 }

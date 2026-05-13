@@ -18,9 +18,23 @@ pub struct AppState {
     /// can ignore the first field; the WS handler exposes it on the wire
     /// only when the client requests it via `?ts=1`.
     pub mic_tx: broadcast::Sender<(u64, Bytes)>,
-    pub spk_tx: Arc<Mutex<Option<mpsc::Sender<PlaybackMessage>>>>,
-    pub flush: Arc<FlushSignals>,
+    /// Per-playback-track endpoints. Vec index = track id (= `?track=N`
+    /// on the /spk WS). Empty Vec while services are stopped; populated
+    /// at `service::start_services` with `config.runtime.playback_tracks`
+    /// entries, each pointing at an independent cpal output stream that
+    /// the Windows audio engine mixes at the OS layer.
+    pub spk_tracks: Arc<Mutex<Vec<PlaybackTrack>>>,
     pub handles: Arc<Mutex<ServiceHandles>>,
+}
+
+/// One playback track's user-facing handles. The producer task and cpal
+/// thread own clones of these (the sender via the channel, the flush
+/// signal via `Arc::clone`), and so do the `/spk` / `/spk/stop` HTTP
+/// handlers — `spk_tracks` lets them route by track id.
+#[derive(Clone)]
+pub struct PlaybackTrack {
+    pub sender: mpsc::Sender<PlaybackMessage>,
+    pub flush: Arc<FlushSignals>,
 }
 
 pub struct FlushSignals {
@@ -51,5 +65,7 @@ impl Default for FlushSignals {
 #[derive(Default)]
 pub struct ServiceHandles {
     pub capture: Option<CaptureHandle>,
-    pub playback: Option<PlaybackHandle>,
+    /// Vec index = track id. Populated in lockstep with
+    /// `AppState.spk_tracks`; both are emptied on `stop_services`.
+    pub playback: Vec<PlaybackHandle>,
 }
