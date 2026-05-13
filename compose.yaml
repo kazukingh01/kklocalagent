@@ -391,6 +391,24 @@ services:
       # below. Prevents an infinite retry loop on a tool that always
       # fails. Ignored when AGENT_TOOLS_ENABLED=false.
       AGENT_TOOL_RECURSION_LIMIT: "${AGENT_TOOL_RECURSION_LIMIT:-6}"
+      # run_shell tool — CSV of allowed command *names* (argv[0] match,
+      # no prefix/regex). Empty list = run_shell is effectively disabled
+      # (every command rejected). `shell=True` is never used, so pipes
+      # / redirects / `&&` are structurally impossible regardless of
+      # this allowlist. Default: read-only diagnostics only — no rm /
+      # curl / sh / shell / bash / sudo / etc.
+      AGENT_SHELL_ALLOWLIST: "${AGENT_SHELL_ALLOWLIST:-date,uptime,uname,df,ip,who}"
+      # read_file tool — absolute path *inside the container* that the
+      # agent may read from. Files outside this root (including via
+      # `..` or symlinks) are rejected by the sandbox. Empty = read_file
+      # is effectively disabled (every call rejects with "not
+      # configured"). To actually expose host files: set this env to
+      # the container path you'll mount, AND add a bind-mount line to
+      # `volumes:` below, e.g.
+      #     - /home/me/voice-share:/workspace/share:ro
+      # The `:ro` suffix is recommended — read_file never writes, and
+      # ro guards against any future tool that might.
+      AGENT_FILE_ROOT: "${AGENT_FILE_ROOT:-}"
     volumes:
       - agent-data:/data
     # No `ports:` publish — agent is reached by orchestrator via the
