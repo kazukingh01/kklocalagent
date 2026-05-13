@@ -119,17 +119,38 @@ async def _run_shell_impl(command: str) -> str:
     return result
 
 
-@tool
-async def run_shell(command: str) -> str:
-    """Linux のシェルコマンドを 1 つ実行して標準出力を返す。
+def _build_run_shell_description() -> str:
+    """Tool description を `_SHELL_ALLOWLIST` から動的に組み立てる。
 
-    許可されたコマンド名のみ実行できる (例: date, uptime, df, uname, ip, who)。
-    パイプ (`|`) やリダイレクト (`>`)、複数コマンドの連結 (`;`, `&&`) は使えない。
-    日付・ネットワーク状況・ディスク使用量・カーネル情報などを調べるときに呼ぶ。
+    `@tool` デコレータ呼び出し時に評価して LangChain の tool schema に
+    入れる。これで LLM は **実際にこの環境で許可されているコマンド名** を
+    把握でき、`.env` で allowlist を上書きしても LLM の手元の説明が古い
+    まま (`ls` を呼ぶと「unknown command」と思い込む) という mismatch が
+    起きない。
 
-    引数 command にはコマンド本体と引数をスペース区切りで渡す
-    (例: `"uname -a"`, `"df -h"`, `"ip addr"`)。
+    env を変えたら agent コンテナを restart する必要があるのは現状と同じ
+    (`_SHELL_ALLOWLIST` 自体が module load 時 1 回読みなので)。
     """
+    if _SHELL_ALLOWLIST:
+        listed = ", ".join(sorted(_SHELL_ALLOWLIST))
+        avail = f"許可されているコマンド名は **{listed}** のみ"
+    else:
+        avail = "現在は何も許可されていない (AGENT_SHELL_ALLOWLIST が空)"
+    return (
+        "Linux のシェルコマンドを 1 つ実行して標準出力を返す。\n\n"
+        f"{avail}。これ以外を渡すと [denied] エラーが返る。\n"
+        "パイプ (`|`)、リダイレクト (`>`)、複数コマンドの連結 (`;`, `&&`) は"
+        "構造的に使えない (`shell=True` 不使用)。\n\n"
+        "command にはコマンド本体と引数をスペース区切りで渡す "
+        "(例: `\"date\"`, `\"ls /workspace\"`)。実行は 5 秒で打ち切られ、"
+        "stdout は 3KB を超えると末尾省略される。"
+    )
+
+
+@tool(description=_build_run_shell_description())
+async def run_shell(command: str) -> str:
+    # docstring ではなく @tool(description=...) で description を渡している。
+    # 詳細は `_build_run_shell_description` の docstring 参照。
     return await _safe_invoke("run_shell", _run_shell_impl(command))
 
 

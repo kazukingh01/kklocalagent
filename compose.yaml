@@ -396,9 +396,11 @@ services:
       # no prefix/regex). Empty list = run_shell is effectively disabled
       # (every command rejected). `shell=True` is never used, so pipes
       # / redirects / `&&` are structurally impossible regardless of
-      # this allowlist. Default: read-only diagnostics only — no rm /
-      # curl / sh / shell / bash / sudo / etc.
-      AGENT_SHELL_ALLOWLIST: "${AGENT_SHELL_ALLOWLIST:-date,uptime,uname,df,ip,who}"
+      # this allowlist. The allowlist value is injected into the
+      # tool's description at agent startup so the LLM sees the actual
+      # set it's allowed to call (override the env → restart agent →
+      # LLM sees the new list).
+      AGENT_SHELL_ALLOWLIST: "${AGENT_SHELL_ALLOWLIST:-date,ls,cat}"
       # read_file tool — absolute path *inside the container* that the
       # agent may read from. Files outside this root (including via
       # `..` or symlinks) are rejected by the sandbox. Empty = read_file
