@@ -14,20 +14,29 @@ ack phrase は tool 実行中の無音をカバーする目的の合成 chunk。
   やリダイレクトは構造的に不可能。
 * `read_file` は env `AGENT_FILE_ROOT` 配下の **相対パス** のみ受け付ける。
   `Path.resolve()` で symlink 経由の jailbreak も弾く。
-* 違反は `sandbox.SandboxError` (ValueError 派生) で raise → LangChain が
-  ToolMessage として LLM に渡し、retry / 諦めを LLM 自身に判断させる
-  (recursion_limit で打ち切り)。
+
+エラーハンドリング:
+* tool 内部の例外は全て catch し `[denied] ...` / `[error] ...` 文字列として
+  return する。raise すると LangChain が必ずしも捕捉しきれず、AIMessage の
+  tool_calls が state に残ったまま対応 ToolMessage が積まれず以降のターンが
+  INVALID_CHAT_HISTORY で死ぬ (検証で確認済)。string return にすれば LLM が
+  「失敗した、別の方法を試す or 諦める」を ToolMessage を読んで判断できる。
+* allowlist 違反のように LLM が retry しても無意味な失敗は `[denied]` プレ
+  フィックスで区別し、LLM が「無理だから諦めて答える」方に倒しやすくする。
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from datetime import datetime, timezone, timedelta
 
 from langchain_core.tools import tool
 
-from sandbox import ensure_command_allowed, ensure_path_in_root
+from sandbox import SandboxError, ensure_command_allowed, ensure_path_in_root
+
+log = logging.getLogger("agent.tools")
 
 # 日本標準時。voice agent は日本語前提で動くので JST 固定が自然。海外向けに
 # 切り出すときは TZ env を見るように変える。
@@ -66,17 +75,9 @@ def get_current_datetime() -> str:
     return datetime.now(JST).isoformat(timespec="seconds")
 
 
-@tool
-async def run_shell(command: str) -> str:
-    """Linux のシェルコマンドを 1 つ実行して標準出力を返す。
-
-    許可されたコマンド名のみ実行できる (例: date, uptime, df, uname, ip, who)。
-    パイプ (`|`) やリダイレクト (`>`)、複数コマンドの連結 (`;`, `&&`) は使えない。
-    日付・ネットワーク状況・ディスク使用量・カーネル情報などを調べるときに呼ぶ。
-
-    引数 command にはコマンド本体と引数をスペース区切りで渡す
-    (例: `"uname -a"`, `"df -h"`, `"ip addr"`)。
-    """
+async def _run_shell_impl(command: str) -> str:
+    """run_shell の本体。例外は raise する — `run_shell` 側で catch して
+    文字列化する。テスト容易性のため `@tool` ラッパとは分離している。"""
     argv = ensure_command_allowed(command, _SHELL_ALLOWLIST)
     proc = await asyncio.create_subprocess_exec(
         *argv,
@@ -113,17 +114,21 @@ async def run_shell(command: str) -> str:
 
 
 @tool
-async def read_file(path: str) -> str:
-    """指定ファイルを読んで内容をそのまま返す。
+async def run_shell(command: str) -> str:
+    """Linux のシェルコマンドを 1 つ実行して標準出力を返す。
 
-    path は `AGENT_FILE_ROOT` (= 共有ディレクトリ) からの相対パスを渡す
-    (例: `"memo.txt"`, `"docs/recipe.md"`)。絶対パスや `..` を含むパスは
-    拒否される。
+    許可されたコマンド名のみ実行できる (例: date, uptime, df, uname, ip, who)。
+    パイプ (`|`) やリダイレクト (`>`)、複数コマンドの連結 (`;`, `&&`) は使えない。
+    日付・ネットワーク状況・ディスク使用量・カーネル情報などを調べるときに呼ぶ。
 
-    voice agent のユースケース: ユーザに「メモを読んで」「あのファイルを
-    読んで」と言われたとき、ここで内容を取得して読み上げに繋げる。
-    内容は 50 KB を超える場合は末尾が省略される。
+    引数 command にはコマンド本体と引数をスペース区切りで渡す
+    (例: `"uname -a"`, `"df -h"`, `"ip addr"`)。
     """
+    return await _safe_invoke("run_shell", _run_shell_impl(command))
+
+
+async def _read_file_impl(path: str) -> str:
+    """read_file の本体。例外は raise する — `read_file` 側で catch する。"""
     if not _FILE_ROOT:
         raise RuntimeError(
             "AGENT_FILE_ROOT is not configured — read_file is disabled"
@@ -140,6 +145,47 @@ async def read_file(path: str) -> str:
     if truncated:
         text += "\n[...truncated]"
     return text
+
+
+@tool
+async def read_file(path: str) -> str:
+    """指定ファイルを読んで内容をそのまま返す。
+
+    path は `AGENT_FILE_ROOT` (= 共有ディレクトリ) からの相対パスを渡す
+    (例: `"memo.txt"`, `"docs/recipe.md"`)。絶対パスや `..` を含むパスは
+    拒否される。
+
+    voice agent のユースケース: ユーザに「メモを読んで」「あのファイルを
+    読んで」と言われたとき、ここで内容を取得して読み上げに繋げる。
+    内容は 50 KB を超える場合は末尾が省略される。
+    """
+    return await _safe_invoke("read_file", _read_file_impl(path))
+
+
+async def _safe_invoke(name: str, coro) -> str:
+    """共通エラーハンドラ。tool 本体 (coroutine) を await し、例外は文字列化
+    して返す。
+
+    raise すると LangChain v0.3 系の create_react_agent が AIMessage の
+    tool_calls を state に積んだまま ToolMessage を積まないことがあり、以降の
+    ターンで INVALID_CHAT_HISTORY (Found AIMessages with tool_calls that do
+    not have a corresponding ToolMessage) で全 chat が死ぬ。本関数で string に
+    変換しておけば、ReAct ループが必ず ToolMessage を state に積むので state
+    が壊れない。
+
+    `SandboxError` は LLM が retry しても通らない設定/権限系なので
+    `[denied]` プレフィックスで明示し、LLM が「諦めて答える」方向に倒れやすく
+    する (system prompt の「無理なら正直に伝えて」と組合せる)。それ以外は
+    `[error]` で retry-worth な扱いに。
+    """
+    try:
+        return await coro
+    except SandboxError as e:
+        log.info("tool %s denied: %s", name, e)
+        return f"[denied] {e}"
+    except Exception as e:  # noqa: BLE001
+        log.warning("tool %s failed: %s: %s", name, type(e).__name__, e)
+        return f"[error] {type(e).__name__}: {e}"
 
 
 # --- tool 登録 ----------------------------------------------------------

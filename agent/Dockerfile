@@ -5,9 +5,13 @@
 # live here.
 FROM python:3.11-slim-bookworm
 
-# curl for the HEALTHCHECK probe.
+# curl for the HEALTHCHECK probe. procps (uptime / free / ps) and
+# iproute2 (ip) are required by the run_shell tool's default allowlist
+# (`uptime`, `ip`); without them the LLM's "ネットワーク状況を教えて"
+# turns into a "command not found" loop. coreutils-only commands
+# (date, df, uname, who) are already in python:slim.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
+    && apt-get install -y --no-install-recommends curl procps iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
