@@ -1,14 +1,20 @@
-aiohttp>=3.9
-aiosqlite>=0.20
-langgraph>=0.2
-langchain-core>=0.3
-langchain-ollama>=0.2
-langgraph-checkpoint-sqlite>=2.0
-# issue #19 step 3 — web_search tool. DDG はキー不要で TOS が voice agent
+# 直接依存はピン留め。`docker build` 時に PyPI 最新が紛れ込んで挙動が変わる
+# のを防ぐ。バージョン更新は手動で確認してから `==` の右辺を書き換える。
+# 動作確認時のスタック: gemma4:e4b + ollama 0.23.2 + LangGraph 1.2 系。
+#
+# 注: 推移的依存 (langchain, httpx, primp など) は pip の解決に委ねる。
+# 完全再現が必要になったら pip-tools / uv lock を導入する。
+aiohttp==3.13.5
+aiosqlite==0.22.1
+langgraph==1.2.0
+langchain-core==1.4.0
+langchain-ollama==1.1.0
+langgraph-checkpoint-sqlite==3.1.0
+# issue #19 step 3 — web_search tool。DDG はキー不要で TOS が voice agent
 # のユースケースを許容する。rate limit はあるが偶発的失敗は ToolMessage を
 # LLM に渡して「諦めて謝る」経路で吸収する。
 #
 # 旧パッケージ `duckduckgo-search` は 2025 年中に `ddgs` へリネームされた。
 # 旧名で import すると deprecation warning + 検索が空になる挙動だったので
 # 新名のみを採用する。
-ddgs>=9.0
+ddgs==9.14.2

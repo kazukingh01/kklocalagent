@@ -1,0 +1,7 @@
+# Build cache がイメージに混入するのを防ぐ。`COPY experiments /app/experiments`
+# で __pycache__ ごと持ち込んでいたので明示的に除外する。`**/` プレフィックスは
+# サブディレクトリ配下にも適用するため (パターンなしだと build context root の
+# 直下しかマッチしない)。
+**/__pycache__/
+**/*.pyc
+**/*.pyo

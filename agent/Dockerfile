@@ -20,6 +20,11 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY app.py tools.py sandbox.py /app/
+# Test ハーネスも image に含める。issue #19 step 2 で追加した chat_repl.py を
+# `docker compose exec agent python /app/experiments/chat_repl.py` で叩ける
+# ようにするため。production 実行では import されないので runtime コストは
+# 無し (数 KB の追加レイヤだけ)。
+COPY experiments /app/experiments
 
 # /data is mounted as a named volume in compose so conversation memory
 # survives `docker compose down && up`. AGENT_DB_PATH defaults to a
