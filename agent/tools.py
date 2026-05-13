@@ -30,17 +30,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from datetime import datetime, timezone, timedelta
 
 from langchain_core.tools import tool
 
 from sandbox import SandboxError, ensure_command_allowed, ensure_path_in_root
 
 log = logging.getLogger("agent.tools")
-
-# 日本標準時。voice agent は日本語前提で動くので JST 固定が自然。海外向けに
-# 切り出すときは TZ env を見るように変える。
-JST = timezone(timedelta(hours=9))
 
 # --- 環境変数 (起動時に 1 度読む) -------------------------------------------
 
@@ -71,15 +66,9 @@ _WEB_SEARCH_TIMEOUT_S = 5.0
 
 
 # --- tool 実装 ----------------------------------------------------------
-
-@tool
-def get_current_datetime() -> str:
-    """現在の日時を JST で ISO 8601 形式 (例: 2026-05-13T15:30:00+09:00) で返す。
-
-    日付・時刻・曜日・今が何月か・現在年などを聞かれたときに呼ぶ。
-    """
-    return datetime.now(JST).isoformat(timespec="seconds")
-
+# 「現在時刻」系の独立 tool は持たない — `date` を run_shell 経由で呼べば
+# 十分で、agent コンテナの TZ を Asia/Tokyo に固定してあるので JST が返る
+# (compose.yaml の agent.environment.TZ 参照)。
 
 async def _run_shell_impl(command: str) -> str:
     """run_shell の本体。例外は raise する — `run_shell` 側で catch して
@@ -140,26 +129,32 @@ def _build_run_shell_description() -> str:
     """
     if _SHELL_ALLOWLIST:
         listed = ", ".join(sorted(_SHELL_ALLOWLIST))
-        avail = f"許可されているコマンド名は **{listed}** のみ"
+        avail = f"Only these command names are allowed: **{listed}**"
     else:
-        avail = "現在は何も許可されていない (AGENT_SHELL_ALLOWLIST が空)"
+        avail = (
+            "No commands are currently allowed "
+            "(AGENT_SHELL_ALLOWLIST is empty)"
+        )
     cwd_hint = (
-        f"カレントディレクトリは `{_FILE_ROOT}` (= read_file のルート)。"
-        "相対パスで呼ぶとこの配下を見る (例: `ls`, `cat memo.txt`)。"
-        "他の場所を見たいときは絶対パスを渡す (例: `ls /etc`)。"
+        f"Current working directory is `{_FILE_ROOT}` "
+        "(same as the read_file root). Relative paths target files "
+        "inside that directory (e.g. `ls`, `cat memo.txt`). "
+        "Pass an absolute path to look elsewhere (e.g. `ls /etc`)."
         if _FILE_ROOT
-        else "カレントディレクトリは agent コンテナの `/app`。"
-        "ファイルを指定するときは絶対パスを渡す (例: `ls /etc`)。"
+        else "Current working directory is the agent container's "
+        "`/app`. Pass absolute paths to reach files outside it "
+        "(e.g. `ls /etc`)."
     )
     return (
-        "Linux のシェルコマンドを 1 つ実行して標準出力を返す。\n\n"
-        f"{avail}。これ以外を渡すと [denied] エラーが返る。\n"
-        "パイプ (`|`)、リダイレクト (`>`)、複数コマンドの連結 (`;`, `&&`) は"
-        "構造的に使えない (`shell=True` 不使用)。\n\n"
+        "Run one Linux shell command and return its stdout.\n\n"
+        f"{avail}. Anything else returns a [denied] error.\n"
+        "Pipes (`|`), redirects (`>`), and command chaining "
+        "(`;`, `&&`) are structurally impossible "
+        "(`shell=True` is not used).\n\n"
         f"{cwd_hint}\n\n"
-        "command にはコマンド本体と引数をスペース区切りで渡す "
-        "(例: `\"date\"`, `\"ls\"`)。実行は 5 秒で打ち切られ、"
-        "stdout は 3KB を超えると末尾省略される。"
+        "`command` takes the executable name and its arguments "
+        "separated by spaces (e.g. `\"date\"`, `\"ls\"`). Each call "
+        "is capped at 5 seconds and stdout is truncated past 3KB."
     )
 
 
@@ -235,30 +230,32 @@ async def _web_search_impl(query: str) -> str:
 
 @tool
 async def web_search(query: str) -> str:
-    """インターネットを検索して上位 5 件の概要を返す。
+    """Search the web and return up to 5 result summaries.
 
-    最新ニュース・商品情報・調べごとなど、自分の知識だけでは答えられないことを
-    聞かれたときに呼ぶ。query には自然文の検索クエリを渡す (例:
-    `"今日の東京の天気"`, `"Rust async runtime 比較"`)。
+    Call this for current news, product info, weather, or anything
+    you can't answer from your own knowledge. `query` is a natural-
+    language search string (e.g. `"weather in Tokyo today"`,
+    `"Rust async runtime comparison"`).
 
-    結果は各件 `N. タイトル / snippet / URL` 形式で最大 5 件、全体 1500 字を
-    超えると末尾省略。リアルタイムページ取得や本文全文は別 tool 範囲外なので、
-    snippet を見て要点を自然な言葉で要約して答える。
+    Results come back as `N. title / snippet / URL` per entry, up to
+    5 entries, with the whole payload capped at ~1500 characters.
+    Fetching full page bodies or following links is out of scope —
+    distil the snippets into a short natural-language answer.
     """
     return await _safe_invoke("web_search", _web_search_impl(query))
 
 
 @tool
 async def read_file(path: str) -> str:
-    """指定ファイルを読んで内容をそのまま返す。
+    """Read a file and return its contents verbatim.
 
-    path は `AGENT_FILE_ROOT` (= 共有ディレクトリ) からの相対パスを渡す
-    (例: `"memo.txt"`, `"docs/recipe.md"`)。絶対パスや `..` を含むパスは
-    拒否される。
+    `path` is interpreted relative to `AGENT_FILE_ROOT` (the shared
+    directory), e.g. `"memo.txt"`, `"docs/recipe.md"`. Absolute paths
+    and paths containing `..` are rejected.
 
-    voice agent のユースケース: ユーザに「メモを読んで」「あのファイルを
-    読んで」と言われたとき、ここで内容を取得して読み上げに繋げる。
-    内容は 50 KB を超える場合は末尾が省略される。
+    Use this when the user asks to read a memo or a specific file —
+    fetch the contents here, then summarise or read it back to them.
+    Files larger than 50 KB are truncated at the tail.
     """
     return await _safe_invoke("read_file", _read_file_impl(path))
 
@@ -294,20 +291,17 @@ async def _safe_invoke(name: str, coro) -> str:
 def all_tools() -> list:
     """登録 tool の一覧。`create_react_agent` に渡す。
 
-    issue #19 の段階的な追加に伴い後段の PR で `list_drive_files` /
-    `read_drive_file` が積まれる予定。
+    issue #19 の段階的な追加に伴い後段の PR で別 tool が積まれる可能性あり。
     """
-    return [get_current_datetime, run_shell, read_file, web_search]
+    return [run_shell, read_file, web_search]
 
 
 # tool name → ack phrase。None なら ack 挿入なし。
 #
-# 即応 tool (date / shell / file) は None でよく、遅い tool (web 検索や Drive
-# アクセス) だけ ack を入れて voice agent の無音を埋める。文言は環境変数で
-# 上書き可能にしておくと運用しやすい — Drive 系は対応 tool 追加の PR で同様に
-# AGENT_TOOL_ACK_DRIVE などを追加する想定。
+# 即応 tool (shell / file) は None でよく、遅い tool (web 検索) だけ ack を
+# 入れて voice agent の無音を埋める。文言は環境変数で上書き可能にしておくと
+# 運用しやすい。
 TOOL_ACK_PHRASES: dict[str, str | None] = {
-    "get_current_datetime": None,
     "run_shell": None,
     "read_file": None,
     "web_search": os.environ.get(

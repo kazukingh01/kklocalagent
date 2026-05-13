@@ -367,6 +367,10 @@ services:
     container_name: kklocalagent-agent
     restart: unless-stopped
     environment:
+      # Container timezone. `run_shell` の `date` がそのまま voice agent の
+      # 「現在時刻」用 tool として機能するようにここで JST に固定する。
+      # python:slim はデフォルト UTC なので、立てたままだと date が UTC を返す。
+      TZ: "${TZ:-Asia/Tokyo}"
       AGENT_OLLAMA_URL: http://llm:11434
       AGENT_MODEL: *llm-model
       # Voice-assistant persona — prepended at invoke time on every

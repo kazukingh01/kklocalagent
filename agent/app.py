@@ -92,8 +92,14 @@ RECURSION_FALLBACK_TEXT = os.environ.get(
 # AGENT_TOOL_SYSTEM_SUFFIX if you want different guidance.
 TOOL_SYSTEM_SUFFIX = os.environ.get(
     "AGENT_TOOL_SYSTEM_SUFFIX",
-    " 使える機能があるときは自然に使って答えて。"
-    "機能が失敗したら別の方法を試して、それでも無理なら正直に「できなかった」と伝えて。",
+    " You have tools available — use them naturally when they help."
+    " Tool results are private to you; the user can't see or hear them,"
+    " so don't refer to them with deictic words like 'this', 'these',"
+    " or 'as written there' — instead, restate the relevant content in"
+    " your own words and speak it out. When asked for a list, pick a few"
+    " representative items and name them (you don't have to read"
+    " everything). If a tool fails, try a different approach; if that"
+    " still doesn't work, honestly say you couldn't do it.",
 )
 
 
