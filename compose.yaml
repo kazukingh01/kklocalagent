@@ -409,15 +409,23 @@ services:
       # agent may read from. Files outside this root (including via
       # `..` or symlinks) are rejected by the sandbox. Also used as
       # `run_shell` の cwd so `ls` / `cat` operate on the same dir.
-      # Default `/app` lets read_file work out of the box (agent's own
-      # code is readable via run_shell's `ls` anyway, so no extra
-      # exposure). For a real share dir, set this to the container
-      # path you'll bind-mount and add the mount under `volumes:`:
-      #     - /home/me/voice-share:/workspace/share:ro
-      # then `AGENT_FILE_ROOT=/workspace/share` in `.env`. `:ro` is
-      # recommended — read_file never writes, ro guards against any
-      # future tool that might.
-      AGENT_FILE_ROOT: "${AGENT_FILE_ROOT:-/app}"
+      # Default `/workspace` is the parent of the host share mount
+      # (`AGENT_SHARE_DIR` below → `/workspace/share:ro`), so the agent
+      # can `ls share/` and `cat share/foo.txt` out of the box. Set to
+      # `/workspace/share` to confine access to just the share dir, or
+      # to `/app` to expose the agent's own code instead.
+      AGENT_FILE_ROOT: "${AGENT_FILE_ROOT:-/workspace}"
+      # Host directory mounted into the agent container at
+      # `/workspace/share` (read-only) so `read_file` / `run_shell` can
+      # see files the operator drops in from the host side. Default
+      # `./share` is auto-created by Docker on first up (owned by root,
+      # which is fine since the mount is `:ro`). Override in `.env` to
+      # point at an existing share dir, e.g.
+      #     AGENT_SHARE_DIR=/home/me/voice-share
+      # `:ro` is hard-coded — read_file never writes, and ro guards
+      # against any future tool that might. If you need rw, change the
+      # mount line in this file directly.
+      AGENT_SHARE_DIR: "${AGENT_SHARE_DIR:-./share}"
       # web_search tool — filler ack phrase the agent emits before the
       # actual DuckDuckGo round-trip, so the voice agent doesn't go
       # silent for the ~1-2 s search latency. Set empty to disable
@@ -447,6 +455,9 @@ services:
       AGENT_TOOL_ACK_PLAY_AUDIO: "${AGENT_TOOL_ACK_PLAY_AUDIO:-音声を再生するね。}"
     volumes:
       - agent-data:/data
+      # Host share dir → /workspace/share (read-only). The host path is
+      # taken from AGENT_SHARE_DIR (see env block above for docs).
+      - "${AGENT_SHARE_DIR:-./share}:/workspace/share:ro"
     # No `ports:` publish — agent is reached by orchestrator via the
     # compose network (http://agent:7080). Keeping the port internal
     # means the unauthenticated /api/chat surface isn't exposed on the
