@@ -458,6 +458,14 @@ services:
       # Host share dir → /workspace/share (read-only). The host path is
       # taken from AGENT_SHARE_DIR (see env block above for docs).
       - "${AGENT_SHARE_DIR:-./share}:/workspace/share:ro"
+    extra_hosts:
+      # play_audio_file tool reaches audio-io on the host via
+      # AGENT_AUDIO_IO_SPK_URL (default `ws://host.docker.internal:...`).
+      # On plain Linux docker (incl. WSL2) `host.docker.internal` is not
+      # resolved by default; host-gateway maps it to the bridge network's
+      # gateway, which is where audio-io.exe is reachable. Matches the
+      # same line on tts-streamer / vad / wake-word.
+      - "host.docker.internal:host-gateway"
     # No `ports:` publish — agent is reached by orchestrator via the
     # compose network (http://agent:7080). Keeping the port internal
     # means the unauthenticated /api/chat surface isn't exposed on the
