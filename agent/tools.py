@@ -28,9 +28,11 @@ ack phrase は tool 実行中の無音をカバーする目的の合成 chunk。
 from __future__ import annotations
 
 import asyncio
+import audioop  # Python 3.13 で deprecated だが、stdlib のままで動く間は依存ゼロで便利。
 import json
 import logging
 import os
+import sys
 import time
 import wave
 from pathlib import Path
@@ -61,10 +63,14 @@ _FILE_ROOT: str = os.environ.get("AGENT_FILE_ROOT", "")
 # 即 [error] で返す。
 _AUDIO_IO_SPK_URL: str = os.environ.get("AGENT_AUDIO_IO_SPK_URL", "")
 # audio-io の wire format。WAV のサンプルレート / チャンネル数がこれと
-# 一致しない場合は再生を拒否する (一致しないまま送ると framer が誤解釈
-# して早回し / 遅回しの音が出るため)。defaults はプロジェクト標準。
+# 一致しない場合は audioop で吸収して送り出す (44.1kHz stereo の WAV でも
+# 16kHz mono に変換して再生できる)。defaults はプロジェクト標準。
 _AUDIO_IO_WIRE_RATE: int = int(os.environ.get("AGENT_AUDIO_IO_WIRE_RATE", "16000"))
 _AUDIO_IO_WIRE_CHANNELS: int = int(os.environ.get("AGENT_AUDIO_IO_WIRE_CHANNELS", "1"))
+# サンプルレート / チャンネル不一致は audioop で吸収する (stereo→mono は
+# `tomono`、レート変換は `ratecv`)。LLM が「48kHz の WAV ですが？」と
+# 言い訳せず再生できるようにするための保険。
+_AUDIO_SAMPLE_WIDTH = 2  # s16le 固定 (= 16-bit PCM)
 # 単一再生の壁時計上限 (秒)。1 時間の WAV をうっかり渡されると tool が
 # その間 block するので DoS 対策。
 _AUDIO_PLAY_MAX_S: float = float(os.environ.get("AGENT_AUDIO_PLAY_MAX_S", "300"))
@@ -290,9 +296,11 @@ async def _play_audio_file_impl(path: str) -> str:
     if not p.is_file():
         raise FileNotFoundError(f"not a file: {path}")
 
-    # WAV パースは sync I/O なので thread にオフロード。WAV 形式の検証も
-    # ここで一括 (チャンネル数 / レート / 圧縮 / 長さ / sample width)。
-    def _read_wav() -> tuple[bytes, int, int, int]:
+    # WAV パース + リサンプル / リミックスは sync I/O + CPU 仕事なので
+    # まとめて thread にオフロード。圧縮 / sample width は raise する
+    # (audioop は s16le 固定で扱う)。sample rate / channels の不一致は
+    # ここで吸収して wire format に揃える。
+    def _read_wav() -> tuple[bytes, float, int, int]:
         with wave.open(str(p), "rb") as wav:
             comp = wav.getcomptype()
             if comp != "NONE":
@@ -301,24 +309,13 @@ async def _play_audio_file_impl(path: str) -> str:
                     "give uncompressed PCM (s16le)"
                 )
             sw = wav.getsampwidth()
-            if sw != 2:
+            if sw != _AUDIO_SAMPLE_WIDTH:
                 raise ValueError(
                     f"unsupported sample width {sw * 8} bits; "
                     "only 16-bit PCM (s16le) is supported"
                 )
             fr = wav.getframerate()
             ch = wav.getnchannels()
-            if fr != _AUDIO_IO_WIRE_RATE:
-                raise ValueError(
-                    f"sample rate {fr}Hz does not match audio-io wire "
-                    f"rate {_AUDIO_IO_WIRE_RATE}Hz — re-render the WAV to "
-                    f"{_AUDIO_IO_WIRE_RATE}Hz first"
-                )
-            if ch != _AUDIO_IO_WIRE_CHANNELS:
-                raise ValueError(
-                    f"channels {ch} does not match audio-io wire channels "
-                    f"{_AUDIO_IO_WIRE_CHANNELS}"
-                )
             n = wav.getnframes()
             duration_s = n / fr
             if duration_s > _AUDIO_PLAY_MAX_S:
@@ -326,18 +323,54 @@ async def _play_audio_file_impl(path: str) -> str:
                     f"duration {duration_s:.1f}s exceeds limit "
                     f"{_AUDIO_PLAY_MAX_S:.0f}s"
                 )
-            return wav.readframes(n), n, ch, fr
+            pcm = wav.readframes(n)
 
-    pcm, nframes, nchannels, framerate = await asyncio.to_thread(_read_wav)
-    bytes_per_sample = 2 * nchannels
-    samples_per_frame = framerate * _AUDIO_PLAY_FRAME_MS // 1000
+        # チャンネル変換 (audioop は 1↔2 のみネイティブ対応)。
+        # rate 変換より先にやると後段の処理データ量が減るので少しだけ速い。
+        if ch != _AUDIO_IO_WIRE_CHANNELS:
+            if ch == 2 and _AUDIO_IO_WIRE_CHANNELS == 1:
+                pcm = audioop.tomono(pcm, _AUDIO_SAMPLE_WIDTH, 0.5, 0.5)
+            elif ch == 1 and _AUDIO_IO_WIRE_CHANNELS == 2:
+                pcm = audioop.tostereo(pcm, _AUDIO_SAMPLE_WIDTH, 1.0, 1.0)
+            else:
+                raise ValueError(
+                    f"cannot convert {ch}-channel WAV to "
+                    f"{_AUDIO_IO_WIRE_CHANNELS}-channel wire format "
+                    "(only 1↔2 channel conversions are supported)"
+                )
+
+        # サンプルレート変換。`state=None` は新規変換 (連続呼び出し時の
+        # 補間状態を引き継がない) を意味する。今回は単発なので None で OK。
+        if fr != _AUDIO_IO_WIRE_RATE:
+            pcm, _ = audioop.ratecv(
+                pcm,
+                _AUDIO_SAMPLE_WIDTH,
+                _AUDIO_IO_WIRE_CHANNELS,
+                fr,
+                _AUDIO_IO_WIRE_RATE,
+                None,
+            )
+
+        return pcm, duration_s, fr, ch
+
+    pcm, duration_s, src_rate, src_ch = await asyncio.to_thread(_read_wav)
+    bytes_per_sample = _AUDIO_SAMPLE_WIDTH * _AUDIO_IO_WIRE_CHANNELS
+    samples_per_frame = _AUDIO_IO_WIRE_RATE * _AUDIO_PLAY_FRAME_MS // 1000
     bytes_per_frame = samples_per_frame * bytes_per_sample
-    duration_s = nframes / framerate
 
-    log.info(
-        "play_audio_file: %s (%.1fs, %dHz, %dch) → %s",
-        p.name, duration_s, framerate, nchannels, _AUDIO_IO_SPK_URL,
-    )
+    if (src_rate, src_ch) != (_AUDIO_IO_WIRE_RATE, _AUDIO_IO_WIRE_CHANNELS):
+        log.info(
+            "play_audio_file: %s (%.1fs) converted %dHz/%dch → %dHz/%dch → %s",
+            p.name, duration_s, src_rate, src_ch,
+            _AUDIO_IO_WIRE_RATE, _AUDIO_IO_WIRE_CHANNELS,
+            _AUDIO_IO_SPK_URL,
+        )
+    else:
+        log.info(
+            "play_audio_file: %s (%.1fs, %dHz, %dch) → %s",
+            p.name, duration_s, _AUDIO_IO_WIRE_RATE,
+            _AUDIO_IO_WIRE_CHANNELS, _AUDIO_IO_SPK_URL,
+        )
 
     # ws_connect の sock_connect で接続フェーズを短く (audio-io が居なければ
     # ここで即落ちて [error] にする)。全体 timeout は意図的に None — 長尺
@@ -399,10 +432,12 @@ def _build_play_audio_description() -> str:
     return (
         "Play a WAV audio file via the speaker.\n\n"
         "`path` is an **absolute** filesystem path to a WAV file. The file "
-        f"must be uncompressed 16-bit PCM (s16le) at "
-        f"{_AUDIO_IO_WIRE_RATE}Hz with {_AUDIO_IO_WIRE_CHANNELS} channel(s) "
-        "(audio-io's wire format). Relative paths, compressed WAVs, and "
-        "mismatched sample rate / channels are rejected.\n\n"
+        "must be uncompressed 16-bit PCM (s16le). Sample rate and channel "
+        "count are auto-converted to "
+        f"{_AUDIO_IO_WIRE_RATE}Hz / {_AUDIO_IO_WIRE_CHANNELS} channel(s) "
+        "(audio-io's wire format) if they differ, so 44.1kHz stereo and "
+        "48kHz mono and similar are all accepted. Relative paths, "
+        "compressed WAVs, and >2-channel surround formats are rejected.\n\n"
         "Call this when the user asks to play a specific audio file — "
         "for example a pre-rendered news summary or notification produced "
         "by another agent. The tool blocks until playback completes; if "
@@ -489,3 +524,96 @@ TOOL_ACK_PHRASES: dict[str, str | None] = {
         else None
     ),
 }
+
+
+# --- CLI (`python tools.py <tool> <args>`) -------------------------------
+#
+# LLM 抜きで個別 tool を手叩きするための薄い entry point。
+# LangGraph ToolNode は `.ainvoke({"path": "..."})` を呼ぶだけなので、
+# ここでも同じ呼び出しを再現する。これで「LLM が呼ぶときと同じコードパス」
+# (= `_safe_invoke` で例外を string 化、ack は CLI には出ない) で挙動確認できる。
+#
+# Usage:
+#   python tools.py                                 # list tools
+#   python tools.py <name>                          # show args & description
+#   python tools.py <name> <value>                  # single-arg tools
+#   python tools.py <name> key=value [key=value]    # multi-arg / named
+#
+# 例:
+#   python tools.py play_audio_file /workspace/share/foo.wav
+#   python tools.py run_shell command="ls -la"
+def _cli_list(tools: list) -> None:
+    print("available tools:")
+    for t in tools:
+        desc = (t.description or "").splitlines()[0] if t.description else ""
+        print(f"  {t.name:20s} {desc}")
+
+
+def _cli_show(t) -> None:
+    print(f"{t.name}\n")
+    print(t.description or "(no description)")
+    print()
+    print("args:")
+    for k, v in (t.args or {}).items():
+        print(f"  {k}: {v}")
+
+
+def _cli_parse(values: list[str], schema_keys: list[str]) -> dict:
+    """argv 後半を {param: value} に直す。
+
+    - 全要素に `=` を含むなら全部 key=value 形式とみなす
+    - そうでなければ positional 扱いで schema 順に zip
+    - 引数 1 個 + schema 1 個 の最頻ケースは positional でそのまま渡る
+    """
+    if not values:
+        return {}
+    if all("=" in v for v in values):
+        out: dict = {}
+        for v in values:
+            k, _, val = v.partition("=")
+            out[k] = val
+        return out
+    if len(values) != len(schema_keys):
+        raise SystemExit(
+            f"expected {len(schema_keys)} positional arg(s) "
+            f"({', '.join(schema_keys) or '-'}), got {len(values)}; "
+            "use key=value form for multi-arg tools"
+        )
+    return dict(zip(schema_keys, values))
+
+
+async def _cli_main(argv: list[str]) -> int:
+    tools = all_tools()
+    by_name = {t.name: t for t in tools}
+
+    if not argv or argv[0] in ("-h", "--help"):
+        print("usage: python tools.py <tool_name> [<args...>]\n")
+        _cli_list(tools)
+        return 0
+
+    name = argv[0]
+    if name not in by_name:
+        print(f"unknown tool: {name}", file=sys.stderr)
+        print(f"available: {', '.join(by_name)}", file=sys.stderr)
+        return 1
+
+    tool_obj = by_name[name]
+    if len(argv) == 1:
+        _cli_show(tool_obj)
+        return 0
+
+    args = _cli_parse(argv[1:], list((tool_obj.args or {}).keys()))
+    result = await tool_obj.ainvoke(args)
+    print(result)
+    return 0
+
+
+if __name__ == "__main__":
+    # CLI 専用に logging を stderr へ INFO で出す。production の app.py は
+    # 自前で logging 設定するので、こちらの basicConfig は __main__ 経路だけ。
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+    sys.exit(asyncio.run(_cli_main(sys.argv[1:])))

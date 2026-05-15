@@ -24,3 +24,9 @@ sudo docker compose -f compose.yaml up -d --build llm agent
 sudo docker compose exec agent python /app/experiments/chat_repl.py
 sudo docker compose down
 ```
+
+## Tools
+
+```bash
+sudo docker compose exec agent python /app/tools.py play_audio_file /workspace/share/foo.wav
+```
