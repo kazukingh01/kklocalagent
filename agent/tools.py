@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import audioop  # Python 3.13 で deprecated だが、stdlib のままで動く間は依存ゼロで便利。
+import difflib
 import json
 import logging
 import os
@@ -290,11 +291,35 @@ async def _play_audio_file_impl(path: str) -> str:
         raise RuntimeError(
             "AGENT_AUDIO_IO_SPK_URL is not set — audio playback is disabled"
         )
+    # 相対パスを許容する: read_file と意味論を合わせて _FILE_ROOT 配下として
+    # 解釈し、root 外脱出は弾く。LLM が `ls` で見た相対パスをそのまま渡して
+    # きても再生できるようにする (実運用での誤り頻度が高かったため)。
     p = Path(path)
     if not p.is_absolute():
-        raise ValueError(f"path must be absolute, got: {path!r}")
+        if not _FILE_ROOT:
+            raise ValueError(
+                f"path must be absolute, got: {path!r} "
+                "(AGENT_FILE_ROOT not set so relative paths cannot be resolved)"
+            )
+        p = ensure_path_in_root(path, _FILE_ROOT)
     if not p.is_file():
-        raise FileNotFoundError(f"not a file: {path}")
+        # 似た名前のファイルを同じ親ディレクトリから 5 件まで返す。
+        # LLM が「該当ファイルが無い → このリストの中から選び直す or
+        # 諦めて user に伝える」と判断できるようにするための補助情報。
+        # 親ディレクトリ自体が無いケースも想定して try/except で包む。
+        hint = ""
+        try:
+            parent = p.parent
+            if parent.is_dir():
+                names = [c.name for c in parent.iterdir() if c.is_file()]
+                close = difflib.get_close_matches(p.name, names, n=5, cutoff=0.4)
+                if close:
+                    hint = f" (did you mean: {', '.join(close)})"
+                elif names:
+                    hint = f" (files in {parent}: {', '.join(sorted(names)[:5])})"
+        except OSError:
+            pass
+        raise FileNotFoundError(f"not a file: {p}{hint}")
 
     # WAV パース + リサンプル / リミックスは sync I/O + CPU 仕事なので
     # まとめて thread にオフロード。圧縮 / sample width は raise する
@@ -429,15 +454,22 @@ def _build_play_audio_description() -> str:
             "that audio playback is not configured here so they know the "
             "limit is on the setup, not on their request."
         )
+    path_hint = (
+        f"`path` is a WAV file path. Either absolute (e.g. `/workspace/share/foo.wav`) "
+        f"or relative to the share root `{_FILE_ROOT}` (e.g. `share/foo.wav`)."
+        if _FILE_ROOT
+        else "`path` is an **absolute** filesystem path to a WAV file."
+    )
     return (
         "Play a WAV audio file via the speaker.\n\n"
-        "`path` is an **absolute** filesystem path to a WAV file. The file "
-        "must be uncompressed 16-bit PCM (s16le). Sample rate and channel "
-        "count are auto-converted to "
+        f"{path_hint} The file must be uncompressed 16-bit PCM (s16le). "
+        "Sample rate and channel count are auto-converted to "
         f"{_AUDIO_IO_WIRE_RATE}Hz / {_AUDIO_IO_WIRE_CHANNELS} channel(s) "
         "(audio-io's wire format) if they differ, so 44.1kHz stereo and "
-        "48kHz mono and similar are all accepted. Relative paths, "
-        "compressed WAVs, and >2-channel surround formats are rejected.\n\n"
+        "48kHz mono and similar are all accepted. Compressed WAVs and "
+        ">2-channel surround formats are rejected. If the file isn't "
+        "found, the error message lists similar filenames in the same "
+        "directory — pick one and retry rather than asking the user.\n\n"
         "Call this when the user asks to play a specific audio file — "
         "for example a pre-rendered news summary or notification produced "
         "by another agent. The tool blocks until playback completes; if "

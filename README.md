@@ -13,7 +13,7 @@ ssh home -R 0.0.0.0:7010:$(ip route show | awk '/default/ {print $3}'):7010
 
 ```bash
 sudo docker compose -f compose.yaml -f compose.cpu.yaml up -d --build
-
+sudo WW_MODELS=tanuki.onnx WINDOWS_HOST=$(ip route show | awk '/default/ {print $3}') docker compose -f compose.yaml up --build
 sudo WW_MODELS=tanuki.onnx WINDOWS_HOST=$(sudo docker network inspect kklocalagent_default --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}') docker compose -f compose.yaml up --build
 ```
 

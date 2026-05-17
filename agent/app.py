@@ -90,16 +90,58 @@ RECURSION_FALLBACK_TEXT = os.environ.get(
 # don't tell the LLM about tools that aren't wired. The phrasing matches the
 # voice-agent persona (タメ口 / 短文 / TTS 向き). Override entirely with
 # AGENT_TOOL_SYSTEM_SUFFIX if you want different guidance.
-TOOL_SYSTEM_SUFFIX = os.environ.get(
-    "AGENT_TOOL_SYSTEM_SUFFIX",
+# Empty string (not just unset) also falls back to the default. compose.yaml
+# passes the env through with an empty fallback (`${VAR:-}`) so the container
+# always sees the var; without `or`, a blank .env would silently disable the
+# entire tool-use prompt.
+TOOL_SYSTEM_SUFFIX = os.environ.get("AGENT_TOOL_SYSTEM_SUFFIX") or (
     " You have tools available — use them naturally when they help."
     " Tool results are private to you; the user can't see or hear them,"
     " so don't refer to them with deictic words like 'this', 'these',"
     " or 'as written there' — instead, restate the relevant content in"
     " your own words and speak it out. When asked for a list, pick a few"
     " representative items and name them (you don't have to read"
-    " everything). If a tool fails, try a different approach; if that"
-    " still doesn't work, honestly say you couldn't do it.",
+    " everything)."
+    # --- Override the 1-2 sentence brevity rule for the tool-using path.
+    # The base system prompt is tuned for chit-chat; multi-step requests
+    # (find → check → act) need room to run several tool calls in a
+    # single turn without speaking between them. Observed failure: model
+    # said "じゃあ中身見てみるよ" and ended the turn, leaving the task
+    # half-done.
+    " The 1-2 sentence limit in the base prompt applies only to your"
+    " final spoken reply once the task is done. While you're working,"
+    " call as many tools as you need — silently. Do NOT announce intent"
+    " (\"I'll check X\", \"まず~してみるよ\") and then stop the turn."
+    " If you say you'll do something, the next thing in the same turn"
+    " must be the tool call that does it, not the end of your response."
+    # --- Step further: don't bounce questions back the user can't answer
+    # any better than you can.
+    " Before asking the user a clarifying question, check whether you"
+    " can answer it yourself with a tool — today's date (use run_shell"
+    " `date`), what files exist in a directory (`ls`), the contents of"
+    " a file (read_file). Only ask the user about things only they know"
+    " (their intent, their preference, ambiguous wording)."
+    # --- Pre-action checklist for file/audio paths. Reduces the
+    # \"relative path → tool failure\" loop we saw in production.
+    " When acting on a file or directory: first establish the absolute"
+    " path (combine the share root with the relative path the user"
+    " referred to), then confirm the file or directory exists with"
+    " `ls`, then perform the action. Don't guess a path and call the"
+    " action tool hoping it works."
+    # --- Hypothesize-and-retry instead of giving up on the first error.
+    " If a tool returns `[error]` or `[denied]`, form one hypothesis"
+    " about the cause (wrong path? relative instead of absolute? typo"
+    " in filename?) and retry with a corrected input once before"
+    " telling the user it failed. Don't loop more than 2-3 times on"
+    " the same tool — if that doesn't work, honestly say you couldn't"
+    " do it."
+    # --- Tiny CoT nudge. We don't have explicit thinking tokens for
+    # Gemma so this is the prompt-level equivalent.
+    " For requests that involve multiple steps (find a file, then play"
+    " it; look something up, then act on it), briefly plan the steps"
+    " in your head before calling the first tool, then execute all"
+    " the steps in one turn — only speak to the user once everything"
+    " is done (or you've genuinely hit a wall)."
 )
 
 

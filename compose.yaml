@@ -396,6 +396,15 @@ services:
       # below. Prevents an infinite retry loop on a tool that always
       # fails. Ignored when AGENT_TOOLS_ENABLED=false.
       AGENT_TOOL_RECURSION_LIMIT: "${AGENT_TOOL_RECURSION_LIMIT:-6}"
+      # Tool-use behavior policy — *separate* from AGENT_SYSTEM_PROMPT
+      # (which is persona / speaking style). Appended after the persona
+      # only when AGENT_TOOLS_ENABLED=true. Controls how the LLM
+      # decides to call tools, retries on failure, plans multi-step
+      # work, and avoids bouncing answerable questions back to the
+      # user. Empty (default) means the agent uses the long built-in
+      # policy in agent/app.py — override in .env only if you need
+      # different guidance (e.g. domain-specific tool etiquette).
+      AGENT_TOOL_SYSTEM_SUFFIX: "${AGENT_TOOL_SYSTEM_SUFFIX:-}"
       # run_shell tool — CSV of allowed command *names* (argv[0] match,
       # no prefix/regex). Empty list = run_shell is effectively disabled
       # (every command rejected). `shell=True` is never used, so pipes
