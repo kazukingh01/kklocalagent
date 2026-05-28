@@ -82,3 +82,51 @@ operationally:
 * idle-rotated session id
 
 Tools / MCP / approval are explicit follow-ups in issue #10.
+
+## Testing the chat IF directly (issue #19 step 2)
+
+The voice pipeline (orchestrator → tts-streamer → audio-io) is the
+production path, but for verifying tool wiring / system prompt
+tweaks / conversation memory behaviour it's faster to talk to the
+agent over its HTTP IF directly. `experiments/chat_repl.py` is a
+stdlib-only CLI REPL that POSTs to `/api/chat` and streams ndjson
+deltas back as plain text.
+
+The script is baked into the image, so once the stack is up:
+
+```
+docker compose up -d agent llm         # llm is the ollama backend
+docker compose exec agent python /app/experiments/chat_repl.py
+```
+
+Output:
+
+```
+agent: http://localhost:7080
+session=abc12345  tools_enabled=True  idle=3.4s
+Ctrl-D or Ctrl-C to exit.
+
+user> 今何時？
+agent> 今は午後1時44分だよ。
+user>
+```
+
+Continuous turns share the same session (= LangGraph thread_id), so
+"さっき何を聞いた？" picks up the previous turn's content from the
+SqliteSaver checkpoint. Idle past `AGENT_SESSION_IDLE_SEC` rotates
+the session and forgets prior turns.
+
+Tool-related env vars (`AGENT_TOOLS_ENABLED`,
+`AGENT_SHELL_ALLOWLIST`, `AGENT_FILE_ROOT`, `AGENT_TOOL_ACK_*`,
+`AGENT_TOOL_RECURSION_LIMIT`) all take effect at agent restart —
+e.g. `docker compose up -d --force-recreate agent` after editing
+`compose.yaml`. The wire (ndjson) format is identical to what the
+orchestrator sees, so anything that works here will work over voice
+too (modulo TTS-side effects on long sentences, which the
+orchestrator handles separately).
+
+`experiments/tool_calling_probe.py` is a related sanity check —
+POSTs three short canned prompts to ollama directly (no agent
+involvement) to verify Gemma 4 + ollama tool-calling still works
+after a model upgrade. Run from the host with the ollama port
+exposed.

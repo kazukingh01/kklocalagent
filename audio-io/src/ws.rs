@@ -64,12 +64,22 @@ async fn handle_mic(mut socket: WebSocket, state: AppState, with_ts: bool) {
     info!("mic ws: client disconnected");
 }
 
-pub async fn ws_spk(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_spk(socket, state))
+pub async fn ws_spk(
+    ws: WebSocketUpgrade,
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    // `?track=N` picks one of the parallel playback streams (default 0).
+    // 0 keeps the existing TTS-streamer client working unmodified.
+    let track_id: usize = params
+        .get("track")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    ws.on_upgrade(move |socket| handle_spk(socket, state, track_id))
 }
 
-async fn handle_spk(mut socket: WebSocket, state: AppState) {
-    info!("spk ws: client connected");
+async fn handle_spk(mut socket: WebSocket, state: AppState, track_id: usize) {
+    info!(track_id, "spk ws: client connected");
     // Tracks whether this WS actually pushed any PCM. cpal is always
     // running (consuming silence when no producer), so a drift report
     // for a zero-PCM session would still log a number — but it would
@@ -78,15 +88,19 @@ async fn handle_spk(mut socket: WebSocket, state: AppState) {
     // line is unambiguously "this session's PCM throughput vs hw clock".
     let mut pcm_frames_received: u64 = 0;
     let spk_tx = {
-        let guard = state.spk_tx.lock().await;
-        match guard.as_ref() {
-            Some(tx) => tx.clone(),
+        let guard = state.spk_tracks.lock().await;
+        match guard.get(track_id) {
+            Some(t) => t.sender.clone(),
             None => {
-                warn!("spk ws: playback not running; closing");
+                warn!(
+                    track_id,
+                    n_tracks = guard.len(),
+                    "spk ws: track id out of range or playback not running; closing"
+                );
                 let _ = socket
                     .send(Message::Close(Some(CloseFrame {
                         code: close_code::POLICY,
-                        reason: Cow::Borrowed("playback not running"),
+                        reason: Cow::Borrowed("invalid track or playback not running"),
                     })))
                     .await;
                 return;
@@ -97,11 +111,11 @@ async fn handle_spk(mut socket: WebSocket, state: AppState) {
     // Hardware-vs-system clock drift snapshot. We baseline cpal's
     // hardware-clock-paced counters at connect and diff at disconnect;
     // the wall-clock duration of the session is the system-clock
-    // reference. Output device may not be running (rare), in which case
-    // we simply skip the drift report.
+    // reference. The drift is per-track (each cpal stream has its own
+    // hardware-clock-paced sample counter).
     let drift_baseline = {
         let guard = state.handles.lock().await;
-        guard.playback.as_ref().map(|h| {
+        guard.playback.get(track_id).map(|h| {
             let (cb, samples) = h.stats().snapshot();
             (
                 Instant::now(),
@@ -217,6 +231,7 @@ async fn handle_spk(mut socket: WebSocket, state: AppState) {
             };
             let drift_ms = consumed_ms as i64 - elapsed_ms as i64;
             info!(
+                track_id,
                 elapsed_ms,
                 callbacks,
                 consumed_samples = consumed,
@@ -227,5 +242,5 @@ async fn handle_spk(mut socket: WebSocket, state: AppState) {
             );
         }
     }
-    info!("spk ws: client disconnected");
+    info!(track_id, "spk ws: client disconnected");
 }

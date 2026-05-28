@@ -32,3 +32,10 @@ playback_buffer_ms = 10000
 # receives a single Lagged warning covering the skipped frames. Increase for
 # bursty consumers, decrease for tighter latency.
 mic_broadcast_frames = 64
+# Number of independent playback tracks. Each track owns its own cpal output
+# stream + ring buffer; WASAPI shared mode mixes them at the OS layer so
+# multiple clients can play in parallel without per-sample interference.
+# Track id is selected with `?track=N` on the /spk WebSocket (default 0 keeps
+# the legacy single-client setup working unchanged); `/spk/stop` accepts the
+# same `?track=N` to stop just that track, or no query to stop all.
+playback_tracks = 2

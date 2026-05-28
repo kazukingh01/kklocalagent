@@ -5,9 +5,13 @@
 # live here.
 FROM python:3.11-slim-bookworm
 
-# curl for the HEALTHCHECK probe.
+# curl for the HEALTHCHECK probe. procps (uptime / free / ps) and
+# iproute2 (ip) are required by the run_shell tool's default allowlist
+# (`uptime`, `ip`); without them the LLM's "ネットワーク状況を教えて"
+# turns into a "command not found" loop. coreutils-only commands
+# (date, df, uname, who) are already in python:slim.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
+    && apt-get install -y --no-install-recommends curl procps iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -15,7 +19,12 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY app.py /app/app.py
+COPY app.py tools.py sandbox.py /app/
+# Test ハーネスも image に含める。issue #19 step 2 で追加した chat_repl.py を
+# `docker compose exec agent python /app/experiments/chat_repl.py` で叩ける
+# ようにするため。production 実行では import されないので runtime コストは
+# 無し (数 KB の追加レイヤだけ)。
+COPY experiments /app/experiments
 
 # /data is mounted as a named volume in compose so conversation memory
 # survives `docker compose down && up`. AGENT_DB_PATH defaults to a

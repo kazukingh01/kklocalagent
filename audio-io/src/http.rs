@@ -1,10 +1,12 @@
-use axum::extract::State;
+use std::collections::HashMap;
+
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use cpal::traits::{DeviceTrait, HostTrait};
 use serde::Serialize;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::service;
 use crate::state::AppState;
@@ -96,8 +98,60 @@ pub async fn stop(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-pub async fn spk_stop(State(state): State<AppState>) -> impl IntoResponse {
-    state.flush.trigger();
-    info!("spk_stop: flush signaled");
-    Json(serde_json::json!({ "status": "flushed" }))
+pub async fn spk_stop(
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    // `?track=N` stops just that track; absent = stop all tracks
+    // (treated as a full audio reset — useful as a global barge-in that
+    // takes out any TTS-streamer and any agent-side file playback in
+    // one shot).
+    let requested: Option<usize> = params.get("track").and_then(|s| s.parse().ok());
+    let tracks = state.spk_tracks.lock().await;
+    match requested {
+        Some(idx) => match tracks.get(idx) {
+            Some(t) => {
+                t.flush.trigger();
+                info!(track = idx, "spk_stop: flush signaled");
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "status": "flushed", "track": idx })),
+                )
+                    .into_response()
+            }
+            None => {
+                warn!(
+                    track = idx,
+                    n_tracks = tracks.len(),
+                    "spk_stop: track out of range"
+                );
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "status": "no such track",
+                        "track": idx,
+                        "n_tracks": tracks.len(),
+                    })),
+                )
+                    .into_response()
+            }
+        },
+        None => {
+            for t in tracks.iter() {
+                t.flush.trigger();
+            }
+            info!(
+                n_tracks = tracks.len(),
+                "spk_stop: flush signaled (all tracks)"
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "flushed",
+                    "n_tracks": tracks.len(),
+                })),
+            )
+                .into_response()
+        }
+    }
 }

@@ -7,9 +7,9 @@ the same body it always sent to ollama:
      "stream": true}
 
 — but the URL now points here. We pull the latest user turn out of
-that body, run a single-node LangGraph chat against an internally
-configured `ChatOllama`, and stream the assistant's deltas back as
-ndjson lines whose shape matches ollama's /api/chat output exactly:
+that body, run a LangGraph chat against an internally configured
+`ChatOllama`, and stream the assistant's deltas back as ndjson lines
+whose shape matches ollama's /api/chat output exactly:
 
     {"message":{"content":"<delta>"},"done":false}\\n
     ...
@@ -32,11 +32,13 @@ Architecture decisions:
   process, so we generate a single session at startup and rotate it
   after `AGENT_SESSION_IDLE_SEC` of no /api/chat traffic (assume the
   operator walked away; the next turn is a fresh conversation).
-* **No tools / MCP / approval in v1** — the graph is one chat node so
-  the orchestrator's existing barge-in path (HTTP cancellation drops
-  the response stream → ChatOllama drops its httpx connection →
-  ollama stops generating) still works without agent-side
-  bookkeeping. Tools land in a follow-up.
+* **Tools (issue #19)** are gated behind `AGENT_TOOLS_ENABLED`. When
+  on, the chat graph is replaced with `create_react_agent` (LLM ↔
+  tool loop). When off, the legacy single-node graph is used so
+  pre-tools behaviour is preserved bit-for-bit. The stream filter
+  drops tool-call deltas (would TTS structured data otherwise) and
+  injects a per-tool "filler ack" chunk (e.g. "ちょっと検索してみるね")
+  before slow tools so the user doesn't sit through a silent gap.
 """
 
 from __future__ import annotations
@@ -52,10 +54,19 @@ from typing import AsyncIterator
 
 import aiosqlite
 from aiohttp import web
-from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessageChunk,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_ollama import ChatOllama
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.prebuilt import create_react_agent
+
+from tools import TOOL_ACK_PHRASES, all_tools
 
 log = logging.getLogger("agent")
 
@@ -65,6 +76,83 @@ SYSTEM_PROMPT = os.environ.get("AGENT_SYSTEM_PROMPT", "")
 DB_PATH = os.environ.get("AGENT_DB_PATH", "/data/agent.sqlite")
 SESSION_IDLE_SEC = float(os.environ.get("AGENT_SESSION_IDLE_SEC", "600"))
 PORT = int(os.environ.get("AGENT_PORT", "7080"))
+
+# Feature flag for issue #19. The in-code default is off so a bare
+# `import app` with no env set stays a no-op, but compose.yaml passes
+# AGENT_TOOLS_ENABLED=true — deployed stacks therefore run with tools
+# ON by default (set it false in .env to fall back to the legacy
+# single-node chat graph).
+TOOLS_ENABLED = os.environ.get("AGENT_TOOLS_ENABLED", "false").lower() in ("1", "true", "yes")
+# Caps the number of graph steps per turn (agent_node → tools → agent_node
+# → ... ). 6 ≈ 3 tool calls in a chain. Beyond this we surface a fallback
+# voice line rather than loop forever. issue #19 オープン項目 #6 の retry
+# リミット。
+RECURSION_LIMIT = int(os.environ.get("AGENT_TOOL_RECURSION_LIMIT", "6"))
+# Recovery line spoken whenever a turn would otherwise end with no
+# spoken text — either the ReAct loop exceeded RECURSION_LIMIT, or the
+# stream finished after a failed/denied tool without the LLM producing
+# any reply. A voice agent must always say *something*.
+FALLBACK_TEXT = os.environ.get(
+    "AGENT_TOOL_FALLBACK_TEXT",
+    "うまくできませんでした、すみません。",
+)
+# Suffix appended to AGENT_SYSTEM_PROMPT *only when tools are enabled* so we
+# don't tell the LLM about tools that aren't wired. The phrasing matches the
+# voice-agent persona (タメ口 / 短文 / TTS 向き). Override entirely with
+# AGENT_TOOL_SYSTEM_SUFFIX if you want different guidance.
+# Empty string (not just unset) also falls back to the default. compose.yaml
+# passes the env through with an empty fallback (`${VAR:-}`) so the container
+# always sees the var; without `or`, a blank .env would silently disable the
+# entire tool-use prompt.
+TOOL_SYSTEM_SUFFIX = os.environ.get("AGENT_TOOL_SYSTEM_SUFFIX") or (
+    " You have tools available — use them naturally when they help."
+    " Tool results are private to you; the user can't see or hear them,"
+    " so don't refer to them with deictic words like 'this', 'these',"
+    " or 'as written there' — instead, restate the relevant content in"
+    " your own words and speak it out. When asked for a list, pick a few"
+    " representative items and name them (you don't have to read"
+    " everything)."
+    # --- Override the 1-2 sentence brevity rule for the tool-using path.
+    # The base system prompt is tuned for chit-chat; multi-step requests
+    # (find → check → act) need room to run several tool calls in a
+    # single turn without speaking between them. Observed failure: model
+    # said "じゃあ中身見てみるよ" and ended the turn, leaving the task
+    # half-done.
+    " The 1-2 sentence limit in the base prompt applies only to your"
+    " final spoken reply once the task is done. While you're working,"
+    " call as many tools as you need — silently. Do NOT announce intent"
+    " (\"I'll check X\", \"まず~してみるよ\") and then stop the turn."
+    " If you say you'll do something, the next thing in the same turn"
+    " must be the tool call that does it, not the end of your response."
+    # --- Step further: don't bounce questions back the user can't answer
+    # any better than you can.
+    " Before asking the user a clarifying question, check whether you"
+    " can answer it yourself with a tool — today's date (use run_shell"
+    " `date`), what files exist in a directory (`ls`), the contents of"
+    " a file (read_file). Only ask the user about things only they know"
+    " (their intent, their preference, ambiguous wording)."
+    # --- Pre-action checklist for file/audio paths. Reduces the
+    # \"relative path → tool failure\" loop we saw in production.
+    " When acting on a file or directory: first establish the absolute"
+    " path (combine the share root with the relative path the user"
+    " referred to), then confirm the file or directory exists with"
+    " `ls`, then perform the action. Don't guess a path and call the"
+    " action tool hoping it works."
+    # --- Hypothesize-and-retry instead of giving up on the first error.
+    " If a tool returns `[error]` or `[denied]`, form one hypothesis"
+    " about the cause (wrong path? relative instead of absolute? typo"
+    " in filename?) and retry with a corrected input once before"
+    " telling the user it failed. Don't loop more than 2-3 times on"
+    " the same tool — if that doesn't work, honestly say you couldn't"
+    " do it."
+    # --- Tiny CoT nudge. We don't have explicit thinking tokens for
+    # Gemma so this is the prompt-level equivalent.
+    " For requests that involve multiple steps (find a file, then play"
+    " it; look something up, then act on it), briefly plan the steps"
+    " in your head before calling the first tool, then execute all"
+    " the steps in one turn — only speak to the user once everything"
+    " is done (or you've genuinely hit a wall)."
+)
 
 
 class SessionManager:
@@ -107,11 +195,14 @@ class SessionManager:
             return self.current_session
 
 
-def build_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
-    """Single-node chat graph.
+def build_legacy_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
+    """Single-node chat graph (pre-tools fallback).
 
-    The system prompt is injected at LLM-invoke time from the
-    env-configured constant, *not* persisted in state. Two reasons:
+    Kept verbatim from the original implementation so AGENT_TOOLS_ENABLED=false
+    deployments behave exactly as before issue #19.
+
+    The system prompt is injected at LLM-invoke time from the env-configured
+    constant, *not* persisted in state. Two reasons:
 
     1. Restarting the agent with a new `AGENT_SYSTEM_PROMPT` should
        take effect on existing sessions' next turn. If we persisted
@@ -142,6 +233,32 @@ def build_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
     return builder.compile(checkpointer=checkpointer)
 
 
+def build_react_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
+    """ReAct (agent_node ↔ tools) graph for AGENT_TOOLS_ENABLED=true.
+
+    `create_react_agent` handles tool binding, the agent-vs-tools router,
+    and the loop back to agent_node after each tool result. We only
+    customise the prompt (system prompt + tool-usage guidance) so the
+    voice-agent persona is preserved while the LLM learns it has tools.
+
+    Tools live in `tools.py::all_tools()`. Adding one there + entering
+    its name in `TOOL_ACK_PHRASES` is enough to wire it — no changes
+    needed here.
+    """
+    tools = all_tools()
+    prompt = (SYSTEM_PROMPT + TOOL_SYSTEM_SUFFIX) if SYSTEM_PROMPT else TOOL_SYSTEM_SUFFIX.strip()
+    # `prompt=` is injected as a SystemMessage on every LLM call, same
+    # pattern as the legacy graph — i.e. not persisted in state. So
+    # restarting with a different AGENT_SYSTEM_PROMPT still takes effect
+    # on the next turn.
+    return create_react_agent(
+        llm,
+        tools,
+        prompt=prompt,
+        checkpointer=checkpointer,
+    )
+
+
 def extract_user_text(body: dict) -> str:
     """Pluck the last `role:user` content from an ollama-compatible
     /api/chat body.
@@ -164,27 +281,120 @@ def extract_user_text(body: dict) -> str:
 
 async def stream_chat(graph, sessions: SessionManager, user_text: str
                       ) -> AsyncIterator[dict]:
+    """Drive the graph for one turn and yield ndjson-shaped chunks.
+
+    Three sources of LLM-side AIMessageChunk are interleaved when tools
+    are on (one only, when tools are off):
+
+      1. plain content tokens          → forward as `message.content` delta
+      2. tool-call deltas              → DROP (TTS-ing structured JSON
+                                          would be gibberish). Side
+                                          effect: emit a one-shot ack
+                                          chunk on the *first* time we
+                                          see each new tool name so the
+                                          user hears a filler line
+                                          while the tool runs.
+      3. ToolMessage (tool result)     → not an AIMessageChunk; the
+                                          isinstance() filter drops it.
+
+    `recursion_limit` caps the agent→tools→agent loop count per turn.
+    On overflow we yield `FALLBACK_TEXT` as the final spoken
+    line — better than leaving the speaker silent.
+    """
     session_id = await sessions.claim()
-    config = {"configurable": {"thread_id": session_id}}
+    config = {
+        "configurable": {"thread_id": session_id},
+        "recursion_limit": RECURSION_LIMIT,
+    }
     input_state = {"messages": [HumanMessage(content=user_text)]}
-    # stream_mode="messages" yields (message_chunk, metadata) tuples
-    # for every LLM token chunk — exactly what we need to forward
-    # delta-by-delta to the orchestrator's existing ndjson parser.
-    async for chunk, _meta in graph.astream(
-        input_state, config=config, stream_mode="messages"
-    ):
-        # `chunk.content` is `str` for plain text streams (today's
-        # ChatOllama output), but newer langchain message types can
-        # surface a `list[ContentBlock]` for multimodal / tool-call
-        # deltas. The orchestrator's parser expects a string, so we
-        # only forward str chunks — once tools are bound the list
-        # branch will need its own handling.
-        if (
-            isinstance(chunk, AIMessageChunk)
-            and isinstance(chunk.content, str)
-            and chunk.content
+
+    # Tracks the most recent tool name we've spoken an ack for. Reset
+    # per-call (= per-turn) so a fresh turn re-acks. Two consecutive
+    # tool calls of *different* names within the same turn each get
+    # their own ack; two of the *same* name don't re-ack (rare and
+    # would feel repetitive on the speaker).
+    last_acked_tool: str | None = None
+
+    # Whether any *real* LLM-produced text was yielded (acks don't count).
+    # If a turn ends with this still False — e.g. the LLM called a tool,
+    # got back a `[denied]` ToolMessage, and silently stopped without
+    # generating an apology — we emit `FALLBACK_TEXT` at the
+    # end so the operator never hears total silence. Observed with
+    # gemma4:e4b when allowlist-rejected shell commands feed back.
+    real_content_yielded = False
+    # Did the *most recent* tool call succeed? `_safe_invoke` prefixes
+    # failures with `[error]` / `[denied]`, so anything else means the
+    # action went through. For action-only commands ("play this wav",
+    # "run this shell") gemma3:4b often produces zero follow-up text
+    # after a successful tool — that's expected, not a failure, so we
+    # must NOT speak the apology fallback in that case (the user already
+    # heard the ack and the action happened). Only emit fallback when
+    # the silence really does follow a failure.
+    last_tool_succeeded: bool | None = None
+
+    try:
+        async for chunk, _meta in graph.astream(
+            input_state, config=config, stream_mode="messages"
         ):
-            yield {"message": {"content": chunk.content}, "done": False}
+            if isinstance(chunk, ToolMessage):
+                content = chunk.content if isinstance(chunk.content, str) else ""
+                last_tool_succeeded = not content.startswith(
+                    ("[error]", "[denied]")
+                )
+                continue
+            if not isinstance(chunk, AIMessageChunk):
+                # SystemMessage etc — not for TTS.
+                continue
+
+            # Tool-call delta: each partial chunk lists 1+ tool_call_chunks
+            # whose `name` may be partial early on (Ollama streams it
+            # token-by-token). We only emit ack when a *complete* known
+            # tool name appears in TOOL_ACK_PHRASES — partial names like
+            # "get_" will simply miss the dict lookup and skip.
+            if chunk.tool_call_chunks:
+                for tc in chunk.tool_call_chunks:
+                    name = tc.get("name")
+                    if name and name != last_acked_tool:
+                        ack = TOOL_ACK_PHRASES.get(name)
+                        if ack:
+                            yield {"message": {"content": ack}, "done": False}
+                        last_acked_tool = name
+                # Suppress the structured-data delta itself.
+                continue
+
+            # `chunk.content` is `str` for plain text streams (today's
+            # ChatOllama output). Newer message types could surface a
+            # `list[ContentBlock]` for multimodal — we ignore those
+            # because the orchestrator's parser expects str.
+            if isinstance(chunk.content, str) and chunk.content:
+                real_content_yielded = True
+                yield {"message": {"content": chunk.content}, "done": False}
+    except GraphRecursionError:
+        # ReAct loop ran past `recursion_limit` without producing a
+        # final assistant message — e.g., the LLM kept calling a tool
+        # that kept failing. Speak the fallback line so the user isn't
+        # left wondering whether the agent crashed.
+        log.warning(
+            "recursion limit %d reached for session %s; emitting fallback",
+            RECURSION_LIMIT, session_id,
+        )
+        yield {"message": {"content": FALLBACK_TEXT}, "done": False}
+        real_content_yielded = True
+
+    if not real_content_yielded and last_tool_succeeded is not True:
+        # Stream ended normally but the LLM produced no text — typically
+        # after a tool error returned `[denied]` / `[error]` content that
+        # the LLM decided not to comment on. Voice agent must always say
+        # SOMETHING; emit the fallback so the speaker isn't dead. We skip
+        # this when the last tool *succeeded* — for action-only commands
+        # the user already heard the ack and the action happened, so
+        # apologising would contradict reality.
+        log.warning(
+            "no LLM text yielded for session %s; emitting fallback",
+            session_id,
+        )
+        yield {"message": {"content": FALLBACK_TEXT}, "done": False}
+
     yield {"done": True}
 
 
@@ -212,7 +422,9 @@ async def chat_handler(request: web.Request) -> web.StreamResponse:
     # raises, the generator's `async for` propagates the cancel, and
     # the LangGraph astream is dropped — which closes ChatOllama's
     # httpx connection to ollama and stops token generation upstream.
-    # No explicit cancellation plumbing needed.
+    # With tools enabled, asyncio-native tool implementations get the
+    # same CancelledError so subprocess.kill() / aiohttp.close() fire
+    # automatically. No explicit cancellation plumbing needed.
     resp = web.StreamResponse(
         status=200,
         headers={"Content-Type": "application/x-ndjson"},
@@ -258,6 +470,7 @@ async def session_handler(request: web.Request) -> web.Response:
             "session_id": sessions.current_session,
             "idle_sec": round(now - sessions.last_active, 2),
             "rotate_after_sec": sessions.idle_seconds,
+            "tools_enabled": TOOLS_ENABLED,
         })
 
 
@@ -269,8 +482,8 @@ async def amain() -> None:
     )
 
     log.info(
-        "agent: ollama=%s model=%s db=%s",
-        OLLAMA_BASE_URL, MODEL_NAME, DB_PATH,
+        "agent: ollama=%s model=%s db=%s tools=%s recursion_limit=%d",
+        OLLAMA_BASE_URL, MODEL_NAME, DB_PATH, TOOLS_ENABLED, RECURSION_LIMIT,
     )
 
     # ChatOllama streams tokens from ollama via httpx. temperature=0
@@ -293,7 +506,7 @@ async def amain() -> None:
     saver = AsyncSqliteSaver(conn)
     await saver.setup()
 
-    graph = build_graph(llm, saver)
+    graph = build_react_graph(llm, saver) if TOOLS_ENABLED else build_legacy_graph(llm, saver)
     sessions = SessionManager(SESSION_IDLE_SEC)
 
     app = web.Application()

@@ -367,6 +367,10 @@ services:
     container_name: kklocalagent-agent
     restart: unless-stopped
     environment:
+      # Container timezone. `run_shell` の `date` がそのまま voice agent の
+      # 「現在時刻」用 tool として機能するようにここで JST に固定する。
+      # python:slim はデフォルト UTC なので、立てたままだと date が UTC を返す。
+      TZ: "${TZ:-Asia/Tokyo}"
       AGENT_OLLAMA_URL: http://llm:11434
       AGENT_MODEL: *llm-model
       # Voice-assistant persona — prepended at invoke time on every
@@ -380,8 +384,97 @@ services:
       # assumes one operator per process, so going idle = "the
       # operator walked away" → next turn is a fresh conversation.
       AGENT_SESSION_IDLE_SEC: "${AGENT_SESSION_IDLE_SEC:-600}"
+      # Feature flag for tool-calling (issue #19). Default on — the
+      # tool-augmented ReAct agent (LLM ↔ tool loop) is the intended
+      # mode now that step 1-5 have landed. Set `AGENT_TOOLS_ENABLED=false`
+      # in `.env` to fall back to the legacy single-node chat graph
+      # (no tools, bit-for-bit identical to pre-#19 behaviour) for A/B
+      # testing or debugging tool-side regressions.
+      AGENT_TOOLS_ENABLED: "${AGENT_TOOLS_ENABLED:-true}"
+      # Caps the agent_node → tools → agent_node loop per turn. 6 ≈ up
+      # to 3 chained tool calls before we surface the fallback line
+      # below. Prevents an infinite retry loop on a tool that always
+      # fails. Ignored when AGENT_TOOLS_ENABLED=false.
+      AGENT_TOOL_RECURSION_LIMIT: "${AGENT_TOOL_RECURSION_LIMIT:-6}"
+      # Tool-use behavior policy — *separate* from AGENT_SYSTEM_PROMPT
+      # (which is persona / speaking style). Appended after the persona
+      # only when AGENT_TOOLS_ENABLED=true. Controls how the LLM
+      # decides to call tools, retries on failure, plans multi-step
+      # work, and avoids bouncing answerable questions back to the
+      # user. Empty (default) means the agent uses the long built-in
+      # policy in agent/app.py — override in .env only if you need
+      # different guidance (e.g. domain-specific tool etiquette).
+      AGENT_TOOL_SYSTEM_SUFFIX: "${AGENT_TOOL_SYSTEM_SUFFIX:-}"
+      # run_shell tool — CSV of allowed command *names* (argv[0] match,
+      # no prefix/regex). Empty list = run_shell is effectively disabled
+      # (every command rejected). `shell=True` is never used, so pipes
+      # / redirects / `&&` are structurally impossible regardless of
+      # this allowlist. The allowlist value is injected into the
+      # tool's description at agent startup so the LLM sees the actual
+      # set it's allowed to call (override the env → restart agent →
+      # LLM sees the new list).
+      AGENT_SHELL_ALLOWLIST: "${AGENT_SHELL_ALLOWLIST:-ls,date,pwd}"
+      # read_file tool — absolute path *inside the container* that the
+      # agent may read from. Files outside this root (including via
+      # `..` or symlinks) are rejected by the sandbox. Also used as
+      # `run_shell` の cwd so `ls` / `cat` operate on the same dir.
+      # Default `/workspace` is the parent of the host share mount
+      # (`AGENT_SHARE_DIR` below → `/workspace/share:ro`), so the agent
+      # can `ls share/` and `cat share/foo.txt` out of the box. Set to
+      # `/workspace/share` to confine access to just the share dir, or
+      # to `/app` to expose the agent's own code instead.
+      AGENT_FILE_ROOT: "${AGENT_FILE_ROOT:-/workspace}"
+      # Host directory mounted into the agent container at
+      # `/workspace/share` (read-only) so `read_file` / `run_shell` can
+      # see files the operator drops in from the host side. Default
+      # `./share` is auto-created by Docker on first up (owned by root,
+      # which is fine since the mount is `:ro`). Override in `.env` to
+      # point at an existing share dir, e.g.
+      #     AGENT_SHARE_DIR=/home/me/voice-share
+      # `:ro` is hard-coded — read_file never writes, and ro guards
+      # against any future tool that might. If you need rw, change the
+      # mount line in this file directly.
+      AGENT_SHARE_DIR: "${AGENT_SHARE_DIR:-./share}"
+      # web_search tool — filler ack phrase the agent emits before the
+      # actual DuckDuckGo round-trip, so the voice agent doesn't go
+      # silent for the ~1-2 s search latency. Set empty to disable
+      # the ack (rare — the search is slow enough that the silence is
+      # noticeable). The default is tuned for voice (タメ口, short).
+      AGENT_TOOL_ACK_WEB_SEARCH: "${AGENT_TOOL_ACK_WEB_SEARCH:-ちょっと検索してみるね。}"
+      # play_audio_file tool — WebSocket URL of audio-io's /spk endpoint
+      # with `?track=N` so the agent's playback uses a parallel cpal
+      # stream and never stomps on tts-streamer's TTS stream. audio-io
+      # must be running on the Windows host with
+      # `runtime.playback_tracks >= 2`. Set empty in `.env` to disable
+      # the tool entirely — the tool description then tells the LLM the
+      # feature is unavailable so it can answer the user gracefully
+      # instead of trying and failing.
+      AGENT_AUDIO_IO_SPK_URL: "${AGENT_AUDIO_IO_SPK_URL:-ws://${WINDOWS_HOST:-host.docker.internal}:7010/spk?track=1}"
+      # Wire format audio-io expects on /spk. The PCM in the WAV file
+      # must match these — re-render the WAV if your audio-io is
+      # configured differently. Defaults match the project's standard
+      # audio-io setup (16 kHz mono 16-bit PCM s16le).
+      AGENT_AUDIO_IO_WIRE_RATE: "${AGENT_AUDIO_IO_WIRE_RATE:-16000}"
+      AGENT_AUDIO_IO_WIRE_CHANNELS: "${AGENT_AUDIO_IO_WIRE_CHANNELS:-1}"
+      # Hard cap on play_audio_file duration (seconds). Defensive against
+      # a long file blocking the agent for minutes. 300 s = 5 min covers
+      # typical news / weather briefings.
+      AGENT_AUDIO_PLAY_MAX_S: "${AGENT_AUDIO_PLAY_MAX_S:-300}"
+      # Filler ack spoken just before playback begins. Empty disables.
+      AGENT_TOOL_ACK_PLAY_AUDIO: "${AGENT_TOOL_ACK_PLAY_AUDIO:-音声を再生するね。}"
     volumes:
       - agent-data:/data
+      # Host share dir → /workspace/share (read-only). The host path is
+      # taken from AGENT_SHARE_DIR (see env block above for docs).
+      - "${AGENT_SHARE_DIR:-./share}:/workspace/share:ro"
+    extra_hosts:
+      # play_audio_file tool reaches audio-io on the host via
+      # AGENT_AUDIO_IO_SPK_URL (default `ws://host.docker.internal:...`).
+      # On plain Linux docker (incl. WSL2) `host.docker.internal` is not
+      # resolved by default; host-gateway maps it to the bridge network's
+      # gateway, which is where audio-io.exe is reachable. Matches the
+      # same line on tts-streamer / vad / wake-word.
+      - "host.docker.internal:host-gateway"
     # No `ports:` publish — agent is reached by orchestrator via the
     # compose network (http://agent:7080). Keeping the port internal
     # means the unauthenticated /api/chat surface isn't exposed on the
