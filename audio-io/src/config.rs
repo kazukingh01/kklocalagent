@@ -10,6 +10,7 @@ pub struct Config {
     pub input: DeviceConfig,
     pub output: DeviceConfig,
     pub runtime: RuntimeConfig,
+    pub aec: AecConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -50,6 +51,33 @@ pub struct RuntimeConfig {
     pub playback_tracks: u32,
 }
 
+/// Acoustic echo cancellation. Runs *inside* audio-io because near-end
+/// (mic capture) and far-end (the mixed `/spk` track PCM) live in the same
+/// process on the same clock — so the echo-cancelled mic can be served to
+/// every consumer (VAD, wake-word-detection) from a single computation via
+/// `/mic?aec=1`, with `/mic` (raw) left byte-identical. Disabled by default;
+/// when off, no mixer/AEC task is spawned and `/mic?aec=1` is rejected.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AecConfig {
+    pub enabled: bool,
+    /// Adaptive-filter backend. Only `"nlms"` (a pure-Rust normalized LMS
+    /// filter — no native dependency, cross-compiles cleanly to the mingw
+    /// Windows target) is implemented today; the field exists so a
+    /// `"speex"` / `"webrtc"` backend can be added later without a config
+    /// break.
+    pub backend: String,
+    /// Adaptive filter length in milliseconds — covers the residual echo
+    /// tail (reverberation) *after* `initial_delay_ms` is removed. Longer
+    /// captures more reverb at higher CPU cost (taps = ms * sample_rate).
+    pub filter_length_ms: u32,
+    /// Bulk far-end delay hint in milliseconds: the playback ring residency
+    /// (`runtime.playback_buffer_ms`) + output + acoustic + capture latency.
+    /// The far-end reference is delayed by this much before entering the
+    /// adaptive filter so the filter only has to model the room tail.
+    pub initial_delay_ms: u32,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -58,6 +86,7 @@ impl Default for Config {
             input: DeviceConfig::default(),
             output: DeviceConfig::default(),
             runtime: RuntimeConfig::default(),
+            aec: AecConfig::default(),
         }
     }
 }
@@ -100,6 +129,17 @@ impl Default for RuntimeConfig {
     }
 }
 
+impl Default for AecConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend: "nlms".into(),
+            filter_length_ms: 150,
+            initial_delay_ms: 120,
+        }
+    }
+}
+
 impl AudioConfig {
     pub fn samples_per_frame(&self) -> usize {
         (self.sample_rate as usize * self.frame_ms as usize) / 1000
@@ -136,6 +176,17 @@ impl Config {
         }
         if self.runtime.playback_tracks == 0 {
             anyhow::bail!("runtime.playback_tracks must be >= 1");
+        }
+        if self.aec.enabled {
+            if self.aec.backend != "nlms" {
+                anyhow::bail!(
+                    "aec.backend '{}' is not supported (only 'nlms')",
+                    self.aec.backend
+                );
+            }
+            if self.aec.filter_length_ms == 0 {
+                anyhow::bail!("aec.filter_length_ms must be > 0 when aec.enabled");
+            }
         }
         Ok(())
     }

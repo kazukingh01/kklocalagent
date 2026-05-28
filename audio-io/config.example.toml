@@ -39,3 +39,22 @@ mic_broadcast_frames = 64
 # the legacy single-client setup working unchanged); `/spk/stop` accepts the
 # same `?track=N` to stop just that track, or no query to stop all.
 playback_tracks = 2
+
+[aec]
+# Acoustic echo cancellation (issue #20). audio-io cancels its own speaker
+# output (the mix of all /spk tracks: TTS + play_audio_file) out of the mic so
+# VAD and wake-word-detection don't self-trigger on the assistant's own voice.
+# The echo-cancelled mic is served on `/mic?aec=1`; plain `/mic` stays raw.
+# Disabled by default — when off this whole section is a no-op and `/mic` is
+# byte-identical to before.
+enabled = false
+# Adaptive-filter backend. Only "nlms" (pure-Rust normalized LMS — no native
+# dependency, cross-compiles to the mingw Windows target as-is) is implemented.
+backend = "nlms"
+# Adaptive filter length (ms): models the room echo tail after the bulk delay
+# is removed. Longer = captures more reverb, more CPU (taps = ms * sample_rate).
+filter_length_ms = 150
+# Bulk far-end delay hint (ms): playback ring residency (playback_buffer_ms) +
+# output + acoustic + capture latency. The far-end reference is delayed by this
+# before entering the filter. Tune on real hardware so the filter converges.
+initial_delay_ms = 120

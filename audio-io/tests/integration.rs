@@ -96,3 +96,23 @@ async fn ws_spk_closes_when_playback_not_running() {
         "expected close, got {msg:?}"
     );
 }
+
+#[tokio::test]
+async fn ws_mic_aec_closes_when_aec_disabled() {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::connect_async;
+
+    // Default config has aec.enabled = false, so `/mic?aec=1` has no producer
+    // and must be rejected rather than left hanging on a silent socket.
+    let addr = spawn_test_server().await;
+    let url = format!("ws://{addr}/mic?aec=1");
+    let (mut ws, _resp) = connect_async(&url).await.unwrap();
+    let msg = ws.next().await;
+    assert!(
+        matches!(
+            msg,
+            Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None
+        ),
+        "expected close for ?aec=1 with aec disabled, got {msg:?}"
+    );
+}

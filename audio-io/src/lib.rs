@@ -1,3 +1,4 @@
+pub mod aec;
 pub mod capture;
 pub mod config;
 pub mod framer;
@@ -44,11 +45,22 @@ pub async fn run(config: Config) -> Result<()> {
 }
 
 pub fn build_state(config: Config) -> AppState {
-    let (mic_tx, _) = broadcast::channel(config.runtime.mic_broadcast_frames.max(1) as usize);
+    let cap = config.runtime.mic_broadcast_frames.max(1) as usize;
+    let (mic_tx, _) = broadcast::channel(cap);
+    // AEC channels exist regardless of `aec.enabled` so the WS/`/spk`
+    // handlers needn't branch on a runtime toggle; with the mixer/AEC tasks
+    // not spawned there are simply no subscribers/producers. The far-end
+    // ingress is sized larger because multiple `/spk` tracks feed it.
+    let (ref_in_tx, _) = broadcast::channel(cap * 2);
+    let (ref_tx, _) = broadcast::channel(cap);
+    let (mic_aec_tx, _) = broadcast::channel(cap);
     AppState {
         config: Arc::new(config),
         mic_tx,
         spk_tracks: Arc::new(Mutex::new(Vec::new())),
+        ref_in_tx,
+        ref_tx,
+        mic_aec_tx,
         handles: Arc::new(Mutex::new(ServiceHandles::default())),
     }
 }

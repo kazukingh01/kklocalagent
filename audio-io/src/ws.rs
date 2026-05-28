@@ -24,12 +24,31 @@ pub async fn ws_mic(
     // frame. Default behavior is unchanged so existing consumers (VAD,
     // openwakeword shim, tests) keep working without modification.
     let with_ts = matches!(params.get("ts").map(String::as_str), Some("1"));
-    ws.on_upgrade(move |socket| handle_mic(socket, state, with_ts))
+    // `?aec=1` (issue #20) serves the echo-cancelled mic instead of the raw
+    // one — same wire format and `?ts=1` semantics. Only valid when
+    // `aec.enabled`; otherwise no producer feeds that stream, so we reject
+    // the upgrade rather than leave the client hanging on a silent socket.
+    let want_aec = matches!(params.get("aec").map(String::as_str), Some("1"));
+    ws.on_upgrade(move |socket| handle_mic(socket, state, with_ts, want_aec))
 }
 
-async fn handle_mic(mut socket: WebSocket, state: AppState, with_ts: bool) {
-    let mut rx = state.mic_tx.subscribe();
-    info!(with_ts, "mic ws: client connected");
+async fn handle_mic(mut socket: WebSocket, state: AppState, with_ts: bool, want_aec: bool) {
+    if want_aec && !state.config.aec.enabled {
+        warn!("mic ws: ?aec=1 requested but aec.enabled is false; closing");
+        let _ = socket
+            .send(Message::Close(Some(CloseFrame {
+                code: close_code::POLICY,
+                reason: Cow::Borrowed("aec not enabled"),
+            })))
+            .await;
+        return;
+    }
+    let mut rx = if want_aec {
+        state.mic_aec_tx.subscribe()
+    } else {
+        state.mic_tx.subscribe()
+    };
+    info!(with_ts, aec = want_aec, "mic ws: client connected");
     loop {
         tokio::select! {
             msg = rx.recv() => match msg {
@@ -144,11 +163,12 @@ async fn handle_spk(mut socket: WebSocket, state: AppState, track_id: usize) {
                         .await;
                     break;
                 }
-                if spk_tx
-                    .send(PlaybackMessage::Frame(Bytes::from(data)))
-                    .await
-                    .is_err()
-                {
+                let frame = Bytes::from(data);
+                // Tee a copy to the AEC far-end mixer (issue #20). Cheap:
+                // `Bytes` is refcounted, and with AEC disabled the broadcast
+                // has no subscriber so `send` is a no-op error we ignore.
+                let _ = state.ref_in_tx.send((track_id, frame.clone()));
+                if spk_tx.send(PlaybackMessage::Frame(frame)).await.is_err() {
                     warn!("spk ws: playback task gone; closing");
                     break;
                 }

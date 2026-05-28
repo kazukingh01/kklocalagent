@@ -3,6 +3,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use tracing::info;
 
+use crate::aec::{aec_task, reference_mixer_task, Aec};
 use crate::capture::start_capture;
 use crate::playback::start_playback;
 use crate::state::{AppState, FlushSignals, PlaybackTrack, ServiceHandles};
@@ -52,7 +53,41 @@ pub async fn start_services(state: &AppState) -> Result<()> {
     *state.spk_tracks.lock().await = new_tracks;
     handles.playback = new_handles;
 
-    info!(n_tracks, "services started");
+    // Acoustic echo cancellation (issue #20). When enabled, spin up the
+    // reference mixer (sums the far-end `/spk` tracks) and the AEC task
+    // (cancels that far-end out of the mic, serving `/mic?aec=1`). Both
+    // subscribe to broadcast channels that already exist on AppState, so the
+    // `/spk` tee and `/mic` handler don't depend on these tasks being up.
+    if state.config.aec.enabled {
+        let spf = state.config.audio.samples_per_frame();
+        let mixer = tokio::spawn(reference_mixer_task(
+            state.ref_in_tx.subscribe(),
+            state.ref_tx.clone(),
+            spf,
+            n_tracks,
+            state.config.audio.frame_ms,
+        ));
+        let aec = Aec::new(
+            state.config.audio.sample_rate,
+            state.config.aec.filter_length_ms,
+            state.config.aec.initial_delay_ms,
+        );
+        let canceller = tokio::spawn(aec_task(
+            state.mic_tx.subscribe(),
+            state.ref_tx.subscribe(),
+            state.mic_aec_tx.clone(),
+            aec,
+        ));
+        handles.aec_tasks = vec![mixer, canceller];
+        info!(
+            backend = %state.config.aec.backend,
+            filter_length_ms = state.config.aec.filter_length_ms,
+            initial_delay_ms = state.config.aec.initial_delay_ms,
+            "aec enabled"
+        );
+    }
+
+    info!(n_tracks, aec = state.config.aec.enabled, "services started");
     Ok(())
 }
 
@@ -73,4 +108,8 @@ fn drop_inner(handles: &mut ServiceHandles) {
     // producer task abort mid-Tick (purely defensive — Drop on each is
     // independent — but keeps log order tidy).
     handles.playback.clear();
+    // tokio JoinHandles detach on drop, so abort the AEC tasks explicitly.
+    for t in handles.aec_tasks.drain(..) {
+        t.abort();
+    }
 }
