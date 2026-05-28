@@ -54,7 +54,12 @@ from typing import AsyncIterator
 
 import aiosqlite
 from aiohttp import web
-from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessageChunk,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_ollama import ChatOllama
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.errors import GraphRecursionError
@@ -312,13 +317,28 @@ async def stream_chat(graph, sessions: SessionManager, user_text: str
     # end so the operator never hears total silence. Observed with
     # gemma4:e4b when allowlist-rejected shell commands feed back.
     real_content_yielded = False
+    # Did the *most recent* tool call succeed? `_safe_invoke` prefixes
+    # failures with `[error]` / `[denied]`, so anything else means the
+    # action went through. For action-only commands ("play this wav",
+    # "run this shell") gemma3:4b often produces zero follow-up text
+    # after a successful tool — that's expected, not a failure, so we
+    # must NOT speak the apology fallback in that case (the user already
+    # heard the ack and the action happened). Only emit fallback when
+    # the silence really does follow a failure.
+    last_tool_succeeded: bool | None = None
 
     try:
         async for chunk, _meta in graph.astream(
             input_state, config=config, stream_mode="messages"
         ):
+            if isinstance(chunk, ToolMessage):
+                content = chunk.content if isinstance(chunk.content, str) else ""
+                last_tool_succeeded = not content.startswith(
+                    ("[error]", "[denied]")
+                )
+                continue
             if not isinstance(chunk, AIMessageChunk):
-                # ToolMessage / SystemMessage etc — not for TTS.
+                # SystemMessage etc — not for TTS.
                 continue
 
             # Tool-call delta: each partial chunk lists 1+ tool_call_chunks
@@ -356,11 +376,14 @@ async def stream_chat(graph, sessions: SessionManager, user_text: str
         yield {"message": {"content": RECURSION_FALLBACK_TEXT}, "done": False}
         real_content_yielded = True
 
-    if not real_content_yielded:
+    if not real_content_yielded and last_tool_succeeded is not True:
         # Stream ended normally but the LLM produced no text — typically
         # after a tool error returned `[denied]` / `[error]` content that
         # the LLM decided not to comment on. Voice agent must always say
-        # SOMETHING; emit the fallback so the speaker isn't dead.
+        # SOMETHING; emit the fallback so the speaker isn't dead. We skip
+        # this when the last tool *succeeded* — for action-only commands
+        # the user already heard the ack and the action happened, so
+        # apologising would contradict reality.
         log.warning(
             "no LLM text yielded for session %s; emitting fallback",
             session_id,
