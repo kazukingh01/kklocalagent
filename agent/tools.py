@@ -278,22 +278,69 @@ async def web_search(query: str) -> str:
     return await _safe_invoke("web_search", _web_search_impl(query))
 
 
-async def _play_audio_file_impl(path: str) -> str:
-    """play_audio_file 本体。audio-io の /spk (?track=N) WS に PCM を realtime
-    ペーシングで流し、`{"type":"eos"}` で drain handshake して終わる。
+def _read_and_convert_wav(p: Path) -> tuple[bytes, float, int, int]:
+    """単一 WAV を読んで wire format (rate/channels) に揃えた PCM を返す。
 
-    全例外は `_safe_invoke` で string 化される。barge-in は orchestrator が
-    /api/chat の HTTP を切ることで `asyncio.CancelledError` を伝播させて
-    アボートする — その時点で `async with` の context manager が WS を閉じ、
-    audio-io 側もリングが drain → close を見て後始末する。
+    返り値は `(pcm, duration_s, src_rate, src_ch)`。圧縮 / 非 s16le は raise。
+    duration の上限チェックはここではせず、呼び出し側が合計で判定する
+    (複数ファイルの合算で `_AUDIO_PLAY_MAX_S` を超えたら弾くため)。
+    sync I/O + CPU 仕事なので呼び出し側で `asyncio.to_thread` に乗せる。
     """
-    if not _AUDIO_IO_SPK_URL:
-        raise RuntimeError(
-            "AGENT_AUDIO_IO_SPK_URL is not set — audio playback is disabled"
+    with wave.open(str(p), "rb") as wav:
+        comp = wav.getcomptype()
+        if comp != "NONE":
+            raise ValueError(
+                f"compressed WAV ({comp}) is not supported; "
+                "give uncompressed PCM (s16le)"
+            )
+        sw = wav.getsampwidth()
+        if sw != _AUDIO_SAMPLE_WIDTH:
+            raise ValueError(
+                f"unsupported sample width {sw * 8} bits; "
+                "only 16-bit PCM (s16le) is supported"
+            )
+        fr = wav.getframerate()
+        ch = wav.getnchannels()
+        n = wav.getnframes()
+        duration_s = n / fr
+        pcm = wav.readframes(n)
+
+    # チャンネル変換 (audioop は 1↔2 のみネイティブ対応)。
+    # rate 変換より先にやると後段の処理データ量が減るので少しだけ速い。
+    if ch != _AUDIO_IO_WIRE_CHANNELS:
+        if ch == 2 and _AUDIO_IO_WIRE_CHANNELS == 1:
+            pcm = audioop.tomono(pcm, _AUDIO_SAMPLE_WIDTH, 0.5, 0.5)
+        elif ch == 1 and _AUDIO_IO_WIRE_CHANNELS == 2:
+            pcm = audioop.tostereo(pcm, _AUDIO_SAMPLE_WIDTH, 1.0, 1.0)
+        else:
+            raise ValueError(
+                f"cannot convert {ch}-channel WAV to "
+                f"{_AUDIO_IO_WIRE_CHANNELS}-channel wire format "
+                "(only 1↔2 channel conversions are supported)"
+            )
+
+    # サンプルレート変換。`state=None` は新規変換 (連続呼び出し時の
+    # 補間状態を引き継がない) を意味する。各ファイル独立に変換するので None。
+    if fr != _AUDIO_IO_WIRE_RATE:
+        pcm, _ = audioop.ratecv(
+            pcm,
+            _AUDIO_SAMPLE_WIDTH,
+            _AUDIO_IO_WIRE_CHANNELS,
+            fr,
+            _AUDIO_IO_WIRE_RATE,
+            None,
         )
-    # 相対パスを許容する: read_file と意味論を合わせて _FILE_ROOT 配下として
-    # 解釈し、root 外脱出は弾く。LLM が `ls` で見た相対パスをそのまま渡して
-    # きても再生できるようにする (実運用での誤り頻度が高かったため)。
+
+    return pcm, duration_s, fr, ch
+
+
+def _resolve_audio_path(path: str) -> Path:
+    """play_audio_file の path を解決する。
+
+    相対パスは read_file と意味論を合わせて `_FILE_ROOT` 配下として解釈し、
+    root 外脱出は弾く (LLM が `ls` で見た相対パスをそのまま渡しても再生
+    できるように)。見つからなければ似た名前を最大 5 件 hint に付けて raise。
+    """
     p = Path(path)
     if not p.is_absolute():
         if not _FILE_ROOT:
@@ -320,82 +367,72 @@ async def _play_audio_file_impl(path: str) -> str:
         except OSError:
             pass
         raise FileNotFoundError(f"not a file: {p}{hint}")
+    return p
 
-    # WAV パース + リサンプル / リミックスは sync I/O + CPU 仕事なので
-    # まとめて thread にオフロード。圧縮 / sample width は raise する
-    # (audioop は s16le 固定で扱う)。sample rate / channels の不一致は
-    # ここで吸収して wire format に揃える。
-    def _read_wav() -> tuple[bytes, float, int, int]:
-        with wave.open(str(p), "rb") as wav:
-            comp = wav.getcomptype()
-            if comp != "NONE":
+
+async def _play_audio_file_impl(paths: list[str] | str) -> str:
+    """play_audio_file 本体。1 本の audio-io /spk (?track=N) WS に、渡された
+    全 WAV の PCM を順に realtime ペーシングで流し込み、最後に一度だけ
+    `{"type":"eos"}` で drain handshake して終わる (ギャップレス連続再生)。
+
+    全例外は `_safe_invoke` で string 化される。barge-in は orchestrator が
+    /api/chat の HTTP を切ることで `asyncio.CancelledError` を伝播させて
+    アボートする — その時点で `async with` の context manager が WS を閉じ、
+    audio-io 側もリングが drain → close を見て後始末する。これは連続再生の
+    途中でも効くので、複数ファイルでも 1 回の wake-word で全停止できる。
+    """
+    if not _AUDIO_IO_SPK_URL:
+        raise RuntimeError(
+            "AGENT_AUDIO_IO_SPK_URL is not set — audio playback is disabled"
+        )
+    # LLM が単一文字列を渡してくる可能性があるので list に正規化する
+    # (tool スキーマは array だが boundary なので念のため吸収)。
+    if isinstance(paths, str):
+        paths = [paths]
+    if not paths:
+        raise ValueError("no audio file given; pass at least one WAV path")
+
+    # 1 件でも見つからない / 不正なら、再生を一切始める前に弾く。
+    # 連続再生は単一 drain なので、途中で中断するより全件検証してから
+    # 流し始める方が「半分だけ鳴った」状態を避けられる。
+    resolved = [_resolve_audio_path(path) for path in paths]
+
+    # 全ファイルを読んで wire format に揃え、合計 duration で上限を判定する。
+    # WAV パース + リサンプルは sync I/O + CPU 仕事なのでまとめて thread に
+    # オフロード。返すのは連結用の (name, pcm) と、ログ用の変換メモ。
+    def _read_all() -> tuple[list[tuple[str, bytes]], float, list[str]]:
+        clips: list[tuple[str, bytes]] = []
+        total_s = 0.0
+        notes: list[str] = []
+        for p in resolved:
+            pcm, dur, src_rate, src_ch = _read_and_convert_wav(p)
+            total_s += dur
+            if total_s > _AUDIO_PLAY_MAX_S:
                 raise ValueError(
-                    f"compressed WAV ({comp}) is not supported; "
-                    "give uncompressed PCM (s16le)"
-                )
-            sw = wav.getsampwidth()
-            if sw != _AUDIO_SAMPLE_WIDTH:
-                raise ValueError(
-                    f"unsupported sample width {sw * 8} bits; "
-                    "only 16-bit PCM (s16le) is supported"
-                )
-            fr = wav.getframerate()
-            ch = wav.getnchannels()
-            n = wav.getnframes()
-            duration_s = n / fr
-            if duration_s > _AUDIO_PLAY_MAX_S:
-                raise ValueError(
-                    f"duration {duration_s:.1f}s exceeds limit "
+                    f"total duration {total_s:.1f}s exceeds limit "
                     f"{_AUDIO_PLAY_MAX_S:.0f}s"
                 )
-            pcm = wav.readframes(n)
+            clips.append((p.name, pcm))
+            if (src_rate, src_ch) != (_AUDIO_IO_WIRE_RATE, _AUDIO_IO_WIRE_CHANNELS):
+                notes.append(f"{p.name} {src_rate}Hz/{src_ch}ch→wire")
+        return clips, total_s, notes
 
-        # チャンネル変換 (audioop は 1↔2 のみネイティブ対応)。
-        # rate 変換より先にやると後段の処理データ量が減るので少しだけ速い。
-        if ch != _AUDIO_IO_WIRE_CHANNELS:
-            if ch == 2 and _AUDIO_IO_WIRE_CHANNELS == 1:
-                pcm = audioop.tomono(pcm, _AUDIO_SAMPLE_WIDTH, 0.5, 0.5)
-            elif ch == 1 and _AUDIO_IO_WIRE_CHANNELS == 2:
-                pcm = audioop.tostereo(pcm, _AUDIO_SAMPLE_WIDTH, 1.0, 1.0)
-            else:
-                raise ValueError(
-                    f"cannot convert {ch}-channel WAV to "
-                    f"{_AUDIO_IO_WIRE_CHANNELS}-channel wire format "
-                    "(only 1↔2 channel conversions are supported)"
-                )
-
-        # サンプルレート変換。`state=None` は新規変換 (連続呼び出し時の
-        # 補間状態を引き継がない) を意味する。今回は単発なので None で OK。
-        if fr != _AUDIO_IO_WIRE_RATE:
-            pcm, _ = audioop.ratecv(
-                pcm,
-                _AUDIO_SAMPLE_WIDTH,
-                _AUDIO_IO_WIRE_CHANNELS,
-                fr,
-                _AUDIO_IO_WIRE_RATE,
-                None,
-            )
-
-        return pcm, duration_s, fr, ch
-
-    pcm, duration_s, src_rate, src_ch = await asyncio.to_thread(_read_wav)
+    clips, duration_s, notes = await asyncio.to_thread(_read_all)
+    # 連結すると frame 境界が clip 境界をまたぐが、各 clip は wire format で
+    # サンプル境界が揃っているので連結 PCM もそのまま streaming できる
+    # (= ギャップレス)。
+    pcm = b"".join(clip_pcm for _, clip_pcm in clips)
     bytes_per_sample = _AUDIO_SAMPLE_WIDTH * _AUDIO_IO_WIRE_CHANNELS
     samples_per_frame = _AUDIO_IO_WIRE_RATE * _AUDIO_PLAY_FRAME_MS // 1000
     bytes_per_frame = samples_per_frame * bytes_per_sample
 
-    if (src_rate, src_ch) != (_AUDIO_IO_WIRE_RATE, _AUDIO_IO_WIRE_CHANNELS):
-        log.info(
-            "play_audio_file: %s (%.1fs) converted %dHz/%dch → %dHz/%dch → %s",
-            p.name, duration_s, src_rate, src_ch,
-            _AUDIO_IO_WIRE_RATE, _AUDIO_IO_WIRE_CHANNELS,
-            _AUDIO_IO_SPK_URL,
-        )
-    else:
-        log.info(
-            "play_audio_file: %s (%.1fs, %dHz, %dch) → %s",
-            p.name, duration_s, _AUDIO_IO_WIRE_RATE,
-            _AUDIO_IO_WIRE_CHANNELS, _AUDIO_IO_SPK_URL,
-        )
+    names = ", ".join(name for name, _ in clips)
+    convert_note = f" [converted: {'; '.join(notes)}]" if notes else ""
+    log.info(
+        "play_audio_file: %d file(s) (%.1fs total, %dHz/%dch wire) [%s]%s → %s",
+        len(clips), duration_s, _AUDIO_IO_WIRE_RATE, _AUDIO_IO_WIRE_CHANNELS,
+        names, convert_note, _AUDIO_IO_SPK_URL,
+    )
 
     # ws_connect の sock_connect で接続フェーズを短く (audio-io が居なければ
     # ここで即落ちて [error] にする)。全体 timeout は意図的に None — 長尺
@@ -438,7 +475,7 @@ async def _play_audio_file_impl(path: str) -> str:
                     "play_audio_file: drain handshake timed out after %.0fs",
                     _AUDIO_DRAIN_TIMEOUT_S,
                 )
-    return f"played {duration_s:.1f}s from {p.name}"
+    return f"played {duration_s:.1f}s from {len(clips)} file(s): {names}"
 
 
 def _build_play_audio_description() -> str:
@@ -447,7 +484,7 @@ def _build_play_audio_description() -> str:
     user に伝えるよう誘導する。"""
     if not _AUDIO_IO_SPK_URL:
         return (
-            "Play a WAV audio file via the speaker.\n\n"
+            "Play one or more WAV audio files via the speaker.\n\n"
             "**CURRENTLY UNAVAILABLE** — the AGENT_AUDIO_IO_SPK_URL env "
             "is not set, so this feature is disabled in this environment. "
             "Do NOT call this tool; instead, tell the user in one sentence "
@@ -455,34 +492,39 @@ def _build_play_audio_description() -> str:
             "limit is on the setup, not on their request."
         )
     path_hint = (
-        f"`path` is a WAV file path. Either absolute (e.g. `/workspace/share/foo.wav`) "
-        f"or relative to the share root `{_FILE_ROOT}` (e.g. `share/foo.wav`)."
+        f"`paths` is a list of WAV file paths. Each is either absolute "
+        f"(e.g. `/workspace/share/foo.wav`) or relative to the share root "
+        f"`{_FILE_ROOT}` (e.g. `share/foo.wav`)."
         if _FILE_ROOT
-        else "`path` is an **absolute** filesystem path to a WAV file."
+        else "`paths` is a list of **absolute** filesystem paths to WAV files."
     )
     return (
-        "Play a WAV audio file via the speaker.\n\n"
-        f"{path_hint} The file must be uncompressed 16-bit PCM (s16le). "
-        "Sample rate and channel count are auto-converted to "
-        f"{_AUDIO_IO_WIRE_RATE}Hz / {_AUDIO_IO_WIRE_CHANNELS} channel(s) "
-        "(audio-io's wire format) if they differ, so 44.1kHz stereo and "
-        "48kHz mono and similar are all accepted. Compressed WAVs and "
-        ">2-channel surround formats are rejected. If the file isn't "
-        "found, the error message lists similar filenames in the same "
-        "directory — pick one and retry rather than asking the user.\n\n"
-        "Call this when the user asks to play a specific audio file — "
+        "Play one or more WAV audio files via the speaker.\n\n"
+        f"{path_hint} Pass several paths to play them back-to-back, "
+        "gapless, in the given order within a single call. Each file must "
+        "be uncompressed 16-bit PCM (s16le). Sample rate and channel count "
+        f"are auto-converted to {_AUDIO_IO_WIRE_RATE}Hz / "
+        f"{_AUDIO_IO_WIRE_CHANNELS} channel(s) (audio-io's wire format) if "
+        "they differ, so 44.1kHz stereo and 48kHz mono and similar are all "
+        "accepted. Compressed WAVs and >2-channel surround formats are "
+        "rejected. All paths are validated before playback starts, so if "
+        "any file is missing nothing plays; the error message lists similar "
+        "filenames in the same directory — pick one and retry rather than "
+        "asking the user.\n\n"
+        "Call this when the user asks to play specific audio file(s) — "
         "for example a pre-rendered news summary or notification produced "
         "by another agent. The tool blocks until playback completes; if "
         "the user interrupts via wake-word, playback aborts cleanly. "
-        f"Duration is capped at {_AUDIO_PLAY_MAX_S:.0f} seconds."
+        f"Total duration across all files is capped at {_AUDIO_PLAY_MAX_S:.0f} "
+        "seconds."
     )
 
 
 @tool(description=_build_play_audio_description())
-async def play_audio_file(path: str) -> str:
+async def play_audio_file(paths: list[str]) -> str:
     # description は @tool(description=...) で動的注入。詳細は
     # `_build_play_audio_description` の docstring を参照。
-    return await _safe_invoke("play_audio_file", _play_audio_file_impl(path))
+    return await _safe_invoke("play_audio_file", _play_audio_file_impl(paths))
 
 
 @tool
@@ -573,6 +615,7 @@ TOOL_ACK_PHRASES: dict[str, str | None] = {
 #
 # 例:
 #   python tools.py play_audio_file /workspace/share/foo.wav
+#   python tools.py play_audio_file share/a.wav share/b.wav   # 連続再生
 #   python tools.py run_shell command="ls -la"
 def _cli_list(tools: list) -> None:
     print("available tools:")
@@ -634,7 +677,12 @@ async def _cli_main(argv: list[str]) -> int:
         _cli_show(tool_obj)
         return 0
 
-    args = _cli_parse(argv[1:], list((tool_obj.args or {}).keys()))
+    if name == "play_audio_file":
+        # `paths` は list なので汎用の positional zip では扱えない。
+        # 残り argv を全部まとめて 1 つの list として渡す。
+        args = {"paths": argv[1:]}
+    else:
+        args = _cli_parse(argv[1:], list((tool_obj.args or {}).keys()))
     result = await tool_obj.ainvoke(args)
     print(result)
     return 0
