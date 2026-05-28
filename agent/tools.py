@@ -37,6 +37,7 @@ import sys
 import time
 import wave
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 from langchain_core.tools import tool
@@ -75,6 +76,31 @@ _AUDIO_SAMPLE_WIDTH = 2  # s16le 固定 (= 16-bit PCM)
 # 単一再生の壁時計上限 (秒)。1 時間の WAV をうっかり渡されると tool が
 # その間 block するので DoS 対策。
 _AUDIO_PLAY_MAX_S: float = float(os.environ.get("AGENT_AUDIO_PLAY_MAX_S", "300"))
+
+
+def _derive_stop_url(spk_url: str) -> str:
+    """play 用の /spk WS URL から、停止用の /spk/stop HTTP URL を導出する。
+
+    `ws://host:7010/spk?track=1` → `http://host:7010/spk/stop?track=1`。
+    scheme は ws→http / wss→https、path 末尾の `/spk` に `/stop` を足し、
+    `?track=N` クエリはそのまま引き継ぐ (= play と同じ track を狙い撃ちする)。
+    設定を 1 本化するため専用 env は持たず、ここで変換する。
+    """
+    if not spk_url:
+        return ""
+    parts = urlsplit(spk_url)
+    scheme = {"ws": "http", "wss": "https"}.get(parts.scheme, parts.scheme)
+    path = parts.path.rstrip("/")
+    # 通常 path は `/spk`。それ以外でも `/stop` を足して壊さないようにする。
+    path = (path[: -len("/spk")] + "/spk/stop") if path.endswith("/spk") else path + "/stop"
+    return urlunsplit((scheme, parts.netloc, path, parts.query, parts.fragment))
+
+
+# stop_audio: play_audio_file が使う track を flush する HTTP エンドポイント。
+# 空なら tool は「使用不可」を LLM に伝え、呼ばれても即 [error]。
+_AUDIO_IO_STOP_URL: str = _derive_stop_url(_AUDIO_IO_SPK_URL)
+# /spk/stop は即応 (flush signal を投げるだけ) なので短め。
+_AUDIO_STOP_TIMEOUT_S = 5.0
 
 # 出力サイズ上限 (issue #19 設計の「個別 tool ごと truncate」決定に基づく)。
 _SHELL_STDOUT_MAX = 3000
@@ -527,6 +553,62 @@ async def play_audio_file(paths: list[str]) -> str:
     return await _safe_invoke("play_audio_file", _play_audio_file_impl(paths))
 
 
+async def _stop_audio_impl() -> str:
+    """stop_audio 本体。audio-io の /spk/stop?track=N を POST して、
+    play_audio_file が使う track のリングを flush する。
+
+    flush は「今鳴っている / バッファに残っている PCM を捨てる」操作なので、
+    何も鳴っていなくても 200 が返る no-op。LLM の声 (TTS) は別 track なので
+    影響しない。即応操作なので drain handshake は不要。
+    """
+    if not _AUDIO_IO_STOP_URL:
+        raise RuntimeError(
+            "AGENT_AUDIO_IO_SPK_URL is not set — audio stop is disabled"
+        )
+    timeout = aiohttp.ClientTimeout(total=_AUDIO_STOP_TIMEOUT_S)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(_AUDIO_IO_STOP_URL) as resp:
+            body = await resp.text()
+            if resp.status != 200:
+                # 404 = track 範囲外 (audio-io が当該 track を持っていない)
+                # など。retry しても通らないが [error] で LLM に状況を渡す。
+                raise RuntimeError(
+                    f"audio-io /spk/stop returned {resp.status}: {body[:200]}"
+                )
+    log.info("stop_audio: flushed via %s", _AUDIO_IO_STOP_URL)
+    return "stopped audio playback"
+
+
+def _build_stop_audio_description() -> str:
+    """stop_audio の description を起動時 env に応じて動的生成する。"""
+    if not _AUDIO_IO_STOP_URL:
+        return (
+            "Stop audio file playback on the speaker.\n\n"
+            "**CURRENTLY UNAVAILABLE** — the AGENT_AUDIO_IO_SPK_URL env "
+            "is not set, so audio playback (and thus stopping it) is "
+            "disabled in this environment. Do NOT call this tool; tell the "
+            "user in one sentence that audio is not configured here."
+        )
+    return (
+        "Stop audio file playback immediately.\n\n"
+        "Flushes the audio-io playback track that play_audio_file uses, "
+        "cutting off whatever WAV is currently playing on the speaker. "
+        "Your own spoken replies (text-to-speech) play on a different "
+        "track and are NOT affected by this. Takes no arguments. Safe to "
+        "call even when nothing is playing — it is a harmless no-op in "
+        "that case.\n\n"
+        "Call this when the user asks to stop or silence the audio that is "
+        "playing — for example 「音声止めて」「再生やめて」「stop the audio」."
+    )
+
+
+@tool(description=_build_stop_audio_description())
+async def stop_audio() -> str:
+    # description は @tool(description=...) で動的注入。詳細は
+    # `_build_stop_audio_description` の docstring を参照。
+    return await _safe_invoke("stop_audio", _stop_audio_impl())
+
+
 @tool
 async def read_file(path: str) -> str:
     """Read a file and return its contents verbatim.
@@ -575,7 +657,7 @@ def all_tools() -> list:
 
     issue #19 の段階的な追加に伴い後段の PR で別 tool が積まれる可能性あり。
     """
-    return [run_shell, read_file, web_search, play_audio_file]
+    return [run_shell, read_file, web_search, play_audio_file, stop_audio]
 
 
 # tool name → ack phrase。None なら ack 挿入なし。
@@ -597,6 +679,8 @@ TOOL_ACK_PHRASES: dict[str, str | None] = {
         if _AUDIO_IO_SPK_URL
         else None
     ),
+    # stop は即応 (flush signal を投げるだけ) なので ack 不要。
+    "stop_audio": None,
 }
 
 
@@ -616,6 +700,7 @@ TOOL_ACK_PHRASES: dict[str, str | None] = {
 # 例:
 #   python tools.py play_audio_file /workspace/share/foo.wav
 #   python tools.py play_audio_file share/a.wav share/b.wav   # 連続再生
+#   python tools.py stop_audio                                 # 再生停止
 #   python tools.py run_shell command="ls -la"
 def _cli_list(tools: list) -> None:
     print("available tools:")
@@ -674,6 +759,11 @@ async def _cli_main(argv: list[str]) -> int:
 
     tool_obj = by_name[name]
     if len(argv) == 1:
+        # 引数なしの tool (e.g. stop_audio) は名前だけで実行する。
+        # スキーマに引数があるものは従来通り description を表示。
+        if not (tool_obj.args or {}):
+            print(await tool_obj.ainvoke({}))
+            return 0
         _cli_show(tool_obj)
         return 0
 
