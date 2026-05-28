@@ -28,7 +28,7 @@ ack phrase は tool 実行中の無音をカバーする目的の合成 chunk。
 from __future__ import annotations
 
 import asyncio
-import audioop  # Python 3.13 で deprecated だが、stdlib のままで動く間は依存ゼロで便利。
+import audioop  # 3.11 で deprecated、3.13 で stdlib から削除。3.11 pin の間は依存ゼロで使えるが、base image を上げる際は要置換。
 import difflib
 import json
 import logging
@@ -37,7 +37,7 @@ import sys
 import time
 import wave
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import aiohttp
 from langchain_core.tools import tool
@@ -85,10 +85,28 @@ def _derive_stop_url(spk_url: str) -> str:
     scheme は ws→http / wss→https、path 末尾の `/spk` に `/stop` を足し、
     `?track=N` クエリはそのまま引き継ぐ (= play と同じ track を狙い撃ちする)。
     設定を 1 本化するため専用 env は持たず、ここで変換する。
+
+    `?track=N` は必須。未指定だと派生する /spk/stop も track なし = audio-io
+    側で全 track flush (TTS の track 0 まで巻き込む) になってしまうので、起動
+    時にここで明示的に弾く。N は非負整数 (audio-io の track id は 0 始まり)。
     """
     if not spk_url:
         return ""
     parts = urlsplit(spk_url)
+    track_vals = parse_qs(parts.query).get("track")
+    if not track_vals:
+        raise ValueError(
+            f"AGENT_AUDIO_IO_SPK_URL must include a ?track=N query "
+            f"(N >= 0); got {spk_url!r}"
+        )
+    try:
+        track = int(track_vals[0])
+    except ValueError as e:
+        raise ValueError(
+            f"?track= must be an integer, got {track_vals[0]!r} in {spk_url!r}"
+        ) from e
+    if track < 0:
+        raise ValueError(f"?track= must be >= 0, got {track} in {spk_url!r}")
     scheme = {"ws": "http", "wss": "https"}.get(parts.scheme, parts.scheme)
     path = parts.path.rstrip("/")
     # 通常 path は `/spk`。それ以外でも `/stop` を足して壊さないようにする。
@@ -363,18 +381,18 @@ def _read_and_convert_wav(p: Path) -> tuple[bytes, float, int, int]:
 def _resolve_audio_path(path: str) -> Path:
     """play_audio_file の path を解決する。
 
-    相対パスは read_file と意味論を合わせて `_FILE_ROOT` 配下として解釈し、
-    root 外脱出は弾く (LLM が `ls` で見た相対パスをそのまま渡しても再生
-    できるように)。見つからなければ似た名前を最大 5 件 hint に付けて raise。
+    相対パス・絶対パスとも read_file と意味論を合わせて `_FILE_ROOT` 配下に
+    confine する (LLM が `ls` で見た相対パスをそのまま渡しても、絶対パスを
+    渡しても、root 外脱出は弾く)。`ensure_path_in_root` は絶対パスでも join +
+    resolve 後に `relative_to` で判定するので、root 内の絶対パスは通り、外は
+    `PathOutsideRoot` で弾かれる。見つからなければ似た名前を最大 5 件 hint に
+    付けて raise。
     """
-    p = Path(path)
-    if not p.is_absolute():
-        if not _FILE_ROOT:
-            raise ValueError(
-                f"path must be absolute, got: {path!r} "
-                "(AGENT_FILE_ROOT not set so relative paths cannot be resolved)"
-            )
-        p = ensure_path_in_root(path, _FILE_ROOT)
+    if not _FILE_ROOT:
+        raise ValueError(
+            f"cannot resolve audio path {path!r}: AGENT_FILE_ROOT is not set"
+        )
+    p = ensure_path_in_root(path, _FILE_ROOT)
     if not p.is_file():
         # 似た名前のファイルを同じ親ディレクトリから 5 件まで返す。
         # LLM が「該当ファイルが無い → このリストの中から選び直す or
@@ -518,11 +536,14 @@ def _build_play_audio_description() -> str:
             "limit is on the setup, not on their request."
         )
     path_hint = (
-        f"`paths` is a list of WAV file paths. Each is either absolute "
-        f"(e.g. `/workspace/share/foo.wav`) or relative to the share root "
-        f"`{_FILE_ROOT}` (e.g. `share/foo.wav`)."
+        f"`paths` is a list of WAV file paths, each inside the share root "
+        f"`{_FILE_ROOT}`. Give them relative to that root (e.g. "
+        f"`share/foo.wav`) or as an absolute path within it (e.g. "
+        f"`/workspace/share/foo.wav`). Paths outside the root (including "
+        f"via `..` or symlinks) are rejected."
         if _FILE_ROOT
-        else "`paths` is a list of **absolute** filesystem paths to WAV files."
+        else "`paths` is a list of WAV file paths (AGENT_FILE_ROOT is unset, "
+        "so playback is effectively disabled)."
     )
     return (
         "Play one or more WAV audio files via the speaker.\n\n"

@@ -77,17 +77,22 @@ DB_PATH = os.environ.get("AGENT_DB_PATH", "/data/agent.sqlite")
 SESSION_IDLE_SEC = float(os.environ.get("AGENT_SESSION_IDLE_SEC", "600"))
 PORT = int(os.environ.get("AGENT_PORT", "7080"))
 
-# Feature flag for issue #19. Default off so this PR is a no-op for
-# anyone who doesn't opt in.
+# Feature flag for issue #19. The in-code default is off so a bare
+# `import app` with no env set stays a no-op, but compose.yaml passes
+# AGENT_TOOLS_ENABLED=true — deployed stacks therefore run with tools
+# ON by default (set it false in .env to fall back to the legacy
+# single-node chat graph).
 TOOLS_ENABLED = os.environ.get("AGENT_TOOLS_ENABLED", "false").lower() in ("1", "true", "yes")
 # Caps the number of graph steps per turn (agent_node → tools → agent_node
 # → ... ). 6 ≈ 3 tool calls in a chain. Beyond this we surface a fallback
 # voice line rather than loop forever. issue #19 オープン項目 #6 の retry
 # リミット。
 RECURSION_LIMIT = int(os.environ.get("AGENT_TOOL_RECURSION_LIMIT", "6"))
-# Recovery line spoken when the ReAct loop exceeds RECURSION_LIMIT
-# (LLM kept trying tools but never produced a final answer).
-RECURSION_FALLBACK_TEXT = os.environ.get(
+# Recovery line spoken whenever a turn would otherwise end with no
+# spoken text — either the ReAct loop exceeded RECURSION_LIMIT, or the
+# stream finished after a failed/denied tool without the LLM producing
+# any reply. A voice agent must always say *something*.
+FALLBACK_TEXT = os.environ.get(
     "AGENT_TOOL_FALLBACK_TEXT",
     "うまくできませんでした、すみません。",
 )
@@ -293,7 +298,7 @@ async def stream_chat(graph, sessions: SessionManager, user_text: str
                                           isinstance() filter drops it.
 
     `recursion_limit` caps the agent→tools→agent loop count per turn.
-    On overflow we yield `RECURSION_FALLBACK_TEXT` as the final spoken
+    On overflow we yield `FALLBACK_TEXT` as the final spoken
     line — better than leaving the speaker silent.
     """
     session_id = await sessions.claim()
@@ -313,7 +318,7 @@ async def stream_chat(graph, sessions: SessionManager, user_text: str
     # Whether any *real* LLM-produced text was yielded (acks don't count).
     # If a turn ends with this still False — e.g. the LLM called a tool,
     # got back a `[denied]` ToolMessage, and silently stopped without
-    # generating an apology — we emit `RECURSION_FALLBACK_TEXT` at the
+    # generating an apology — we emit `FALLBACK_TEXT` at the
     # end so the operator never hears total silence. Observed with
     # gemma4:e4b when allowlist-rejected shell commands feed back.
     real_content_yielded = False
@@ -373,7 +378,7 @@ async def stream_chat(graph, sessions: SessionManager, user_text: str
             "recursion limit %d reached for session %s; emitting fallback",
             RECURSION_LIMIT, session_id,
         )
-        yield {"message": {"content": RECURSION_FALLBACK_TEXT}, "done": False}
+        yield {"message": {"content": FALLBACK_TEXT}, "done": False}
         real_content_yielded = True
 
     if not real_content_yielded and last_tool_succeeded is not True:
@@ -388,7 +393,7 @@ async def stream_chat(graph, sessions: SessionManager, user_text: str
             "no LLM text yielded for session %s; emitting fallback",
             session_id,
         )
-        yield {"message": {"content": RECURSION_FALLBACK_TEXT}, "done": False}
+        yield {"message": {"content": FALLBACK_TEXT}, "done": False}
 
     yield {"done": True}
 
