@@ -24,31 +24,21 @@ pub async fn ws_mic(
     // frame. Default behavior is unchanged so existing consumers (VAD,
     // openwakeword shim, tests) keep working without modification.
     let with_ts = matches!(params.get("ts").map(String::as_str), Some("1"));
-    // `?aec=1` (issue #20) serves the echo-cancelled mic instead of the raw
-    // one — same wire format and `?ts=1` semantics. Only valid when
-    // `aec.enabled`; otherwise no producer feeds that stream, so we reject
-    // the upgrade rather than leave the client hanging on a silent socket.
-    let want_aec = matches!(params.get("aec").map(String::as_str), Some("1"));
-    ws.on_upgrade(move |socket| handle_mic(socket, state, with_ts, want_aec))
+    ws.on_upgrade(move |socket| handle_mic(socket, state, with_ts))
 }
 
-async fn handle_mic(mut socket: WebSocket, state: AppState, with_ts: bool, want_aec: bool) {
-    if want_aec && !state.config.aec.enabled {
-        warn!("mic ws: ?aec=1 requested but aec.enabled is false; closing");
-        let _ = socket
-            .send(Message::Close(Some(CloseFrame {
-                code: close_code::POLICY,
-                reason: Cow::Borrowed("aec not enabled"),
-            })))
-            .await;
-        return;
-    }
-    let mut rx = if want_aec {
+async fn handle_mic(mut socket: WebSocket, state: AppState, with_ts: bool) {
+    // AEC (issue #20) is a single switch: when `aec.enabled`, `/mic` serves
+    // the echo-cancelled stream; otherwise the raw mic. No per-connection
+    // opt-in — every consumer (VAD, wwd) transparently gets whichever the
+    // host config selected, so enabling AEC needs no client/compose change.
+    let aec = state.config.aec.enabled;
+    let mut rx = if aec {
         state.mic_aec_tx.subscribe()
     } else {
         state.mic_tx.subscribe()
     };
-    info!(with_ts, aec = want_aec, "mic ws: client connected");
+    info!(with_ts, aec, "mic ws: client connected");
     loop {
         tokio::select! {
             msg = rx.recv() => match msg {

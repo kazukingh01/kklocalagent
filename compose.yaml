@@ -240,15 +240,10 @@ services:
     restart: unless-stopped
     environment:
       RUST_LOG: info,voice_activity_detection=info
-      # `${AUDIO_IO_AEC:+?aec=1}` appends `?aec=1` only when AUDIO_IO_AEC is
-      # set non-empty in .env — opting VAD into audio-io's echo-cancelled mic
-      # (issue #20) so the assistant's own TTS / file playback doesn't
-      # self-trigger VAD. COUPLING: this only works if audio-io's config has
-      # `[aec] enabled = true` (set on the Windows host's config.toml); with
-      # AEC off there, `/mic?aec=1` is rejected and VAD gets no audio. Leave
-      # AUDIO_IO_AEC unset (default) for the raw `/mic` — byte-identical to
-      # pre-#20 behaviour.
-      VAD_MIC_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/mic${AUDIO_IO_AEC:+?aec=1}
+      # `/mic` transparently serves audio-io's echo-cancelled stream when the
+      # host's audio-io config has `[aec] enabled = true` (issue #20) — no URL
+      # change needed here. With AEC off (default) this is the raw mic.
+      VAD_MIC_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/mic
       VAD_SINK_MODE: orchestrator
       VAD_ORCHESTRATOR_URL: http://orchestrator:7000/events
       # Required so the orchestrator receives utterance PCM and can
@@ -330,12 +325,9 @@ services:
       #     present; without ts=1 it falls back to header-less PCM.
       # Keep ?ts=1 explicit here so the shim path also gets the header
       # if you swap implementations per the steps above.
-      # `${AUDIO_IO_AEC:+&aec=1}` appends `&aec=1` only when AUDIO_IO_AEC is
-      # set non-empty — same opt-in as VAD (issue #20), so wwd also runs on
-      # the echo-cancelled mic and won't fire on the assistant's own audio.
-      # COUPLING: requires audio-io `[aec] enabled = true`; otherwise the
-      # `?aec=1` upgrade is rejected. Unset (default) = raw `/mic?ts=1`.
-      WW_MIC_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/mic?ts=1${AUDIO_IO_AEC:+&aec=1}
+      # As with VAD, `/mic` serves audio-io's echo-cancelled stream when the
+      # host config enables AEC (issue #20) — no URL change needed.
+      WW_MIC_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/mic?ts=1
       WW_SINK_MODE: orchestrator
       WW_ORCHESTRATOR_URL: http://orchestrator:7000/events
       # Classifier ONNX filename(s) under WW_MODELS_DIR (= /opt/models

@@ -55,7 +55,7 @@ pub async fn start_services(state: &AppState) -> Result<()> {
 
     // Acoustic echo cancellation (issue #20). When enabled, spin up the
     // reference mixer (sums the far-end `/spk` tracks) and the AEC task
-    // (cancels that far-end out of the mic, serving `/mic?aec=1`). Both
+    // (cancels that far-end out of the mic; `/mic` then serves it). Both
     // subscribe to broadcast channels that already exist on AppState, so the
     // `/spk` tee and `/mic` handler don't depend on these tasks being up.
     if state.config.aec.enabled {

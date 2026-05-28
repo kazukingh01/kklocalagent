@@ -55,8 +55,10 @@ pub struct RuntimeConfig {
 /// (mic capture) and far-end (the mixed `/spk` track PCM) live in the same
 /// process on the same clock — so the echo-cancelled mic can be served to
 /// every consumer (VAD, wake-word-detection) from a single computation via
-/// `/mic?aec=1`, with `/mic` (raw) left byte-identical. Disabled by default;
-/// when off, no mixer/AEC task is spawned and `/mic?aec=1` is rejected.
+/// `/mic` to every consumer (VAD, wake-word-detection) from a single
+/// computation. Disabled by default; when off, no mixer/AEC task is spawned
+/// and `/mic` serves the raw capture (byte-identical to pre-#20). When on,
+/// `/mic` transparently serves the echo-cancelled stream — no client change.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct AecConfig {

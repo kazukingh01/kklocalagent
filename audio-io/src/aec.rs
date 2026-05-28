@@ -4,8 +4,9 @@
 //! mic capture (`mic_tx`), the far-end is whatever audio-io itself is playing
 //! out the speaker — i.e. the mix of every `/spk` track (TTS on track 0,
 //! `play_audio_file` on track 1, ...). Doing the cancellation here, once,
-//! lets every consumer (VAD, wake-word-detection) subscribe to the
-//! echo-cancelled stream via `/mic?aec=1` while `/mic` stays byte-identical.
+//! lets every consumer (VAD, wake-word-detection) receive the echo-cancelled
+//! stream from `/mic` once enabled, with no per-client change — flipping
+//! `[aec] enabled` swaps what `/mic` serves (raw vs cancelled).
 //!
 //! Two pieces:
 //! * [`ReferenceMixer`] sums the per-track far-end PCM into one continuous
@@ -226,7 +227,7 @@ pub async fn reference_mixer_task(
 
 /// Subscribes to the raw mic (`mic_rx`, near-end) and the mixed far-end
 /// (`ref_rx`), runs each near frame through [`Aec`], and publishes the
-/// echo-cancelled mic on `aec_tx` (served as `/mic?aec=1`). Near frames drive
+/// echo-cancelled mic on `aec_tx` (served as `/mic` when enabled). Near frames drive
 /// the clock; far samples are buffered and pulled to match each near frame's
 /// length (padding with silence if the far-end momentarily lags).
 pub async fn aec_task(

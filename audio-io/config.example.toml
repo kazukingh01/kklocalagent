@@ -44,9 +44,9 @@ playback_tracks = 2
 # Acoustic echo cancellation (issue #20). audio-io cancels its own speaker
 # output (the mix of all /spk tracks: TTS + play_audio_file) out of the mic so
 # VAD and wake-word-detection don't self-trigger on the assistant's own voice.
-# The echo-cancelled mic is served on `/mic?aec=1`; plain `/mic` stays raw.
-# Disabled by default — when off this whole section is a no-op and `/mic` is
-# byte-identical to before.
+# When enabled, `/mic` transparently serves the echo-cancelled stream (no
+# client change). Disabled by default — when off this whole section is a
+# no-op and `/mic` is byte-identical to before.
 enabled = false
 # Adaptive-filter backend. Only "nlms" (pure-Rust normalized LMS — no native
 # dependency, cross-compiles to the mingw Windows target as-is) is implemented.

@@ -34,9 +34,9 @@ pub struct AppState {
     /// reference mixer task and consumed by the AEC task. ts = epoch ns at
     /// mix time, same clock as `mic_tx`.
     pub ref_tx: broadcast::Sender<(u64, Bytes)>,
-    /// Echo-cancelled mic, published by the AEC task and served as
-    /// `/mic?aec=1`. Empty (no producer) when `aec.enabled` is false, in
-    /// which case `/mic?aec=1` is rejected.
+    /// Echo-cancelled mic, published by the AEC task. When `aec.enabled`,
+    /// the `/mic` WS serves this instead of `mic_tx`; otherwise it has no
+    /// producer and `/mic` serves the raw `mic_tx`.
     pub mic_aec_tx: broadcast::Sender<(u64, Bytes)>,
     pub handles: Arc<Mutex<ServiceHandles>>,
 }
