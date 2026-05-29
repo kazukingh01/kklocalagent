@@ -31,9 +31,22 @@ use tracing::{info, warn};
 /// NLMS step size. 0 < mu < 2 for stability; 0.3 is a conservative value
 /// that converges in a few hundred ms without ringing on a 16 kHz stream.
 const NLMS_MU: f32 = 0.3;
-/// Regularization added to the far-end energy denominator so a silent
-/// far-end (energy ≈ 0) doesn't blow the update up.
-const NLMS_EPS: f32 = 1e-6;
+/// Per-tap regularization floor. The NLMS denominator is `reg + ||far||²`
+/// where `reg = NLMS_REG_PER_TAP * num_taps`. A tiny absolute floor (the old
+/// 1e-6) is catastrophic: with a *quiet* far-end (||far||² near zero) under a
+/// loud near-end, the step `mu*e/denom` explodes, the weights run to ±inf, and
+/// `inf - inf = NaN` poisons the filter — every output sample then casts to 0
+/// (`f32::NAN as i16 == 0`), i.e. total silence (observed in the wild). Scaling
+/// the floor with the filter length keeps the denominator sane at low energy.
+/// 1e-4/tap is tuned to stop the blowup while staying small enough not to
+/// throttle convergence once real far-end audio is flowing (≈11 dB ERLE in the
+/// offline harness vs ≈7 dB at 1e-3/tap).
+const NLMS_REG_PER_TAP: f32 = 1e-4;
+/// Leakage factor: weights decay by `(1 - NLMS_LEAK)` each sample. Bleeds off
+/// the slow drift that an un-regularized NLMS accumulates, bounding the filter
+/// so a bad patch can't grow without limit. Tiny enough not to hurt steady
+/// cancellation.
+const NLMS_LEAK: f32 = 1e-5;
 
 fn now_ns() -> u64 {
     SystemTime::now()
@@ -125,6 +138,9 @@ pub struct Aec {
     /// NLMS normalization denominator.
     energy: f32,
     num_taps: usize,
+    /// Regularization constant in the NLMS denominator (`= NLMS_REG_PER_TAP *
+    /// num_taps`), precomputed so the per-sample hot loop stays a single add.
+    reg: f32,
 }
 
 impl Aec {
@@ -137,7 +153,22 @@ impl Aec {
             far_delay: VecDeque::from(vec![0.0; delay_samples]),
             energy: 0.0,
             num_taps,
+            reg: NLMS_REG_PER_TAP * num_taps as f32,
         }
+    }
+
+    /// Zero the adaptive state. Called when the filter has gone non-finite
+    /// (numerical blowup) so it relearns from scratch rather than emitting
+    /// silence forever. The delay line is preserved (it's just buffered far
+    /// samples, never a NaN source).
+    fn reset_filter(&mut self) {
+        for w in self.weights.iter_mut() {
+            *w = 0.0;
+        }
+        for h in self.far_hist.iter_mut() {
+            *h = 0.0;
+        }
+        self.energy = 0.0;
     }
 
     fn push_far(&mut self, x: f32) {
@@ -174,10 +205,22 @@ impl Aec {
             let d_f = d as f32 / 32768.0;
             let e = d_f - y;
 
-            // NLMS weight update: w += mu * e * far_hist / (eps + ||far_hist||²).
-            let g = NLMS_MU * e / (NLMS_EPS + self.energy);
+            // Numerical safety net: if the estimate has gone non-finite, the
+            // filter has diverged — reset it and pass the raw near sample
+            // through this frame rather than casting NaN to a silent 0.
+            if !e.is_finite() {
+                self.reset_filter();
+                out.push(d);
+                continue;
+            }
+
+            // NLMS weight update with leakage:
+            //   w := (1 - leak) * w + mu * e * far_hist / (reg + ||far_hist||²)
+            // `reg` (scaled with the filter length) keeps the step bounded when
+            // the far-end energy dips toward zero; leakage bleeds off drift.
+            let g = NLMS_MU * e / (self.reg + self.energy);
             for (w, h) in self.weights.iter_mut().zip(self.far_hist.iter()) {
-                *w += g * h;
+                *w = (1.0 - NLMS_LEAK) * *w + g * h;
             }
 
             out.push((e.clamp(-1.0, 1.0) * 32767.0) as i16);
@@ -403,6 +446,49 @@ mod tests {
         assert!(
             last_resid_rms > last_voice_only_rms * 0.5,
             "near voice was suppressed: resid={last_resid_rms:.0}, voice={last_voice_only_rms:.0}"
+        );
+    }
+
+    #[test]
+    fn aec_does_not_collapse_on_quiet_far_loud_near() {
+        // Regression for the divergence bug the user hit (output went fully
+        // zero — `xxd` showed all 0x00). The trigger is a *quiet* far-end
+        // (tiny but non-zero ||far||²) under a *loud* near-end: the old
+        // absolute 1e-6 denominator floor let `mu*e/denom` explode, the
+        // weights ran to ±inf, and `inf - inf = NaN` cast to 0 every sample.
+        // Here there's almost no real echo (far is near-silent), so a correct
+        // filter must just pass the loud near through — not annihilate it.
+        let rate = 16000;
+        let mut aec = Aec::new(rate, 60, 3);
+        let frame_len = 320;
+        let mut t: f32 = 0.0;
+        let mut resid_acc: Vec<i16> = Vec::new();
+        let mut near_acc: Vec<i16> = Vec::new();
+
+        for _ in 0..200 {
+            // Quiet far (constant 30 ≈ -60 dBFS): ||far||² stays tiny but
+            // non-zero — the pathological denominator regime.
+            let far = vec![30i16; frame_len];
+            // Loud near-end voice, uncorrelated with the far-end.
+            let near: Vec<i16> = (0..frame_len)
+                .map(|_| {
+                    t += 1.0;
+                    (20000.0 * (t * 0.05).sin()) as i16
+                })
+                .collect();
+            let resid = aec.process_frame(&near, &far);
+            resid_acc.extend_from_slice(&resid);
+            near_acc.extend_from_slice(&near);
+        }
+
+        // After settling, the residual must still carry the near voice — i.e.
+        // the filter neither diverged to NaN→0 nor over-suppressed.
+        let tail = resid_acc.len() / 2;
+        let resid_rms = rms(&resid_acc[tail..]);
+        let near_rms = rms(&near_acc[tail..]);
+        assert!(
+            resid_rms > near_rms * 0.5,
+            "filter collapsed (NaN→silence regression?): resid={resid_rms:.0}, near={near_rms:.0}"
         );
     }
 }
