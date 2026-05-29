@@ -106,3 +106,12 @@ See `config.example.toml`. All fields optional — defaults are sane.
 ```bash
 cargo test
 ```
+
+```bash
+cargo install websocat
+# terminal A
+ffmpeg -i ../automatic-speech-recognition/test/samples/test-ja.wav -ar 16000 -ac 1 -f s16le - 2>/dev/null | pv -q -L 32000 | websocat -b ws://$(ip route show | awk '/default/ {print $3}'):7010/spk?track=1
+# terminal B
+websocat -b ws://$(ip route show | awk '/default/ {print $3}'):7010/mic | head -c 320000 > near.raw # speak anything
+ffmpeg -y -f s16le -ar 16000 -ac 1 -i near.raw near.wav
+```
