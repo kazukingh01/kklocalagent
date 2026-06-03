@@ -51,10 +51,14 @@ enabled = false
 # Adaptive-filter backend. Only "nlms" (pure-Rust normalized LMS — no native
 # dependency, cross-compiles to the mingw Windows target as-is) is implemented.
 backend = "nlms"
-# Adaptive filter length (ms): models the room echo tail after the bulk delay
-# is removed. Longer = captures more reverb, more CPU (taps = ms * sample_rate).
+# Adaptive filter length (ms). The filter window is initial_delay_ms +
+# filter_length_ms, anchored at zero delay, so the echo is found wherever it
+# lands in that window. Longer = covers more delay/reverb but converges slower
+# and costs more CPU (taps = ms * sample_rate). 100-150 ms suits realtime-paced
+# playback (small speaker->mic delay).
 filter_length_ms = 150
-# Bulk far-end delay hint (ms): playback ring residency (playback_buffer_ms) +
-# output + acoustic + capture latency. The far-end reference is delayed by this
-# before entering the filter. Tune on real hardware so the filter converges.
-initial_delay_ms = 120
+# Extra head-room (ms) for a LARGE bulk delay (e.g. a deep playback buffer).
+# It just extends the window; it is NOT a fixed pre-shift, so too-high only
+# wastes taps (slower convergence) — it never kills cancellation. Leave at 0
+# unless the real echo delay exceeds filter_length_ms.
+initial_delay_ms = 0

@@ -122,18 +122,22 @@ impl ReferenceMixer {
 /// Normalized-LMS adaptive echo canceller operating on 16 kHz mono s16le.
 ///
 /// `process_frame(near, far)` returns `near` with the linear echo of `far`
-/// subtracted. The far-end is delayed by `delay_samples` (bulk transport
-/// delay) before entering a `num_taps`-long adaptive filter that models the
-/// room tail; the filter adapts continuously toward whatever minimizes the
-/// residual, so steady speaker→mic echo is cancelled while a person talking
-/// into the mic (uncorrelated with the far-end) passes through.
+/// subtracted. The adaptive filter spans `num_taps` samples starting at **zero
+/// delay**, so it models the echo wherever it actually lands within that window
+/// — taps ahead of the true echo simply adapt toward zero. This is deliberate:
+/// an earlier version pre-shifted the far-end by a fixed `initial_delay_ms`
+/// bulk delay, which silently killed all cancellation whenever the real echo
+/// delay was *smaller* than that hint (e.g. realtime-paced playback, where the
+/// speaker→mic delay is only tens of ms). Covering `[0, num_taps]` removes that
+/// fragile assumption; `initial_delay_ms` now just *extends* the window to also
+/// reach larger bulk delays. The filter adapts continuously, so steady
+/// speaker→mic echo is cancelled while uncorrelated near-end speech passes
+/// through.
 pub struct Aec {
     weights: VecDeque<f32>,
     /// Filter input history, newest at the front, paired index-for-index
     /// with `weights`.
     far_hist: VecDeque<f32>,
-    /// Bulk-delay line: raw far samples wait here before reaching the filter.
-    far_delay: VecDeque<f32>,
     /// Running sum of squares of `far_hist`, maintained incrementally for the
     /// NLMS normalization denominator.
     energy: f32,
@@ -144,13 +148,16 @@ pub struct Aec {
 }
 
 impl Aec {
+    /// The filter window covers `initial_delay_ms + filter_length_ms` from zero
+    /// delay: `filter_length_ms` is the echo tail to model, `initial_delay_ms`
+    /// is extra head-room for a larger bulk transport delay. Either alone works;
+    /// their sum is the maximum echo delay (in ms) the filter can still cancel.
     pub fn new(sample_rate: u32, filter_length_ms: u32, initial_delay_ms: u32) -> Self {
-        let num_taps = ((sample_rate as usize * filter_length_ms as usize) / 1000).max(1);
-        let delay_samples = (sample_rate as usize * initial_delay_ms as usize) / 1000;
+        let window_ms = (initial_delay_ms + filter_length_ms) as usize;
+        let num_taps = ((sample_rate as usize * window_ms) / 1000).max(1);
         Self {
             weights: VecDeque::from(vec![0.0; num_taps]),
             far_hist: VecDeque::from(vec![0.0; num_taps]),
-            far_delay: VecDeque::from(vec![0.0; delay_samples]),
             energy: 0.0,
             num_taps,
             reg: NLMS_REG_PER_TAP * num_taps as f32,
@@ -159,8 +166,7 @@ impl Aec {
 
     /// Zero the adaptive state. Called when the filter has gone non-finite
     /// (numerical blowup) so it relearns from scratch rather than emitting
-    /// silence forever. The delay line is preserved (it's just buffered far
-    /// samples, never a NaN source).
+    /// silence forever.
     fn reset_filter(&mut self) {
         for w in self.weights.iter_mut() {
             *w = 0.0;
@@ -190,9 +196,7 @@ impl Aec {
     pub fn process_frame(&mut self, near: &[i16], far: &[i16]) -> Vec<i16> {
         let mut out = Vec::with_capacity(near.len());
         for (i, &d) in near.iter().enumerate() {
-            let raw_far = far.get(i).copied().unwrap_or(0) as f32 / 32768.0;
-            self.far_delay.push_back(raw_far);
-            let x = self.far_delay.pop_front().unwrap_or(0.0);
+            let x = far.get(i).copied().unwrap_or(0) as f32 / 32768.0;
             self.push_far(x);
 
             // Estimated echo = w · far_hist.
@@ -407,6 +411,41 @@ mod tests {
         assert!(
             erle > 12.0,
             "expected >12 dB echo reduction, got {erle:.1} dB (echo={last_echo_rms:.0}, resid={last_resid_rms:.0})"
+        );
+    }
+
+    #[test]
+    fn aec_cancels_when_echo_delay_far_below_hint() {
+        // Regression for the "echo passes through untouched" bug: the real
+        // echo delay (here ~1 ms) is much SMALLER than initial_delay_ms (120
+        // ms). The old code pre-shifted the far-end by the full hint, putting
+        // the echo *before* the filter window → zero cancellation. With the
+        // window anchored at delay 0 the filter must still find and cancel it.
+        let rate = 16000;
+        let delay = 16; // ~1 ms echo, far below the 40 ms hint below
+        let mut aec = Aec::new(rate, 60, 40); // window = 100 ms, hint ≫ echo
+        let mut seed = 0xfeed_face_u64;
+        let frame_len = 320;
+        let mut echo_delay_line: VecDeque<i16> = VecDeque::from(vec![0i16; delay]);
+        let mut last_echo_rms = 0.0;
+        let mut last_resid_rms = 0.0;
+
+        for _ in 0..200 {
+            let far: Vec<i16> = (0..frame_len).map(|_| lcg(&mut seed)).collect();
+            let mut near = Vec::with_capacity(frame_len);
+            for &f in &far {
+                echo_delay_line.push_back(f);
+                let delayed = echo_delay_line.pop_front().unwrap_or(0);
+                near.push((delayed as f32 * 0.5) as i16);
+            }
+            let resid = aec.process_frame(&near, &far);
+            last_echo_rms = rms(&near);
+            last_resid_rms = rms(&resid);
+        }
+        let erle = 20.0 * (last_echo_rms / last_resid_rms.max(1.0)).log10();
+        assert!(
+            erle > 12.0,
+            "echo not cancelled when delay ≪ hint: {erle:.1} dB (echo={last_echo_rms:.0}, resid={last_resid_rms:.0})"
         );
     }
 

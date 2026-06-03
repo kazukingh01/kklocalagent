@@ -69,14 +69,19 @@ pub struct AecConfig {
     /// `"speex"` / `"webrtc"` backend can be added later without a config
     /// break.
     pub backend: String,
-    /// Adaptive filter length in milliseconds — covers the residual echo
-    /// tail (reverberation) *after* `initial_delay_ms` is removed. Longer
-    /// captures more reverb at higher CPU cost (taps = ms * sample_rate).
+    /// Adaptive filter length in milliseconds. The filter window is
+    /// `initial_delay_ms + filter_length_ms`, anchored at *zero* delay, so the
+    /// echo is found wherever it lands in that window. Longer = covers more
+    /// delay/reverb but converges slower and costs more CPU (taps = ms *
+    /// sample_rate). For realtime-paced playback (small speaker→mic delay)
+    /// 100–150 ms is plenty.
     pub filter_length_ms: u32,
-    /// Bulk far-end delay hint in milliseconds: the playback ring residency
-    /// (`runtime.playback_buffer_ms`) + output + acoustic + capture latency.
-    /// The far-end reference is delayed by this much before entering the
-    /// adaptive filter so the filter only has to model the room tail.
+    /// Extra filter head-room in milliseconds for a *large* bulk transport
+    /// delay (e.g. a deep playback buffer). It simply extends the window to
+    /// `initial_delay_ms + filter_length_ms`; it is NOT a fixed pre-shift, so
+    /// setting it too high only wastes taps (slower convergence), it never
+    /// kills cancellation the way the old pre-delay did. Leave at 0 unless the
+    /// real echo delay exceeds `filter_length_ms`.
     pub initial_delay_ms: u32,
 }
 
@@ -137,7 +142,7 @@ impl Default for AecConfig {
             enabled: false,
             backend: "nlms".into(),
             filter_length_ms: 150,
-            initial_delay_ms: 120,
+            initial_delay_ms: 0,
         }
     }
 }
