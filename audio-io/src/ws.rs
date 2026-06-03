@@ -154,10 +154,10 @@ async fn handle_spk(mut socket: WebSocket, state: AppState, track_id: usize) {
                     break;
                 }
                 let frame = Bytes::from(data);
-                // Tee a copy to the AEC far-end mixer (issue #20). Cheap:
-                // `Bytes` is refcounted, and with AEC disabled the broadcast
-                // has no subscriber so `send` is a no-op error we ignore.
-                let _ = state.ref_in_tx.send((track_id, frame.clone()));
+                // NB: the AEC far-end reference is NOT teed here. It is tapped
+                // where cpal actually consumes the audio (playback output
+                // callback), so the reference is aligned to the speaker output
+                // rather than leading it by the whole playback-ring residency.
                 if spk_tx.send(PlaybackMessage::Frame(frame)).await.is_err() {
                     warn!("spk ws: playback task gone; closing");
                     break;

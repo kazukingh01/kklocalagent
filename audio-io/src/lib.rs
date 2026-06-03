@@ -47,10 +47,11 @@ pub async fn run(config: Config) -> Result<()> {
 pub fn build_state(config: Config) -> AppState {
     let cap = config.runtime.mic_broadcast_frames.max(1) as usize;
     let (mic_tx, _) = broadcast::channel(cap);
-    // AEC channels exist regardless of `aec.enabled` so the WS/`/spk`
-    // handlers needn't branch on a runtime toggle; with the mixer/AEC tasks
-    // not spawned there are simply no subscribers/producers. The far-end
-    // ingress is sized larger because multiple `/spk` tracks feed it.
+    // AEC channels exist regardless of `aec.enabled` so the producers needn't
+    // branch on a runtime toggle; with the mixer/AEC tasks not spawned there
+    // are simply no subscribers/producers. The far-end ingress (fed by each
+    // playback track's consumption tap) is sized larger because multiple
+    // tracks feed it.
     let (ref_in_tx, _) = broadcast::channel(cap * 2);
     let (ref_tx, _) = broadcast::channel(cap);
     let (mic_aec_tx, _) = broadcast::channel(cap);

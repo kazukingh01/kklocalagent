@@ -8,17 +8,30 @@
 //! stream from `/mic` once enabled, with no per-client change — flipping
 //! `[aec] enabled` swaps what `/mic` serves (raw vs cancelled).
 //!
-//! Two pieces:
-//! * [`ReferenceMixer`] sums the per-track far-end PCM into one continuous
-//!   16 kHz mono stream (silence when nothing plays — the adaptive filter
-//!   needs a gap-free far-end timeline).
+//! **Where the far-end is tapped matters.** The reference is captured at the
+//! point cpal actually *consumes* each playback frame (the output callback in
+//! [`crate::playback`]), NOT at the `/spk` WS ingress. Tapping after the
+//! playback ring buffer means the reference is on the same wall clock as the
+//! sound leaving the speaker, so the only residual delay the filter must model
+//! is the small DAC→air→mic→ADC path (tens of ms) — not the ~hundreds of ms
+//! the ring can hold. (An earlier design teed the raw WS bytes before the ring;
+//! the echo then lagged the reference by the whole ring residency, which
+//! exceeded the filter window and killed all cancellation.)
+//!
+//! Three pieces:
+//! * Each playback track's output callback emits its consumed PCM as a 16 kHz
+//!   mono frame tagged with the wall-clock consumption time.
+//! * [`ReferenceMixer`] sums those per-track frames into one continuous 16 kHz
+//!   mono stream (silence when nothing plays — the adaptive filter needs a
+//!   gap-free far-end timeline) and carries the play timestamp through.
 //! * [`Aec`] is a pure-Rust normalized-LMS (NLMS) adaptive filter. Pure Rust
 //!   (no native dep) so it cross-compiles to the mingw Windows target with
 //!   zero extra build setup; the `backend` config field leaves room for a
-//!   `speex`/`webrtc` swap later. Because near and far share one clock here,
-//!   the bulk delay is known from config (`initial_delay_ms`) and the filter
-//!   only has to model the room tail (`filter_length_ms`) — no delay
-//!   estimator required.
+//!   `speex`/`webrtc` swap later. [`aec_task`] time-aligns far to near using
+//!   the carried timestamps (capture and consumption share the system clock),
+//!   so the echo always lands inside the filter's `[0, filter_length_ms]`
+//!   window regardless of when each stream started — no fixed delay hint
+//!   needed.
 
 use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -70,38 +83,60 @@ fn i16_to_bytes(samples: &[i16]) -> Vec<u8> {
     out
 }
 
-/// Sums the per-track far-end PCM into one 16 kHz mono s16le stream.
+/// Sums the per-track far-end PCM into one 16 kHz mono s16le stream, carrying
+/// the wall-clock *play* time of the emitted samples.
 ///
-/// Track frames arrive asynchronously (one `push` per `/spk` WS frame, any
-/// length); the mixer buffers per track and emits fixed `samples_per_frame`
-/// slots on [`tick`](Self::tick). A slot with no buffered samples for a track
-/// contributes silence, so the output is gap-free even when nothing plays —
-/// which the adaptive filter relies on for a continuous far-end timeline.
+/// Track frames arrive asynchronously (one `push` per playback output
+/// callback, any length); the mixer buffers per track and emits fixed
+/// `samples_per_frame` slots on [`tick`](Self::tick). A slot with no buffered
+/// samples for a track contributes silence, so the output is gap-free even
+/// when nothing plays — which the adaptive filter relies on for a continuous
+/// far-end timeline.
+///
+/// `timeline_ts` tracks the wall-clock play time of the *next* sample to be
+/// emitted (front of the mixed timeline). It is re-anchored from each incoming
+/// frame's timestamp (so it stays locked to the playback hardware clock, not a
+/// free-running software timer) and advanced one frame per [`tick`]. With a
+/// single active track this is exact; with several simultaneous tracks the
+/// most-recently-pushed track wins the anchor — fine, since they share one
+/// output device clock and so are within a callback of each other.
 pub struct ReferenceMixer {
     samples_per_frame: usize,
+    sample_period_ns: u64,
     tracks: Vec<VecDeque<i16>>,
+    timeline_ts: Option<u64>,
 }
 
 impl ReferenceMixer {
-    pub fn new(samples_per_frame: usize, n_tracks: usize) -> Self {
+    pub fn new(sample_rate: u32, samples_per_frame: usize, n_tracks: usize) -> Self {
         Self {
             samples_per_frame,
+            sample_period_ns: 1_000_000_000 / sample_rate.max(1) as u64,
             tracks: (0..n_tracks).map(|_| VecDeque::new()).collect(),
+            timeline_ts: None,
         }
     }
 
-    /// Append a track's incoming s16le bytes. Out-of-range track ids are
-    /// ignored (defensive — `/spk` already validates the track id).
-    pub fn push(&mut self, track_id: usize, bytes: &[u8]) {
+    /// Append a track's incoming s16le bytes. `last_sample_ts` is the
+    /// wall-clock play time of the frame's *last* sample. Out-of-range track
+    /// ids are ignored (defensive — the playback tap already supplies a valid
+    /// track id).
+    pub fn push(&mut self, track_id: usize, last_sample_ts: u64, bytes: &[u8]) {
         if let Some(buf) = self.tracks.get_mut(track_id) {
             buf.extend(bytes_to_i16(bytes));
+            // Front-of-buffer play time = last sample's time minus the span of
+            // the samples queued ahead of it. Re-anchors the shared timeline.
+            let ahead = (buf.len() as u64).saturating_sub(1);
+            self.timeline_ts = Some(last_sample_ts.saturating_sub(ahead * self.sample_period_ns));
         }
     }
 
-    /// Emit one mixed frame (`samples_per_frame` samples, s16le). Pulls up to
-    /// one frame from each track buffer (missing samples = silence) and sums
-    /// with saturation so two simultaneous tracks never wrap around.
-    pub fn tick(&mut self) -> Vec<u8> {
+    /// Emit one mixed frame (`samples_per_frame` samples, s16le) plus the
+    /// play timestamp of its first sample (`None` until the first push). Pulls
+    /// up to one frame from each track buffer (missing samples = silence) and
+    /// sums with saturation so two simultaneous tracks never wrap around.
+    pub fn tick(&mut self) -> (Option<u64>, Vec<u8>) {
+        let ts = self.timeline_ts;
         let n = self.samples_per_frame;
         let mut acc = vec![0i32; n];
         for buf in &mut self.tracks {
@@ -115,7 +150,12 @@ impl ReferenceMixer {
             .into_iter()
             .map(|v| v.clamp(i16::MIN as i32, i16::MAX as i32) as i16)
             .collect();
-        i16_to_bytes(&mixed)
+        // Advance the timeline by the frame we just emitted so silence ticks
+        // keep the clock moving; the next push re-anchors it precisely.
+        if let Some(t) = self.timeline_ts.as_mut() {
+            *t = t.saturating_add(n as u64 * self.sample_period_ns);
+        }
+        (ts, i16_to_bytes(&mixed))
     }
 }
 
@@ -241,13 +281,14 @@ impl Aec {
 /// one mixed frame every `frame_ms` on `ref_tx`. Runs until both inputs close
 /// (services stopped / handle aborted).
 pub async fn reference_mixer_task(
-    mut ref_in_rx: broadcast::Receiver<(usize, Bytes)>,
+    mut ref_in_rx: broadcast::Receiver<(usize, u64, Bytes)>,
     ref_tx: broadcast::Sender<(u64, Bytes)>,
+    sample_rate: u32,
     samples_per_frame: usize,
     n_tracks: usize,
     frame_ms: u32,
 ) {
-    let mut mixer = ReferenceMixer::new(samples_per_frame, n_tracks);
+    let mut mixer = ReferenceMixer::new(sample_rate, samples_per_frame, n_tracks);
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(frame_ms as u64));
     info!(
         samples_per_frame,
@@ -256,50 +297,129 @@ pub async fn reference_mixer_task(
     loop {
         tokio::select! {
             inbound = ref_in_rx.recv() => match inbound {
-                Ok((track_id, bytes)) => mixer.push(track_id, &bytes),
+                Ok((track_id, ts, bytes)) => mixer.push(track_id, ts, &bytes),
                 Err(RecvError::Lagged(n)) => {
                     warn!("reference mixer: lagged {n} far-end frames");
                 }
                 Err(RecvError::Closed) => break,
             },
             _ = interval.tick() => {
-                let frame = mixer.tick();
+                let (ts, frame) = mixer.tick();
+                // Before the first playback frame the timeline has no anchor;
+                // fall back to wall-clock so silence frames still carry a sane
+                // (monotonic-ish) timestamp.
+                let ts = ts.unwrap_or_else(now_ns);
                 // No subscribers (AEC task gone) → send errors, ignored.
-                let _ = ref_tx.send((now_ns(), Bytes::from(frame)));
+                let _ = ref_tx.send((ts, Bytes::from(frame)));
             }
         }
     }
     info!("reference mixer exiting");
 }
 
+/// Time-aligns the far-end reference to a near (mic) frame and returns one far
+/// sample per near sample, on the near frame's timeline.
+///
+/// Both timestamps are wall-clock (capture stamps near at the input callback,
+/// the playback tap stamps far at the output callback), so we feed the far
+/// sample that was *played* at the same instant each near sample was
+/// *captured*. The real echo — far played `d` ms earlier (DAC→air→mic) — then
+/// lands at tap `d` inside the filter window, wherever `d` happens to be, so
+/// the constant offset between when each stream started no longer matters.
+///
+/// `far_front_ts` is the play time of `far_buf.front()`. Far older than the
+/// near frame start is dropped (its echo is already past); if far lags (front
+/// newer than the near start) the unmatched head is padded with silence.
+fn align_far(
+    far_buf: &mut VecDeque<i16>,
+    far_front_ts: &mut Option<u64>,
+    near_ts: u64,
+    n: usize,
+    period_ns: u64,
+) -> Vec<i16> {
+    let mut far = Vec::with_capacity(n);
+    let near_first_ts = near_ts.saturating_sub((n as u64).saturating_sub(1) * period_ns);
+    match *far_front_ts {
+        // No far timeline yet (nothing has played) → reference is silence.
+        None => far.resize(n, 0),
+        Some(mut fts) => {
+            // Drop far strictly older than this near frame's start: its echo
+            // belongs to already-processed near frames.
+            while fts + period_ns <= near_first_ts {
+                if far_buf.pop_front().is_none() {
+                    fts = near_first_ts;
+                    break;
+                }
+                fts += period_ns;
+            }
+            // Far lagging: front is newer than the near start, so the head of
+            // this frame has no reference yet → silence-pad it.
+            let lead = if fts > near_first_ts {
+                ((fts - near_first_ts) / period_ns) as usize
+            } else {
+                0
+            };
+            let pad = lead.min(n);
+            far.resize(pad, 0);
+            for _ in pad..n {
+                far.push(far_buf.pop_front().unwrap_or(0));
+            }
+            let consumed = (n - pad) as u64;
+            *far_front_ts = if far_buf.is_empty() {
+                None
+            } else {
+                Some(fts + consumed * period_ns)
+            };
+        }
+    }
+    far
+}
+
 /// Subscribes to the raw mic (`mic_rx`, near-end) and the mixed far-end
-/// (`ref_rx`), runs each near frame through [`Aec`], and publishes the
-/// echo-cancelled mic on `aec_tx` (served as `/mic` when enabled). Near frames drive
-/// the clock; far samples are buffered and pulled to match each near frame's
-/// length (padding with silence if the far-end momentarily lags).
+/// (`ref_rx`), time-aligns the two streams by their carried wall-clock
+/// timestamps (see [`align_far`]), runs each near frame through [`Aec`], and
+/// publishes the echo-cancelled mic on `aec_tx` (served as `/mic` when
+/// enabled). Near frames drive the clock; far samples are buffered and aligned
+/// to each near frame, padding with silence if the far-end momentarily lags.
 pub async fn aec_task(
     mut mic_rx: broadcast::Receiver<(u64, Bytes)>,
     mut ref_rx: broadcast::Receiver<(u64, Bytes)>,
     aec_tx: broadcast::Sender<(u64, Bytes)>,
+    sample_rate: u32,
     mut aec: Aec,
 ) {
     info!(num_taps = aec.num_taps(), "aec task started");
-    let mut far_pending: VecDeque<i16> = VecDeque::new();
+    let period_ns = 1_000_000_000 / sample_rate.max(1) as u64;
+    let mut far_buf: VecDeque<i16> = VecDeque::new();
+    // Play time of far_buf.front(); None when the buffer is empty / unanchored.
+    let mut far_front_ts: Option<u64> = None;
     loop {
         tokio::select! {
             far = ref_rx.recv() => match far {
-                Ok((_ts, bytes)) => far_pending.extend(bytes_to_i16(&bytes)),
+                Ok((ts, bytes)) => {
+                    // Re-anchor the front timestamp to the playback clock every
+                    // frame: this frame's first sample plays at `ts` and sits
+                    // `far_buf.len()` samples behind the current front, so the
+                    // front plays at `ts - len*period`. Re-anchoring (vs only
+                    // when empty) tracks any drift between the playback and
+                    // capture hardware clocks instead of accumulating it.
+                    let behind = far_buf.len() as u64;
+                    far_front_ts = Some(ts.saturating_sub(behind * period_ns));
+                    far_buf.extend(bytes_to_i16(&bytes));
+                }
                 Err(RecvError::Lagged(n)) => {
+                    // A gap breaks timeline continuity; reset so the next frame
+                    // re-anchors rather than splicing across the hole.
                     warn!("aec: lagged {n} far-end frames");
+                    far_buf.clear();
+                    far_front_ts = None;
                 }
                 Err(RecvError::Closed) => break,
             },
             near = mic_rx.recv() => match near {
                 Ok((ts, bytes)) => {
                     let near = bytes_to_i16(&bytes);
-                    let far: Vec<i16> = (0..near.len())
-                        .map(|_| far_pending.pop_front().unwrap_or(0))
-                        .collect();
+                    let far = align_far(&mut far_buf, &mut far_front_ts, ts, near.len(), period_ns);
                     let cleaned = aec.process_frame(&near, &far);
                     let _ = aec_tx.send((ts, Bytes::from(i16_to_bytes(&cleaned))));
                 }
@@ -325,45 +445,94 @@ mod tests {
         (sum / samples.len() as f64).sqrt()
     }
 
+    // 16 kHz sample period in ns; used by the timestamp/alignment tests.
+    const P: u64 = 62_500;
+
     #[test]
     fn mixer_passthrough_single_track() {
-        let mut m = ReferenceMixer::new(4, 2);
+        let mut m = ReferenceMixer::new(16000, 4, 2);
         let frame = i16_to_bytes(&[100, -200, 300, -400]);
-        m.push(0, &frame);
-        assert_eq!(bytes_to_i16(&m.tick()), vec![100, -200, 300, -400]);
+        m.push(0, 0, &frame);
+        assert_eq!(bytes_to_i16(&m.tick().1), vec![100, -200, 300, -400]);
     }
 
     #[test]
     fn mixer_sums_two_tracks() {
-        let mut m = ReferenceMixer::new(4, 2);
-        m.push(0, &i16_to_bytes(&[100, 100, 100, 100]));
-        m.push(1, &i16_to_bytes(&[50, -50, 50, -50]));
-        assert_eq!(bytes_to_i16(&m.tick()), vec![150, 50, 150, 50]);
+        let mut m = ReferenceMixer::new(16000, 4, 2);
+        m.push(0, 0, &i16_to_bytes(&[100, 100, 100, 100]));
+        m.push(1, 0, &i16_to_bytes(&[50, -50, 50, -50]));
+        assert_eq!(bytes_to_i16(&m.tick().1), vec![150, 50, 150, 50]);
     }
 
     #[test]
     fn mixer_saturates_instead_of_wrapping() {
-        let mut m = ReferenceMixer::new(2, 2);
-        m.push(0, &i16_to_bytes(&[30000, -30000]));
-        m.push(1, &i16_to_bytes(&[30000, -30000]));
+        let mut m = ReferenceMixer::new(16000, 2, 2);
+        m.push(0, 0, &i16_to_bytes(&[30000, -30000]));
+        m.push(1, 0, &i16_to_bytes(&[30000, -30000]));
         // 60000 / -60000 must clamp to i16 range, not wrap.
-        assert_eq!(bytes_to_i16(&m.tick()), vec![i16::MAX, i16::MIN]);
+        assert_eq!(bytes_to_i16(&m.tick().1), vec![i16::MAX, i16::MIN]);
     }
 
     #[test]
     fn mixer_emits_silence_when_idle() {
-        let mut m = ReferenceMixer::new(4, 2);
-        assert_eq!(bytes_to_i16(&m.tick()), vec![0, 0, 0, 0]);
+        let mut m = ReferenceMixer::new(16000, 4, 2);
+        let (ts, frame) = m.tick();
+        assert_eq!(ts, None); // no anchor before the first push
+        assert_eq!(bytes_to_i16(&frame), vec![0, 0, 0, 0]);
     }
 
     #[test]
     fn mixer_carries_residual_across_ticks() {
         // Push 6 samples into a 4-wide mixer: first tick takes 4, second takes
         // the remaining 2 then pads with silence.
-        let mut m = ReferenceMixer::new(4, 1);
-        m.push(0, &i16_to_bytes(&[1, 2, 3, 4, 5, 6]));
-        assert_eq!(bytes_to_i16(&m.tick()), vec![1, 2, 3, 4]);
-        assert_eq!(bytes_to_i16(&m.tick()), vec![5, 6, 0, 0]);
+        let mut m = ReferenceMixer::new(16000, 4, 1);
+        m.push(0, 0, &i16_to_bytes(&[1, 2, 3, 4, 5, 6]));
+        assert_eq!(bytes_to_i16(&m.tick().1), vec![1, 2, 3, 4]);
+        assert_eq!(bytes_to_i16(&m.tick().1), vec![5, 6, 0, 0]);
+    }
+
+    #[test]
+    fn mixer_timestamp_anchors_to_play_time() {
+        // Last sample played at t = 1_000_000 ns; the front (first) sample
+        // played 3 periods earlier. The emit ts is that front time.
+        let mut m = ReferenceMixer::new(16000, 4, 1);
+        let last = 1_000_000u64;
+        m.push(0, last, &i16_to_bytes(&[1, 2, 3, 4]));
+        assert_eq!(m.tick().0, Some(last - 3 * P));
+        // The now-idle tick advances the timeline by one frame (4 samples).
+        assert_eq!(m.tick().0, Some(last - 3 * P + 4 * P));
+    }
+
+    #[test]
+    fn align_far_aligns_by_timestamp() {
+        // Far front plays at t=0; near frame's first sample is at t=0 too →
+        // the front far samples are taken 1:1 with no skew.
+        let mut far_buf: VecDeque<i16> = VecDeque::from(vec![10, 20, 30, 40]);
+        let mut fts = Some(0u64);
+        // n=2, near_ts = P → near_first = 0.
+        let far = align_far(&mut far_buf, &mut fts, P, 2, P);
+        assert_eq!(far, vec![10, 20]);
+        assert_eq!(fts, Some(2 * P)); // remaining [30,40] front now at t=2P
+    }
+
+    #[test]
+    fn align_far_drops_stale_far() {
+        // Far front at t=0 but the near frame doesn't start until t=3P, so the
+        // three oldest far samples (their echo is already past) are dropped.
+        let mut far_buf: VecDeque<i16> = VecDeque::from(vec![1, 2, 3, 4, 5, 6]);
+        let mut fts = Some(0u64);
+        let far = align_far(&mut far_buf, &mut fts, 4 * P, 2, P); // near_first = 3P
+        assert_eq!(far, vec![4, 5]);
+    }
+
+    #[test]
+    fn align_far_pads_when_far_lags() {
+        // Far front is newer (t=2P) than the near frame start (t=0): the head
+        // of the frame has no reference yet and must be silence-padded.
+        let mut far_buf: VecDeque<i16> = VecDeque::from(vec![7, 8]);
+        let mut fts = Some(2 * P);
+        let far = align_far(&mut far_buf, &mut fts, 3 * P, 4, P); // near_first = 0
+        assert_eq!(far, vec![0, 0, 7, 8]);
     }
 
     // Deterministic pseudo-random far-end (LCG) so the test needs no rng dep.

@@ -32,6 +32,13 @@ pub async fn start_services(state: &AppState) -> Result<()> {
     // callers (TTS-streamer on track 0, agent on track 1, ...) can push
     // PCM in parallel without per-sample stomping or contention.
     let n_tracks = state.config.runtime.playback_tracks as usize;
+    // Far-end reference tap: hand each playback stream the AEC ingress sender
+    // only when AEC is enabled, so the no-AEC path pays nothing for it.
+    let ref_tap = if state.config.aec.enabled {
+        Some(state.ref_in_tx.clone())
+    } else {
+        None
+    };
     let mut new_tracks = Vec::with_capacity(n_tracks);
     let mut new_handles = Vec::with_capacity(n_tracks);
     for track_id in 0..n_tracks {
@@ -42,6 +49,7 @@ pub async fn start_services(state: &AppState) -> Result<()> {
             state.config.audio.clone(),
             state.config.runtime.playback_buffer_ms,
             flush.clone(),
+            ref_tap.clone(),
         )
         .with_context(|| format!("start_playback (track {track_id})"))?;
         new_tracks.push(PlaybackTrack {
@@ -63,6 +71,7 @@ pub async fn start_services(state: &AppState) -> Result<()> {
         let mixer = tokio::spawn(reference_mixer_task(
             state.ref_in_tx.subscribe(),
             state.ref_tx.clone(),
+            state.config.audio.sample_rate,
             spf,
             n_tracks,
             state.config.audio.frame_ms,
@@ -76,6 +85,7 @@ pub async fn start_services(state: &AppState) -> Result<()> {
             state.mic_tx.subscribe(),
             state.ref_tx.subscribe(),
             state.mic_aec_tx.clone(),
+            state.config.audio.sample_rate,
             aec,
         ));
         handles.aec_tasks = vec![mixer, canceller];

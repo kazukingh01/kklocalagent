@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
@@ -10,11 +10,11 @@ use cpal::{SampleFormat, StreamConfig};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 use std::time::Instant;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use crate::config::AudioConfig;
-use crate::framer::PlaybackFramer;
+use crate::framer::{CaptureFramer, PlaybackFramer};
 use crate::state::FlushSignals;
 
 /// One unit of work for the playback producer task.
@@ -140,6 +140,7 @@ pub fn start_playback(
     audio: AudioConfig,
     buffer_ms: u32,
     flush: Arc<FlushSignals>,
+    ref_tap: Option<broadcast::Sender<(usize, u64, Bytes)>>,
 ) -> Result<PlaybackHandle> {
     let (ready_tx, ready_rx) = std_mpsc::sync_channel::<Result<PlaybackReady>>(1);
     let (shutdown_tx, shutdown_rx) = std_mpsc::sync_channel::<()>(1);
@@ -147,6 +148,9 @@ pub fn start_playback(
     let flush_cb = flush.clone();
     let stats = Arc::new(UnderrunStats::new());
     let stats_cb = stats.clone();
+    // The producer task (below) keeps `audio`; the cpal thread gets its own
+    // clone for the consumption-side reference tap.
+    let audio_cb = audio.clone();
 
     let thread = std::thread::Builder::new()
         .name(format!("audio-playback-{track_id}"))
@@ -155,9 +159,11 @@ pub fn start_playback(
             if let Err(e) = run_playback(
                 track_id,
                 &device_name,
+                audio_cb,
                 buffer_ms,
                 flush_cb,
                 stats_cb,
+                ref_tap,
                 ready_tx,
                 shutdown_rx,
             ) {
@@ -265,12 +271,62 @@ fn find_output_device(name: &str) -> Result<cpal::Device> {
     Err(anyhow!("output device '{name}' not found"))
 }
 
+/// Emit the playback tap's downsampled reference frames to the AEC mixer.
+/// `frames` are 16 kHz mono s16le (one AEC frame each); `frame_ns` back-dates
+/// frames produced together in a single callback so each carries its own play
+/// timestamp (mirrors the capture-side `dispatch`). Send failures (AEC mixer
+/// not running) are ignored.
+fn emit_ref(
+    tx: &broadcast::Sender<(usize, u64, Bytes)>,
+    track_id: usize,
+    frames: Vec<Vec<u8>>,
+    frame_ns: u64,
+) {
+    if frames.is_empty() {
+        return;
+    }
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let n = frames.len();
+    for (i, frame) in frames.into_iter().enumerate() {
+        let end_ns = now_ns.saturating_sub(((n - 1 - i) as u64) * frame_ns);
+        let _ = tx.send((track_id, end_ns, Bytes::from(frame)));
+    }
+}
+
+/// Build the consumption-side reference resampler (native rate/channels →
+/// 16 kHz mono) — but only when AEC is enabled (`ref_tap` present). When
+/// disabled this is `None` and the output callback skips the tap entirely, so
+/// playback is byte-for-byte identical to the no-AEC path.
+fn build_ref_framer(
+    ref_tap: &Option<broadcast::Sender<(usize, u64, Bytes)>>,
+    native_rate: u32,
+    native_channels: u16,
+    audio: &AudioConfig,
+) -> Result<Option<CaptureFramer>> {
+    if ref_tap.is_some() {
+        Ok(Some(CaptureFramer::new(
+            native_rate,
+            native_channels,
+            audio.sample_rate,
+            audio.samples_per_frame(),
+        )?))
+    } else {
+        Ok(None)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_playback(
     track_id: usize,
     device_name: &str,
+    audio: AudioConfig,
     buffer_ms: u32,
     flush: Arc<FlushSignals>,
     stats: Arc<UnderrunStats>,
+    ref_tap: Option<broadcast::Sender<(usize, u64, Bytes)>>,
     ready_tx: std_mpsc::SyncSender<Result<PlaybackReady>>,
     shutdown_rx: std_mpsc::Receiver<()>,
 ) -> Result<()> {
@@ -311,11 +367,21 @@ fn run_playback(
     let err_fn = |e| error!("cpal output stream error: {e}");
     let flush_cb = flush.clone();
 
+    // Far-end reference tap (issue #20). When AEC is enabled, the matched
+    // format branch builds a `CaptureFramer` that converts the native-rate,
+    // native-channel PCM the device consumes down to the AEC's 16 kHz mono and
+    // hands it to `emit_ref`, timestamped at consumption. `ref_frame_ns` is the
+    // duration of one emitted 16 kHz frame, used to back-date batched frames.
+    let ref_frame_ns: u64 =
+        (audio.samples_per_frame() as u64 * 1_000_000_000) / audio.sample_rate.max(1) as u64;
+
     let stream = match sample_format {
         SampleFormat::F32 => {
             let mut consumer: HeapCons<f32> = consumer;
             let flush = flush_cb;
             let stats = stats.clone();
+            let ref_tap = ref_tap.clone();
+            let mut ref_framer = build_ref_framer(&ref_tap, native_rate, native_channels, &audio)?;
             device.build_output_stream(
                 &stream_config,
                 move |data: &mut [f32], _| {
@@ -338,6 +404,10 @@ fn run_playback(
                     }
                     stats.consumed.fetch_add(data.len() as u64, Ordering::Relaxed);
                     stats.callbacks_total.fetch_add(1, Ordering::Relaxed);
+                    // Tap the exact PCM handed to the device as the AEC far-end.
+                    if let (Some(framer), Some(tx)) = (ref_framer.as_mut(), ref_tap.as_ref()) {
+                        emit_ref(tx, track_id, framer.push_f32(data), ref_frame_ns);
+                    }
                 },
                 err_fn,
                 None,
@@ -347,6 +417,8 @@ fn run_playback(
             let mut consumer: HeapCons<f32> = consumer;
             let flush = flush_cb;
             let stats = stats.clone();
+            let ref_tap = ref_tap.clone();
+            let mut ref_framer = build_ref_framer(&ref_tap, native_rate, native_channels, &audio)?;
             device.build_output_stream(
                 &stream_config,
                 move |data: &mut [i16], _| {
@@ -370,6 +442,9 @@ fn run_playback(
                     }
                     stats.consumed.fetch_add(data.len() as u64, Ordering::Relaxed);
                     stats.callbacks_total.fetch_add(1, Ordering::Relaxed);
+                    if let (Some(framer), Some(tx)) = (ref_framer.as_mut(), ref_tap.as_ref()) {
+                        emit_ref(tx, track_id, framer.push_i16(data), ref_frame_ns);
+                    }
                 },
                 err_fn,
                 None,
@@ -379,6 +454,8 @@ fn run_playback(
             let mut consumer: HeapCons<f32> = consumer;
             let flush = flush_cb;
             let stats = stats.clone();
+            let ref_tap = ref_tap.clone();
+            let mut ref_framer = build_ref_framer(&ref_tap, native_rate, native_channels, &audio)?;
             device.build_output_stream(
                 &stream_config,
                 move |data: &mut [u16], _| {
@@ -403,6 +480,9 @@ fn run_playback(
                     }
                     stats.consumed.fetch_add(data.len() as u64, Ordering::Relaxed);
                     stats.callbacks_total.fetch_add(1, Ordering::Relaxed);
+                    if let (Some(framer), Some(tx)) = (ref_framer.as_mut(), ref_tap.as_ref()) {
+                        emit_ref(tx, track_id, framer.push_u16(data), ref_frame_ns);
+                    }
                 },
                 err_fn,
                 None,
