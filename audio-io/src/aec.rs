@@ -275,6 +275,32 @@ impl Aec {
     pub fn num_taps(&self) -> usize {
         self.num_taps
     }
+
+    /// Diagnostics: `(L2 norm of all weights, index of the largest-magnitude
+    /// tap, that tap's value)`. The peak tap is the filter's current estimate
+    /// of the dominant echo delay *in samples* — if the filter has locked on,
+    /// `peak_tap * 1000 / sample_rate` is roughly the speaker→mic delay in ms.
+    /// A peak pinned at the last tap (or a near-zero L2 that never grows) means
+    /// the true echo sits at/after the window edge and the filter can't reach
+    /// it.
+    pub fn weight_stats(&self) -> (f32, usize, f32) {
+        let mut l2 = 0.0f32;
+        let mut peak_idx = 0usize;
+        let mut peak_abs = 0.0f32;
+        for (i, w) in self.weights.iter().enumerate() {
+            l2 += w * w;
+            if w.abs() > peak_abs {
+                peak_abs = w.abs();
+                peak_idx = i;
+            }
+        }
+        (l2.sqrt(), peak_idx, peak_abs)
+    }
+}
+
+/// Sum of squares as f64 (energy), for RMS-based AEC diagnostics.
+fn sum_sq(samples: &[i16]) -> f64 {
+    samples.iter().map(|&s| (s as f64) * (s as f64)).sum()
 }
 
 /// Drains per-track far-end frames into the [`ReferenceMixer`] and publishes
@@ -330,18 +356,26 @@ pub async fn reference_mixer_task(
 /// `far_front_ts` is the play time of `far_buf.front()`. Far older than the
 /// near frame start is dropped (its echo is already past); if far lags (front
 /// newer than the near start) the unmatched head is padded with silence.
+/// Returns `(far, dropped, padded)`: the aligned far samples, how many stale
+/// far samples were dropped to catch up to the near frame, and how many head
+/// samples were silence-padded because far was lagging. The two counts are
+/// diagnostics — at steady state both should be ~0 (far tracks near exactly).
 fn align_far(
     far_buf: &mut VecDeque<i16>,
     far_front_ts: &mut Option<u64>,
     near_ts: u64,
     n: usize,
     period_ns: u64,
-) -> Vec<i16> {
+) -> (Vec<i16>, usize, usize) {
     let mut far = Vec::with_capacity(n);
     let near_first_ts = near_ts.saturating_sub((n as u64).saturating_sub(1) * period_ns);
+    let mut dropped = 0usize;
     match *far_front_ts {
         // No far timeline yet (nothing has played) → reference is silence.
-        None => far.resize(n, 0),
+        None => {
+            far.resize(n, 0);
+            (far, 0, n)
+        }
         Some(mut fts) => {
             // Drop far strictly older than this near frame's start: its echo
             // belongs to already-processed near frames.
@@ -351,6 +385,7 @@ fn align_far(
                     break;
                 }
                 fts += period_ns;
+                dropped += 1;
             }
             // Far lagging: front is newer than the near start, so the head of
             // this frame has no reference yet → silence-pad it.
@@ -370,9 +405,9 @@ fn align_far(
             } else {
                 Some(fts + consumed * period_ns)
             };
+            (far, dropped, pad)
         }
     }
-    far
 }
 
 /// Subscribes to the raw mic (`mic_rx`, near-end) and the mixed far-end
@@ -393,6 +428,21 @@ pub async fn aec_task(
     let mut far_buf: VecDeque<i16> = VecDeque::new();
     // Play time of far_buf.front(); None when the buffer is empty / unanchored.
     let mut far_front_ts: Option<u64> = None;
+
+    // --- Periodic diagnostics (enable with RUST_LOG=audio_io::aec=info) ---
+    // Accumulated over ~1 s so an operator can answer, from one log line:
+    //   far_rms   — is the reference actually flowing? (0 ⇒ tap broken/idle)
+    //   erle_db   — how much echo is being removed (near_rms vs resid_rms)
+    //   peak_ms   — the delay the filter locked onto; must be < window
+    //   drop/pad  — alignment health (large/persistent ⇒ skew or clock drift)
+    let log_every = (sample_rate as usize / 2).max(1); // ~0.5 s of samples
+    let mut near_sq = 0.0f64;
+    let mut far_sq = 0.0f64;
+    let mut resid_sq = 0.0f64;
+    let mut acc_samples = 0usize;
+    let mut acc_dropped = 0usize;
+    let mut acc_padded = 0usize;
+
     loop {
         tokio::select! {
             far = ref_rx.recv() => match far {
@@ -419,8 +469,50 @@ pub async fn aec_task(
             near = mic_rx.recv() => match near {
                 Ok((ts, bytes)) => {
                     let near = bytes_to_i16(&bytes);
-                    let far = align_far(&mut far_buf, &mut far_front_ts, ts, near.len(), period_ns);
+                    let (far, dropped, padded) =
+                        align_far(&mut far_buf, &mut far_front_ts, ts, near.len(), period_ns);
                     let cleaned = aec.process_frame(&near, &far);
+
+                    near_sq += sum_sq(&near);
+                    far_sq += sum_sq(&far);
+                    resid_sq += sum_sq(&cleaned);
+                    acc_samples += near.len();
+                    acc_dropped += dropped;
+                    acc_padded += padded;
+                    if acc_samples >= log_every {
+                        let denom = acc_samples as f64;
+                        let near_rms = (near_sq / denom).sqrt();
+                        let far_rms = (far_sq / denom).sqrt();
+                        let resid_rms = (resid_sq / denom).sqrt();
+                        // Only log when something is actually playing/speaking,
+                        // so an idle session doesn't spam a line every 0.5 s.
+                        if near_rms > 30.0 || far_rms > 30.0 {
+                            let erle_db = 20.0 * (near_rms / resid_rms.max(1.0)).log10();
+                            let (w_l2, peak_tap, peak_val) = aec.weight_stats();
+                            let peak_ms = peak_tap as u32 * 1000 / sample_rate.max(1);
+                            info!(
+                                near_rms = near_rms as i64,
+                                far_rms = far_rms as i64,
+                                resid_rms = resid_rms as i64,
+                                erle_db = format!("{erle_db:.1}"),
+                                peak_tap,
+                                peak_ms,
+                                peak_val = format!("{peak_val:.3}"),
+                                w_l2 = format!("{w_l2:.3}"),
+                                far_buf = far_buf.len(),
+                                dropped = acc_dropped,
+                                padded = acc_padded,
+                                "aec stats"
+                            );
+                        }
+                        near_sq = 0.0;
+                        far_sq = 0.0;
+                        resid_sq = 0.0;
+                        acc_samples = 0;
+                        acc_dropped = 0;
+                        acc_padded = 0;
+                    }
+
                     let _ = aec_tx.send((ts, Bytes::from(i16_to_bytes(&cleaned))));
                 }
                 Err(RecvError::Lagged(n)) => {
@@ -510,8 +602,9 @@ mod tests {
         let mut far_buf: VecDeque<i16> = VecDeque::from(vec![10, 20, 30, 40]);
         let mut fts = Some(0u64);
         // n=2, near_ts = P → near_first = 0.
-        let far = align_far(&mut far_buf, &mut fts, P, 2, P);
+        let (far, dropped, padded) = align_far(&mut far_buf, &mut fts, P, 2, P);
         assert_eq!(far, vec![10, 20]);
+        assert_eq!((dropped, padded), (0, 0));
         assert_eq!(fts, Some(2 * P)); // remaining [30,40] front now at t=2P
     }
 
@@ -521,8 +614,9 @@ mod tests {
         // three oldest far samples (their echo is already past) are dropped.
         let mut far_buf: VecDeque<i16> = VecDeque::from(vec![1, 2, 3, 4, 5, 6]);
         let mut fts = Some(0u64);
-        let far = align_far(&mut far_buf, &mut fts, 4 * P, 2, P); // near_first = 3P
+        let (far, dropped, padded) = align_far(&mut far_buf, &mut fts, 4 * P, 2, P); // near_first = 3P
         assert_eq!(far, vec![4, 5]);
+        assert_eq!((dropped, padded), (3, 0)); // three stale samples dropped
     }
 
     #[test]
@@ -531,8 +625,9 @@ mod tests {
         // of the frame has no reference yet and must be silence-padded.
         let mut far_buf: VecDeque<i16> = VecDeque::from(vec![7, 8]);
         let mut fts = Some(2 * P);
-        let far = align_far(&mut far_buf, &mut fts, 3 * P, 4, P); // near_first = 0
+        let (far, dropped, padded) = align_far(&mut far_buf, &mut fts, 3 * P, 4, P); // near_first = 0
         assert_eq!(far, vec![0, 0, 7, 8]);
+        assert_eq!((dropped, padded), (0, 2)); // two head samples silence-padded
     }
 
     // Deterministic pseudo-random far-end (LCG) so the test needs no rng dep.
