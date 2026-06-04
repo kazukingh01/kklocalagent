@@ -28,8 +28,17 @@ pub async fn ws_mic(
 }
 
 async fn handle_mic(mut socket: WebSocket, state: AppState, with_ts: bool) {
-    let mut rx = state.mic_tx.subscribe();
-    info!(with_ts, "mic ws: client connected");
+    // AEC (issue #20) is a single switch: when `aec.enabled`, `/mic` serves
+    // the echo-cancelled stream; otherwise the raw mic. No per-connection
+    // opt-in — every consumer (VAD, wwd) transparently gets whichever the
+    // host config selected, so enabling AEC needs no client/compose change.
+    let aec = state.config.aec.enabled;
+    let mut rx = if aec {
+        state.mic_aec_tx.subscribe()
+    } else {
+        state.mic_tx.subscribe()
+    };
+    info!(with_ts, aec, "mic ws: client connected");
     loop {
         tokio::select! {
             msg = rx.recv() => match msg {
@@ -144,11 +153,12 @@ async fn handle_spk(mut socket: WebSocket, state: AppState, track_id: usize) {
                         .await;
                     break;
                 }
-                if spk_tx
-                    .send(PlaybackMessage::Frame(Bytes::from(data)))
-                    .await
-                    .is_err()
-                {
+                let frame = Bytes::from(data);
+                // NB: the AEC far-end reference is NOT teed here. It is tapped
+                // where cpal actually consumes the audio (playback output
+                // callback), so the reference is aligned to the speaker output
+                // rather than leading it by the whole playback-ring residency.
+                if spk_tx.send(PlaybackMessage::Frame(frame)).await.is_err() {
                     warn!("spk ws: playback task gone; closing");
                     break;
                 }

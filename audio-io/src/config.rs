@@ -10,6 +10,7 @@ pub struct Config {
     pub input: DeviceConfig,
     pub output: DeviceConfig,
     pub runtime: RuntimeConfig,
+    pub aec: AecConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -50,6 +51,34 @@ pub struct RuntimeConfig {
     pub playback_tracks: u32,
 }
 
+/// Acoustic echo cancellation. Runs *inside* audio-io because near-end
+/// (mic capture) and far-end (the mixed `/spk` track PCM) live in the same
+/// process on the same clock — so the echo-cancelled mic can be served via
+/// `/mic` to every consumer (VAD, wake-word-detection) from a single
+/// computation. Disabled by default; when off, no mixer/AEC task is spawned
+/// and `/mic` serves the raw capture (byte-identical to pre-#20). When on,
+/// `/mic` transparently serves the echo-cancelled stream — no client change.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AecConfig {
+    pub enabled: bool,
+    /// Adaptive-filter backend:
+    /// * `"nlms"` — the built-in pure-Rust normalized-LMS canceller. No native
+    ///   dependency, cross-compiles cleanly to the mingw Windows target, and is
+    ///   always available (the default).
+    /// * `"speex"` — Speex DSP (MDF echo canceller + preprocessor) via the
+    ///   `aec-rs` crate. Only present when built with `--features speex`;
+    ///   selecting it in a binary built without that feature is a clear startup
+    ///   error rather than a config-load failure.
+    pub backend: String,
+    /// Adaptive filter length in milliseconds — the reverb *tail* the filter
+    /// models. It no longer has to cover the bulk speaker→mic delay: that is
+    /// measured automatically and removed by a pre-delay, so a compact filter
+    /// works for any delay. Longer captures more reverberant rooms at higher
+    /// CPU/convergence cost; ~100–150 ms suits typical rooms.
+    pub filter_length_ms: u32,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -58,6 +87,7 @@ impl Default for Config {
             input: DeviceConfig::default(),
             output: DeviceConfig::default(),
             runtime: RuntimeConfig::default(),
+            aec: AecConfig::default(),
         }
     }
 }
@@ -100,6 +130,16 @@ impl Default for RuntimeConfig {
     }
 }
 
+impl Default for AecConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend: "nlms".into(),
+            filter_length_ms: 128,
+        }
+    }
+}
+
 impl AudioConfig {
     pub fn samples_per_frame(&self) -> usize {
         (self.sample_rate as usize * self.frame_ms as usize) / 1000
@@ -136,6 +176,20 @@ impl Config {
         }
         if self.runtime.playback_tracks == 0 {
             anyhow::bail!("runtime.playback_tracks must be >= 1");
+        }
+        if self.aec.enabled {
+            // "speex" is accepted here regardless of build features; if the
+            // binary wasn't built with `--features speex`, start_services emits
+            // a clear runtime error rather than failing config load.
+            if !matches!(self.aec.backend.as_str(), "nlms" | "speex") {
+                anyhow::bail!(
+                    "aec.backend '{}' is not supported (use 'nlms' or 'speex')",
+                    self.aec.backend
+                );
+            }
+            if self.aec.filter_length_ms == 0 {
+                anyhow::bail!("aec.filter_length_ms must be > 0 when aec.enabled");
+            }
         }
         Ok(())
     }

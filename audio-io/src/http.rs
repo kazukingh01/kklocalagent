@@ -8,6 +8,7 @@ use cpal::traits::{DeviceTrait, HostTrait};
 use serde::Serialize;
 use tracing::{error, info, warn};
 
+use crate::error::AudioError;
 use crate::service;
 use crate::state::AppState;
 
@@ -73,15 +74,14 @@ pub async fn start(State(state): State<AppState>) -> impl IntoResponse {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "status": "started" }))).into_response(),
         Err(e) => {
             error!("start: {e:?}");
-            // anyhow carries the root cause in the chain. Walk it so a
-            // nested device-lookup error still maps to 404, not 500.
-            let msg = format!("{e:#}");
-            let status = if msg.contains("already in progress") {
-                StatusCode::CONFLICT
-            } else if msg.contains("not found") || msg.contains("no default") {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
+            // Map the typed error to a status by variant (no string matching).
+            let status = match &e {
+                AudioError::Busy => StatusCode::CONFLICT,
+                AudioError::DeviceNotFound(_) | AudioError::NoDefaultDevice(_) => {
+                    StatusCode::NOT_FOUND
+                }
+                AudioError::UnsupportedBackend(_) => StatusCode::BAD_REQUEST,
+                AudioError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
             };
             (status, e.to_string()).into_response()
         }

@@ -24,6 +24,23 @@ pub struct AppState {
     /// entries, each pointing at an independent cpal output stream that
     /// the Windows audio engine mixes at the OS layer.
     pub spk_tracks: Arc<Mutex<Vec<PlaybackTrack>>>,
+    /// AEC far-end ingress (issue #20). Each playback track's cpal output
+    /// callback taps its *consumed* PCM here as `(track_id, pcm)` — tapped
+    /// after the playback ring so the reference is on the same wall clock as
+    /// the sound leaving the speaker. The reference mixer task sums the tracks.
+    /// A broadcast with no subscribers (AEC disabled / not started) makes the
+    /// tap a cheap no-op; the playback callback only builds and sends frames
+    /// when AEC is enabled.
+    pub ref_in_tx: broadcast::Sender<(usize, Bytes)>,
+    /// Mixed far-end reference (16 kHz mono s16le, gap-free) published by the
+    /// reference mixer task and consumed by the AEC task. The AEC pairs it to
+    /// the mic by count (one far sample per near sample), so no timestamp is
+    /// carried.
+    pub ref_tx: broadcast::Sender<Bytes>,
+    /// Echo-cancelled mic, published by the AEC task. When `aec.enabled`,
+    /// the `/mic` WS serves this instead of `mic_tx`; otherwise it has no
+    /// producer and `/mic` serves the raw `mic_tx`.
+    pub mic_aec_tx: broadcast::Sender<(u64, Bytes)>,
     pub handles: Arc<Mutex<ServiceHandles>>,
 }
 
@@ -68,4 +85,8 @@ pub struct ServiceHandles {
     /// Vec index = track id. Populated in lockstep with
     /// `AppState.spk_tracks`; both are emptied on `stop_services`.
     pub playback: Vec<PlaybackHandle>,
+    /// Reference-mixer + AEC tokio tasks (issue #20), present only when
+    /// `aec.enabled`. tokio `JoinHandle`s detach on drop, so `drop_inner`
+    /// aborts these explicitly on stop/restart.
+    pub aec_tasks: Vec<tokio::task::JoinHandle<()>>,
 }

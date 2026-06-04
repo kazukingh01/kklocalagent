@@ -6,15 +6,16 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, StreamConfig};
+use cpal::{SampleFormat, SizedSample, StreamConfig};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 use std::time::Instant;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use crate::config::AudioConfig;
-use crate::framer::PlaybackFramer;
+use crate::error::AudioError;
+use crate::framer::{CaptureFramer, PlaybackFramer};
 use crate::state::FlushSignals;
 
 /// One unit of work for the playback producer task.
@@ -140,6 +141,7 @@ pub fn start_playback(
     audio: AudioConfig,
     buffer_ms: u32,
     flush: Arc<FlushSignals>,
+    ref_tap: Option<broadcast::Sender<(usize, Bytes)>>,
 ) -> Result<PlaybackHandle> {
     let (ready_tx, ready_rx) = std_mpsc::sync_channel::<Result<PlaybackReady>>(1);
     let (shutdown_tx, shutdown_rx) = std_mpsc::sync_channel::<()>(1);
@@ -147,6 +149,9 @@ pub fn start_playback(
     let flush_cb = flush.clone();
     let stats = Arc::new(UnderrunStats::new());
     let stats_cb = stats.clone();
+    // The producer task (below) keeps `audio`; the cpal thread gets its own
+    // clone for the consumption-side reference tap.
+    let audio_cb = audio.clone();
 
     let thread = std::thread::Builder::new()
         .name(format!("audio-playback-{track_id}"))
@@ -155,9 +160,11 @@ pub fn start_playback(
             if let Err(e) = run_playback(
                 track_id,
                 &device_name,
+                audio_cb,
                 buffer_ms,
                 flush_cb,
                 stats_cb,
+                ref_tap,
                 ready_tx,
                 shutdown_rx,
             ) {
@@ -255,22 +262,149 @@ fn find_output_device(name: &str) -> Result<cpal::Device> {
     if name == "default" {
         return host
             .default_output_device()
-            .ok_or_else(|| anyhow!("no default output device"));
+            .ok_or_else(|| AudioError::NoDefaultDevice("output").into());
     }
     for dev in host.output_devices().context("listing output devices")? {
         if dev.name().unwrap_or_default() == name {
             return Ok(dev);
         }
     }
-    Err(anyhow!("output device '{name}' not found"))
+    Err(AudioError::DeviceNotFound(name.into()).into())
 }
 
+/// Emit the playback tap's downsampled reference frames to the AEC mixer.
+/// `frames` are 16 kHz mono s16le (one AEC frame each). The AEC pairs far to
+/// near by count, so no play timestamp is carried. Send failures (AEC mixer
+/// not running) are ignored.
+fn emit_ref(tx: &broadcast::Sender<(usize, Bytes)>, track_id: usize, frames: Vec<Vec<u8>>) {
+    for frame in frames {
+        let _ = tx.send((track_id, Bytes::from(frame)));
+    }
+}
+
+/// Build the consumption-side reference resampler (native rate/channels →
+/// 16 kHz mono) — but only when AEC is enabled (`ref_tap` present). When
+/// disabled this is `None` and the output callback skips the tap entirely, so
+/// playback is byte-for-byte identical to the no-AEC path.
+fn build_ref_framer(
+    ref_tap: &Option<broadcast::Sender<(usize, Bytes)>>,
+    native_rate: u32,
+    native_channels: u16,
+    audio: &AudioConfig,
+) -> Result<Option<CaptureFramer>> {
+    if ref_tap.is_some() {
+        Ok(Some(CaptureFramer::new(
+            native_rate,
+            native_channels,
+            audio.sample_rate,
+            audio.samples_per_frame(),
+        )?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Convert a normalized-f32 playback sample to the device sample type `T` using
+/// the *exact* scaling each format used before the callback was made generic,
+/// so the bytes handed to the device stay bit-for-bit identical to the
+/// pre-refactor per-format callbacks. (cpal's `FromSample` would differ subtly —
+/// ×32768 + rounding vs the historical ×32767 + truncation, and it would clamp
+/// the f32 path that previously passed through unclamped.)
+trait PlaybackSample: SizedSample + Send + 'static {
+    fn from_playback_f32(v: f32) -> Self;
+}
+impl PlaybackSample for f32 {
+    #[inline]
+    fn from_playback_f32(v: f32) -> f32 {
+        v // historical f32 path wrote the ring sample straight through (no clamp)
+    }
+}
+impl PlaybackSample for i16 {
+    #[inline]
+    fn from_playback_f32(v: f32) -> i16 {
+        (v.clamp(-1.0, 1.0) * 32767.0) as i16
+    }
+}
+impl PlaybackSample for u16 {
+    #[inline]
+    fn from_playback_f32(v: f32) -> u16 {
+        let scaled = (v.clamp(-1.0, 1.0) * 32767.0) as i32 + 32768;
+        scaled.clamp(0, u16::MAX as i32) as u16
+    }
+}
+
+/// Build a cpal output stream for device sample type `T`. One generic body for
+/// f32/i16/u16: pop f32 from the playback ring, convert to `T` with the exact
+/// per-format scaling ([`PlaybackSample`]), and — when AEC is on — tap the
+/// pre-conversion f32 as the far-end reference. This replaces three
+/// near-identical per-format callbacks while keeping their byte output.
+#[allow(clippy::too_many_arguments)]
+fn build_output_stream<T>(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    mut consumer: HeapCons<f32>,
+    flush: Arc<FlushSignals>,
+    stats: Arc<UnderrunStats>,
+    mut ref_framer: Option<CaptureFramer>,
+    ref_tap: Option<broadcast::Sender<(usize, Bytes)>>,
+    track_id: usize,
+) -> Result<cpal::Stream>
+where
+    T: PlaybackSample,
+{
+    let err_fn = |e| error!("cpal output stream error: {e}");
+    // Reused across callbacks (grows once): the f32 samples for the AEC tap.
+    let mut tap_scratch: Vec<f32> = Vec::new();
+    let stream = device.build_output_stream(
+        config,
+        move |data: &mut [T], _| {
+            if flush.consumer.swap(false, Ordering::Relaxed) {
+                while consumer.try_pop().is_some() {}
+            }
+            let tapping = ref_framer.is_some();
+            if tapping {
+                tap_scratch.clear();
+            }
+            let mut underrun: u64 = 0;
+            for slot in data.iter_mut() {
+                let v = match consumer.try_pop() {
+                    Some(s) => s,
+                    None => {
+                        underrun += 1;
+                        0.0
+                    }
+                };
+                *slot = T::from_playback_f32(v);
+                if tapping {
+                    tap_scratch.push(v);
+                }
+            }
+            if underrun > 0 {
+                stats.samples.fetch_add(underrun, Ordering::Relaxed);
+                stats.callbacks.fetch_add(1, Ordering::Relaxed);
+            }
+            stats.consumed.fetch_add(data.len() as u64, Ordering::Relaxed);
+            stats.callbacks_total.fetch_add(1, Ordering::Relaxed);
+            // Tap the exact PCM handed to the device as the AEC far-end.
+            if let (Some(framer), Some(tx)) = (ref_framer.as_mut(), ref_tap.as_ref()) {
+                emit_ref(tx, track_id, framer.push_f32(&tap_scratch));
+            }
+        },
+        err_fn,
+        None,
+    )?;
+    Ok(stream)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_playback(
     track_id: usize,
     device_name: &str,
+    audio: AudioConfig,
     buffer_ms: u32,
     flush: Arc<FlushSignals>,
     stats: Arc<UnderrunStats>,
+    ref_tap: Option<broadcast::Sender<(usize, Bytes)>>,
     ready_tx: std_mpsc::SyncSender<Result<PlaybackReady>>,
     shutdown_rx: std_mpsc::Receiver<()>,
 ) -> Result<()> {
@@ -308,106 +442,45 @@ fn run_playback(
         }))
         .map_err(|_| anyhow!("failed to signal playback ready"))?;
 
-    let err_fn = |e| error!("cpal output stream error: {e}");
-    let flush_cb = flush.clone();
+    // Far-end reference tap (issue #20). When AEC is enabled, the output
+    // callback converts the native-rate, native-channel PCM the device consumes
+    // down to the AEC's 16 kHz mono and hands it to `emit_ref`. The AEC pairs
+    // far to near by count, so no play timestamp is attached.
 
+    // One generic callback covers every device sample format. `consumer`/`flush`
+    // are moved into whichever arm runs; the others are dead branches, so moving
+    // the same value in each arm is fine.
     let stream = match sample_format {
-        SampleFormat::F32 => {
-            let mut consumer: HeapCons<f32> = consumer;
-            let flush = flush_cb;
-            let stats = stats.clone();
-            device.build_output_stream(
-                &stream_config,
-                move |data: &mut [f32], _| {
-                    if flush.consumer.swap(false, Ordering::Relaxed) {
-                        while consumer.try_pop().is_some() {}
-                    }
-                    let mut underrun: u64 = 0;
-                    for sample in data.iter_mut() {
-                        match consumer.try_pop() {
-                            Some(s) => *sample = s,
-                            None => {
-                                *sample = 0.0;
-                                underrun += 1;
-                            }
-                        }
-                    }
-                    if underrun > 0 {
-                        stats.samples.fetch_add(underrun, Ordering::Relaxed);
-                        stats.callbacks.fetch_add(1, Ordering::Relaxed);
-                    }
-                    stats.consumed.fetch_add(data.len() as u64, Ordering::Relaxed);
-                    stats.callbacks_total.fetch_add(1, Ordering::Relaxed);
-                },
-                err_fn,
-                None,
-            )?
-        }
-        SampleFormat::I16 => {
-            let mut consumer: HeapCons<f32> = consumer;
-            let flush = flush_cb;
-            let stats = stats.clone();
-            device.build_output_stream(
-                &stream_config,
-                move |data: &mut [i16], _| {
-                    if flush.consumer.swap(false, Ordering::Relaxed) {
-                        while consumer.try_pop().is_some() {}
-                    }
-                    let mut underrun: u64 = 0;
-                    for sample in data.iter_mut() {
-                        let v = match consumer.try_pop() {
-                            Some(s) => s,
-                            None => {
-                                underrun += 1;
-                                0.0
-                            }
-                        };
-                        *sample = (v.clamp(-1.0, 1.0) * 32767.0) as i16;
-                    }
-                    if underrun > 0 {
-                        stats.samples.fetch_add(underrun, Ordering::Relaxed);
-                        stats.callbacks.fetch_add(1, Ordering::Relaxed);
-                    }
-                    stats.consumed.fetch_add(data.len() as u64, Ordering::Relaxed);
-                    stats.callbacks_total.fetch_add(1, Ordering::Relaxed);
-                },
-                err_fn,
-                None,
-            )?
-        }
-        SampleFormat::U16 => {
-            let mut consumer: HeapCons<f32> = consumer;
-            let flush = flush_cb;
-            let stats = stats.clone();
-            device.build_output_stream(
-                &stream_config,
-                move |data: &mut [u16], _| {
-                    if flush.consumer.swap(false, Ordering::Relaxed) {
-                        while consumer.try_pop().is_some() {}
-                    }
-                    let mut underrun: u64 = 0;
-                    for sample in data.iter_mut() {
-                        let v = match consumer.try_pop() {
-                            Some(s) => s,
-                            None => {
-                                underrun += 1;
-                                0.0
-                            }
-                        };
-                        let scaled = (v.clamp(-1.0, 1.0) * 32767.0) as i32 + 32768;
-                        *sample = scaled.clamp(0, u16::MAX as i32) as u16;
-                    }
-                    if underrun > 0 {
-                        stats.samples.fetch_add(underrun, Ordering::Relaxed);
-                        stats.callbacks.fetch_add(1, Ordering::Relaxed);
-                    }
-                    stats.consumed.fetch_add(data.len() as u64, Ordering::Relaxed);
-                    stats.callbacks_total.fetch_add(1, Ordering::Relaxed);
-                },
-                err_fn,
-                None,
-            )?
-        }
+        SampleFormat::F32 => build_output_stream::<f32>(
+            &device,
+            &stream_config,
+            consumer,
+            flush.clone(),
+            stats.clone(),
+            build_ref_framer(&ref_tap, native_rate, native_channels, &audio)?,
+            ref_tap.clone(),
+            track_id,
+        )?,
+        SampleFormat::I16 => build_output_stream::<i16>(
+            &device,
+            &stream_config,
+            consumer,
+            flush.clone(),
+            stats.clone(),
+            build_ref_framer(&ref_tap, native_rate, native_channels, &audio)?,
+            ref_tap.clone(),
+            track_id,
+        )?,
+        SampleFormat::U16 => build_output_stream::<u16>(
+            &device,
+            &stream_config,
+            consumer,
+            flush.clone(),
+            stats.clone(),
+            build_ref_framer(&ref_tap, native_rate, native_channels, &audio)?,
+            ref_tap.clone(),
+            track_id,
+        )?,
         other => anyhow::bail!("unsupported output sample format: {other:?}"),
     };
 

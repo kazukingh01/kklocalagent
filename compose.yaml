@@ -240,6 +240,9 @@ services:
     restart: unless-stopped
     environment:
       RUST_LOG: info,voice_activity_detection=info
+      # `/mic` transparently serves audio-io's echo-cancelled stream when the
+      # host's audio-io config has `[aec] enabled = true` (issue #20) — no URL
+      # change needed here. With AEC off (default) this is the raw mic.
       VAD_MIC_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/mic
       VAD_SINK_MODE: orchestrator
       VAD_ORCHESTRATOR_URL: http://orchestrator:7000/events
@@ -322,6 +325,8 @@ services:
       #     present; without ts=1 it falls back to header-less PCM.
       # Keep ?ts=1 explicit here so the shim path also gets the header
       # if you swap implementations per the steps above.
+      # As with VAD, `/mic` serves audio-io's echo-cancelled stream when the
+      # host config enables AEC (issue #20) — no URL change needed.
       WW_MIC_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/mic?ts=1
       WW_SINK_MODE: orchestrator
       WW_ORCHESTRATOR_URL: http://orchestrator:7000/events

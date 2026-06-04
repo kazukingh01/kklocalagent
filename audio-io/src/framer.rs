@@ -1,8 +1,11 @@
 use anyhow::Result;
+use cpal::{FromSample, Sample};
 use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
 use tracing::error;
+
+use crate::pcm::f32_to_i16;
 
 fn make_resampler(input_rate: u32, output_rate: u32, chunk_size: usize) -> Result<SincFixedIn<f32>> {
     let params = SincInterpolationParameters {
@@ -61,19 +64,23 @@ impl CaptureFramer {
         })
     }
 
+    /// Accept native device samples of any cpal sample type and emit 16 kHz
+    /// mono s16le frames. `T` is converted to normalized f32 via cpal, then
+    /// downmixed and resampled. One generic entry point replaces the former
+    /// per-format `push_i16` / `push_u16` methods.
+    pub fn push<T>(&mut self, data: &[T]) -> Vec<Vec<u8>>
+    where
+        T: Sample,
+        f32: FromSample<T>,
+    {
+        self.downmix(data, |v| f32::from_sample(*v));
+        self.emit()
+    }
+
+    /// Convenience for the already-f32 paths (the playback reference tap and the
+    /// tests). Equivalent to [`push::<f32>`](Self::push).
     pub fn push_f32(&mut self, data: &[f32]) -> Vec<Vec<u8>> {
-        self.downmix(data, |v| *v);
-        self.emit()
-    }
-
-    pub fn push_i16(&mut self, data: &[i16]) -> Vec<Vec<u8>> {
-        self.downmix(data, |v| *v as f32 / 32768.0);
-        self.emit()
-    }
-
-    pub fn push_u16(&mut self, data: &[u16]) -> Vec<Vec<u8>> {
-        self.downmix(data, |v| (*v as f32 - 32768.0) / 32768.0);
-        self.emit()
+        self.push(data)
     }
 
     fn downmix<T, F: Fn(&T) -> f32>(&mut self, data: &[T], to_f32: F) {
@@ -101,8 +108,7 @@ impl CaptureFramer {
         while self.resampled_buf.len() >= self.target_samples_per_frame {
             let mut bytes = Vec::with_capacity(self.target_samples_per_frame * 2);
             for s in self.resampled_buf.drain(..self.target_samples_per_frame) {
-                let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-                bytes.extend_from_slice(&v.to_le_bytes());
+                bytes.extend_from_slice(&f32_to_i16(s).to_le_bytes());
             }
             frames.push(bytes);
         }

@@ -4,3 +4,7 @@
 .env
 .env.local
 .env.*.local
+
+# Python bytecode caches (agent/ and its experiments/ generate these on run).
+__pycache__/
+*.py[cod]
