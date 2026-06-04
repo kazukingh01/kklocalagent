@@ -69,30 +69,12 @@ pub struct AecConfig {
     /// `"speex"` / `"webrtc"` backend can be added later without a config
     /// break.
     pub backend: String,
-    /// Adaptive filter length in milliseconds. The filter window is
-    /// `initial_delay_ms + filter_length_ms`, anchored at *zero* delay, so the
-    /// echo is found wherever it lands in that window. Longer = covers more
-    /// delay/reverb but converges slower and costs more CPU (taps = ms *
-    /// sample_rate). For realtime-paced playback (small speaker→mic delay)
-    /// 100–150 ms is plenty.
+    /// Adaptive filter length in milliseconds — the reverb *tail* the filter
+    /// models. It no longer has to cover the bulk speaker→mic delay: that is
+    /// measured automatically and removed by a pre-delay, so a compact filter
+    /// works for any delay. Longer captures more reverberant rooms at higher
+    /// CPU/convergence cost; ~100–150 ms suits typical rooms.
     pub filter_length_ms: u32,
-    /// Extra filter head-room in milliseconds for a *large* bulk transport
-    /// delay (e.g. a deep playback buffer). It simply extends the window to
-    /// `initial_delay_ms + filter_length_ms`; it is NOT a fixed pre-shift, so
-    /// setting it too high only wastes taps (slower convergence), it never
-    /// kills cancellation the way the old pre-delay did. Leave at 0 unless the
-    /// real echo delay exceeds `filter_length_ms`.
-    pub initial_delay_ms: u32,
-    /// Residual echo suppressor (post-NLP) strength. After the linear filter,
-    /// a Wiener-style gain attenuates the echo it can't reach. This is the
-    /// fraction of the filter's echo-estimate energy treated as leftover echo
-    /// to remove; residual beyond it is kept as near-end speech.
-    ///
-    /// `0.0` disables the suppressor (linear AEC only). `~0.3` is gentle and
-    /// preserves double-talk well; `0.5` (default) removes echo-only stretches
-    /// much more thoroughly; higher digs in harder at the cost of denting
-    /// near-end speech that overlaps playback.
-    pub suppression: f32,
 }
 
 impl Default for Config {
@@ -151,9 +133,7 @@ impl Default for AecConfig {
         Self {
             enabled: false,
             backend: "nlms".into(),
-            filter_length_ms: 150,
-            initial_delay_ms: 0,
-            suppression: 0.5,
+            filter_length_ms: 128,
         }
     }
 }

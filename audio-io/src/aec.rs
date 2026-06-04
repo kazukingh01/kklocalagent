@@ -61,20 +61,30 @@ const NLMS_REG_PER_TAP: f32 = 1e-4;
 /// cancellation.
 const NLMS_LEAK: f32 = 1e-5;
 
-// --- Residual echo suppressor (post-NLP) ---
+// --- Residual echo suppressor (post-NLP), with adaptive ERL ---
 // The linear NLMS alone reaches only ~10-15 dB ERLE on a real speaker→mic path
-// (speaker nonlinearity, long reverb tail, slow convergence on correlated
-// speech), which leaves the echo clearly audible. A Wiener-style gain on the
-// residual — keyed off the filter's *own* echo estimate, so it self-gates on
-// whether an echo is actually present — removes the rest during echo-only
-// stretches while backing off when near-end speech is there so it isn't
-// clipped.
+// (speaker nonlinearity, long reverb tail), which leaves the echo audible. A
+// Wiener-style gain on the residual removes the rest. Rather than a fixed,
+// hand-tuned "how much echo is left" knob (which had to be re-tuned per room /
+// speaker / volume), the suppressor *measures* the leftover-echo ratio from the
+// signal itself (see `erl` in [`Aec`]) so it adapts to the environment.
 //
-/// Default residual-echo fraction when none is configured (see
-/// [`Aec::set_suppression`] / `aec.suppression`). Fraction of the echo-estimate
-/// energy assumed to survive the linear filter as residual echo; residual
-/// beyond it is treated as near-end speech and kept.
-const NLP_DEFAULT_SUPPRESSION: f64 = 0.5;
+/// Over-subtraction applied to the measured residual-echo ratio. >1 digs a bit
+/// past the estimate so echo-only output is firmly inaudible; the value trades
+/// echo depth against how much an overlapping (double-talk) talker is dented.
+const NLP_OVERSUB: f64 = 2.0;
+/// Initial residual-echo ratio (residual energy / echo-estimate energy) before
+/// anything has been measured.
+const NLP_ERL_INIT: f32 = 0.1;
+/// ERL tracker: fast pull toward a *lower* observed ratio (echo-only stretches
+/// reveal the true leftover-echo floor) and a slow drift back up (so it can
+/// recover when the path genuinely worsens, and double-talk — which inflates the
+/// ratio — can't corrupt the estimate). A minimum-statistics style follower.
+const NLP_ERL_TRACK_DOWN: f32 = 0.2;
+const NLP_ERL_TRACK_UP: f32 = 0.002;
+/// Clamp range for the ERL estimate.
+const NLP_ERL_MIN: f32 = 0.003;
+const NLP_ERL_MAX: f32 = 1.0;
 /// Lowest gain the suppressor applies, so echo-only output is strongly
 /// attenuated but never fully muted (keeps a natural floor; ≈ -30 dB).
 const NLP_GAIN_FLOOR: f32 = 0.03;
@@ -90,6 +100,35 @@ const NLP_ATTACK: f32 = 0.6;
 /// stops (then [`NLP_RELEASE_IDLE`] restores normal mic capture promptly).
 const NLP_RELEASE_FAR_ACTIVE: f32 = 0.12;
 const NLP_RELEASE_IDLE: f32 = 0.7;
+
+// --- Bulk-delay estimator (envelope cross-correlation) ---
+// The echo arrives some bulk delay after the reference (playback/device
+// buffering + acoustic flight + capture buffering). Rather than make the
+// adaptive filter long enough to *span* that delay — which differs per machine
+// and forces a hand-set window — we estimate the delay and pre-delay the
+// reference so the echo lands at the *start* of a compact, fixed-length filter
+// that then only has to model the room reverb tail. Works for any bulk delay up
+// to `DELAY_MAX_MS` with the same small filter, so no per-environment knob.
+//
+/// Envelope decimation factor (16 kHz → 2 kHz): delay needs coarse timing, not
+/// fine phase, so correlating decimated |signal| envelopes is cheap and robust.
+const DELAY_DECIM: usize = 8;
+/// Largest bulk delay searched/handled (ms). Generous enough for deep playback
+/// buffers on any host.
+const DELAY_MAX_MS: u32 = 500;
+/// Correlation window (ms of recent audio compared at each lag).
+const DELAY_WINDOW_MS: u32 = 256;
+/// How often the delay is re-estimated (ms).
+const DELAY_ESTIMATE_MS: u32 = 250;
+/// Minimum normalized correlation to trust an estimate (rejects double-talk /
+/// no-echo frames, which don't correlate cleanly).
+const DELAY_CONFIDENCE: f32 = 0.5;
+/// Head-room left ahead of the estimated echo inside the filter, so estimation
+/// error and frame-level jitter still land within the taps.
+const DELAY_HEAD_MARGIN_MS: u32 = 32;
+/// Only re-apply the pre-delay (which resets the filter) when the estimate moves
+/// by more than this, so small fluctuations don't thrash convergence.
+const DELAY_HYSTERESIS_MS: u32 = 20;
 
 fn now_ns() -> u64 {
     SystemTime::now()
@@ -189,25 +228,136 @@ impl ReferenceMixer {
     }
 }
 
+fn push_capped(q: &mut VecDeque<f32>, v: f32, cap: usize) {
+    if q.len() >= cap {
+        q.pop_front();
+    }
+    q.push_back(v);
+}
+
+/// Envelope cross-correlation bulk-delay estimator (see the `DELAY_*` consts).
+/// Fed every (far, near) sample, it keeps decimated `|·|` envelopes and
+/// periodically reports the lag (in full-rate samples) at which `near` best
+/// matches a delayed `far` — the speaker→mic bulk delay — but only when the
+/// normalized correlation is confident, so double-talk / no-echo frames are
+/// ignored rather than producing a bogus delay.
+struct DelayEstimator {
+    far_env: VecDeque<f32>,
+    near_env: VecDeque<f32>,
+    cap: usize,
+    max_lag: usize,
+    window: usize,
+    far_acc: f32,
+    near_acc: f32,
+    acc_n: usize,
+    interval: usize,
+    since: usize,
+}
+
+impl DelayEstimator {
+    fn new(sample_rate: u32) -> Self {
+        let dec_rate = (sample_rate as usize / DELAY_DECIM).max(1);
+        let max_lag = (dec_rate * DELAY_MAX_MS as usize / 1000).max(1);
+        let window = (dec_rate * DELAY_WINDOW_MS as usize / 1000).max(1);
+        let cap = max_lag + window + 1;
+        Self {
+            far_env: VecDeque::new(),
+            near_env: VecDeque::new(),
+            cap,
+            max_lag,
+            window,
+            far_acc: 0.0,
+            near_acc: 0.0,
+            acc_n: 0,
+            interval: (sample_rate as usize * DELAY_ESTIMATE_MS as usize / 1000).max(1),
+            since: 0,
+        }
+    }
+
+    /// Feed one full-rate (far, near) pair. Returns a freshly accepted bulk
+    /// delay (full-rate samples) when one is produced this call.
+    fn push(&mut self, far: f32, near: f32) -> Option<usize> {
+        self.far_acc += far.abs();
+        self.near_acc += near.abs();
+        self.acc_n += 1;
+        if self.acc_n >= DELAY_DECIM {
+            let inv = 1.0 / self.acc_n as f32;
+            push_capped(&mut self.far_env, self.far_acc * inv, self.cap);
+            push_capped(&mut self.near_env, self.near_acc * inv, self.cap);
+            self.far_acc = 0.0;
+            self.near_acc = 0.0;
+            self.acc_n = 0;
+        }
+        self.since += 1;
+        if self.since >= self.interval {
+            self.since = 0;
+            return self.estimate_now();
+        }
+        None
+    }
+
+    fn estimate_now(&mut self) -> Option<usize> {
+        if self.near_env.len() < self.window + self.max_lag {
+            return None;
+        }
+        let near: Vec<f32> = self.near_env.iter().copied().collect();
+        let far: Vec<f32> = self.far_env.iter().copied().collect();
+        let nlen = near.len();
+        let n0 = nlen - self.window; // start of the most-recent `window` of near
+        let mut near_e = 0.0f32;
+        for &v in &near[n0..nlen] {
+            near_e += v * v;
+        }
+        if near_e <= 1e-9 {
+            return None;
+        }
+        let mut best_lag = 0usize;
+        let mut best_corr = 0.0f32;
+        for lag in 0..=self.max_lag.min(n0) {
+            let f0 = n0 - lag;
+            let mut dot = 0.0f32;
+            let mut far_e = 0.0f32;
+            for j in 0..self.window {
+                let fv = far[f0 + j];
+                dot += near[n0 + j] * fv;
+                far_e += fv * fv;
+            }
+            if far_e <= 1e-9 {
+                continue;
+            }
+            let corr = dot / (near_e * far_e).sqrt();
+            if corr > best_corr {
+                best_corr = corr;
+                best_lag = lag;
+            }
+        }
+        if best_corr >= DELAY_CONFIDENCE {
+            Some(best_lag * DELAY_DECIM)
+        } else {
+            None
+        }
+    }
+}
+
 /// Normalized-LMS adaptive echo canceller operating on 16 kHz mono s16le.
 ///
-/// `process_frame(near, far)` returns `near` with the linear echo of `far`
-/// subtracted. The adaptive filter spans `num_taps` samples starting at **zero
-/// delay**, so it models the echo wherever it actually lands within that window
-/// — taps ahead of the true echo simply adapt toward zero. This is deliberate:
-/// an earlier version pre-shifted the far-end by a fixed `initial_delay_ms`
-/// bulk delay, which silently killed all cancellation whenever the real echo
-/// delay was *smaller* than that hint (e.g. realtime-paced playback, where the
-/// speaker→mic delay is only tens of ms). Covering `[0, num_taps]` removes that
-/// fragile assumption; `initial_delay_ms` now just *extends* the window to also
-/// reach larger bulk delays. The filter adapts continuously, so steady
-/// speaker→mic echo is cancelled while uncorrelated near-end speech passes
-/// through.
+/// `process_frame(near, far)` returns `near` with the echo of `far` removed in
+/// three stages, all self-tuning so there are no per-environment knobs:
 ///
-/// The linear residual is then passed through a Wiener-style residual echo
-/// suppressor (see the `NLP_*` constants) that attenuates the leftover echo the
-/// linear stage can't reach — without it, ~12 dB of cancellation still leaves
-/// the played audio plainly audible.
+/// 1. **Bulk-delay compensation** — a [`DelayEstimator`] measures the
+///    speaker→mic delay and the reference is pre-delayed by it, so the echo
+///    lands at the front of the filter no matter how deep the host's buffers or
+///    how distant the mic. The adaptive filter therefore only needs to be long
+///    enough for the room *reverb tail* (`num_taps`), not the whole transport
+///    delay.
+/// 2. **Linear NLMS** — a `num_taps` adaptive filter subtracts the linear echo;
+///    it adapts continuously so a steady echo path is cancelled while
+///    uncorrelated near-end speech passes through.
+/// 3. **Adaptive residual suppressor** — a Wiener-style gain (see the `NLP_*`
+///    constants) removes the leftover echo the linear stage can't reach. Its
+///    strength is *measured* from the signal (the `erl` ratio learned during
+///    echo-only stretches), so it adapts to room / speaker / volume instead of
+///    needing a hand-set level.
 pub struct Aec {
     weights: VecDeque<f32>,
     /// Filter input history, newest at the front, paired index-for-index
@@ -224,20 +374,31 @@ pub struct Aec {
     /// per frame from the frame's far / echo-estimate / residual energies and
     /// applied to every residual sample of that frame.
     nlp_g: f32,
-    /// Suppressor strength: fraction of the echo-estimate energy treated as
-    /// residual echo to remove (0.0 = suppressor off). Set from config via
-    /// [`set_suppression`](Self::set_suppression).
-    nlp_frac: f64,
+    /// Adaptively measured residual-echo ratio (residual energy / echo-estimate
+    /// energy during echo-only stretches). Drives the suppressor instead of a
+    /// hand-set strength, so it tracks the room / speaker / volume on its own.
+    erl: f32,
+    sample_rate: u32,
+    /// Estimates the bulk speaker→mic delay so the reference can be pre-delayed
+    /// onto the front of the compact filter (no per-environment delay knob).
+    estimator: DelayEstimator,
+    /// Pre-delay line on the reference: holds `predelay_len` samples so the
+    /// filter only has to model the reverb tail, not the bulk transport delay.
+    predelay: VecDeque<f32>,
+    predelay_len: usize,
+    /// Head-room (samples) kept ahead of the estimated echo, and the minimum
+    /// estimate change (samples) before the pre-delay is re-applied.
+    head_margin: usize,
+    hysteresis: usize,
 }
 
 impl Aec {
-    /// The filter window covers `initial_delay_ms + filter_length_ms` from zero
-    /// delay: `filter_length_ms` is the echo tail to model, `initial_delay_ms`
-    /// is extra head-room for a larger bulk transport delay. Either alone works;
-    /// their sum is the maximum echo delay (in ms) the filter can still cancel.
-    pub fn new(sample_rate: u32, filter_length_ms: u32, initial_delay_ms: u32) -> Self {
-        let window_ms = (initial_delay_ms + filter_length_ms) as usize;
-        let num_taps = ((sample_rate as usize * window_ms) / 1000).max(1);
+    /// `filter_length_ms` is the reverb tail the adaptive filter models. It no
+    /// longer has to span the bulk transport delay — that is measured and
+    /// removed by a pre-delay (see [`DelayEstimator`]) — so a compact filter
+    /// works for any speaker→mic delay up to `DELAY_MAX_MS`.
+    pub fn new(sample_rate: u32, filter_length_ms: u32) -> Self {
+        let num_taps = ((sample_rate as usize * filter_length_ms as usize) / 1000).max(1);
         Self {
             weights: VecDeque::from(vec![0.0; num_taps]),
             far_hist: VecDeque::from(vec![0.0; num_taps]),
@@ -245,21 +406,33 @@ impl Aec {
             num_taps,
             reg: NLMS_REG_PER_TAP * num_taps as f32,
             nlp_g: 1.0,
-            nlp_frac: NLP_DEFAULT_SUPPRESSION,
+            erl: NLP_ERL_INIT,
+            sample_rate,
+            estimator: DelayEstimator::new(sample_rate),
+            predelay: VecDeque::new(),
+            predelay_len: 0,
+            head_margin: (sample_rate as usize * DELAY_HEAD_MARGIN_MS as usize / 1000),
+            hysteresis: (sample_rate as usize * DELAY_HYSTERESIS_MS as usize / 1000).max(1),
         }
     }
 
-    /// Set the residual-echo-suppressor strength (`aec.suppression`). `0.0`
-    /// disables it (linear AEC only); higher removes more echo at the cost of
-    /// denting near-end speech that overlaps playback. Negative inputs clamp to
-    /// 0. Takes effect on the next frame.
-    pub fn set_suppression(&mut self, frac: f32) {
-        self.nlp_frac = frac.max(0.0) as f64;
+    /// Apply a freshly measured bulk delay: pre-delay the reference by
+    /// `delay - head_margin` so the echo lands `head_margin` into the filter.
+    /// Only acts on a change larger than the hysteresis (resetting the filter is
+    /// disruptive); the filter then re-converges around the new alignment.
+    fn apply_delay(&mut self, delay_samples: usize) {
+        let target = delay_samples.saturating_sub(self.head_margin);
+        if target.abs_diff(self.predelay_len) <= self.hysteresis {
+            return;
+        }
+        self.predelay_len = target;
+        self.predelay = VecDeque::from(vec![0.0; target]);
+        self.reset_filter();
     }
 
     /// Zero the adaptive state. Called when the filter has gone non-finite
-    /// (numerical blowup) so it relearns from scratch rather than emitting
-    /// silence forever.
+    /// (numerical blowup) or the pre-delay changed, so it relearns from scratch
+    /// rather than emitting silence forever / fighting a stale alignment.
     fn reset_filter(&mut self) {
         for w in self.weights.iter_mut() {
             *w = 0.0;
@@ -268,6 +441,15 @@ impl Aec {
             *h = 0.0;
         }
         self.energy = 0.0;
+    }
+
+    /// Pre-delay one reference sample: push it in, return the delayed one.
+    fn predelay_sample(&mut self, x: f32) -> f32 {
+        if self.predelay_len == 0 {
+            return x;
+        }
+        self.predelay.push_back(x);
+        self.predelay.pop_front().unwrap_or(0.0)
     }
 
     fn push_far(&mut self, x: f32) {
@@ -293,8 +475,16 @@ impl Aec {
         let mut sum_xx = 0.0f64; // far energy
         let mut sum_yy = 0.0f64; // echo-estimate energy
         let mut sum_ee = 0.0f64; // residual energy
+        let mut new_delay: Option<usize> = None;
         for (i, &d) in near.iter().enumerate() {
-            let x = far.get(i).copied().unwrap_or(0) as f32 / 32768.0;
+            let x_raw = far.get(i).copied().unwrap_or(0) as f32 / 32768.0;
+            let d_f = d as f32 / 32768.0;
+            // Measure the bulk delay on the RAW (un-pre-delayed) streams.
+            if let Some(delay) = self.estimator.push(x_raw, d_f) {
+                new_delay = Some(delay);
+            }
+            // Pre-delay the reference so the echo lands near the filter's front.
+            let x = self.predelay_sample(x_raw);
             self.push_far(x);
 
             // Estimated echo = w · far_hist.
@@ -304,7 +494,6 @@ impl Aec {
                 .zip(self.far_hist.iter())
                 .map(|(w, h)| w * h)
                 .sum();
-            let d_f = d as f32 / 32768.0;
             let e = d_f - y;
 
             // Numerical safety net: if the estimate has gone non-finite, the
@@ -331,6 +520,12 @@ impl Aec {
             resid.push(e);
         }
 
+        // Re-align the pre-delay once per frame if a new bulk delay was measured
+        // (deferred out of the sample loop so this frame stays self-consistent).
+        if let Some(delay) = new_delay {
+            self.apply_delay(delay);
+        }
+
         // Second pass: residual echo suppressor. One smoothed gain for the
         // whole frame, then apply it.
         let gain = self.update_nlp_gain(sum_xx, sum_yy, sum_ee, near.len());
@@ -342,14 +537,20 @@ impl Aec {
 
     /// Update and return the residual-echo-suppressor gain for this frame.
     ///
-    /// Wiener-style: of the residual energy `sum_ee`, the part attributable to
-    /// leftover echo is estimated as `nlp_frac` of the echo-estimate energy
-    /// `sum_yy`; whatever remains is treated as near-end speech to keep. The
-    /// gain is `near / residual`, floored so output is never fully muted, and
-    /// smoothed across frames. Self-gating: when nothing is playing (`sum_xx`
-    /// below the floor) or the filter predicts no echo (`sum_yy` ≈ 0, e.g. no
-    /// acoustic coupling) or the suppressor is disabled (`nlp_frac == 0`), the
-    /// target is unity, so normal mic capture is untouched.
+    /// First the residual-echo ratio `erl` is tracked from the data: during
+    /// echo-only stretches `sum_ee / sum_yy` reveals how much echo the linear
+    /// filter leaves, so `erl` is pulled down quickly toward low observed ratios
+    /// and drifts up only slowly (double-talk inflates the ratio but, rising
+    /// slowly, can't corrupt the estimate). This replaces the old fixed,
+    /// per-environment strength knob.
+    ///
+    /// Then Wiener-style: the leftover echo is estimated as `erl * NLP_OVERSUB *
+    /// sum_yy`; whatever residual remains beyond it is treated as near-end
+    /// speech to keep. The gain is `near / residual`, floored so output is never
+    /// fully muted, and smoothed across frames. Self-gating: when nothing is
+    /// playing (`sum_xx` below the floor) or the filter predicts no echo
+    /// (`sum_yy` ≈ 0, e.g. no acoustic coupling), the target is unity, so normal
+    /// mic capture is untouched.
     ///
     /// Release is slow while the far-end is active (hangover) so a residual
     /// spike or an inter-word gap can't bounce the gain back up and leak echo
@@ -360,10 +561,23 @@ impl Aec {
         }
         let far_pow = sum_xx / n as f64;
         let far_active = far_pow >= NLP_FAR_FLOOR;
-        let target = if !far_active || self.nlp_frac == 0.0 {
+
+        // Track the residual-echo ratio (minimum-statistics style) only while an
+        // echo is actually present to measure.
+        if far_active && sum_yy > 1e-9 {
+            let ratio = (sum_ee / sum_yy) as f32;
+            let coef = if ratio < self.erl {
+                NLP_ERL_TRACK_DOWN
+            } else {
+                NLP_ERL_TRACK_UP
+            };
+            self.erl = (self.erl + coef * (ratio - self.erl)).clamp(NLP_ERL_MIN, NLP_ERL_MAX);
+        }
+
+        let target = if !far_active {
             1.0
         } else {
-            let resid_echo = sum_yy * self.nlp_frac;
+            let resid_echo = self.erl as f64 * NLP_OVERSUB * sum_yy;
             let near_pow = (sum_ee - resid_echo).max(0.0);
             ((near_pow / (sum_ee + 1e-9)) as f32).clamp(0.0, 1.0)
         };
@@ -386,6 +600,16 @@ impl Aec {
     /// Current residual-suppressor gain (1.0 = no suppression). For diagnostics.
     pub fn nlp_gain(&self) -> f32 {
         self.nlp_g
+    }
+
+    /// Current measured residual-echo ratio. For diagnostics.
+    pub fn erl(&self) -> f32 {
+        self.erl
+    }
+
+    /// Current applied bulk pre-delay in milliseconds. For diagnostics.
+    pub fn delay_ms(&self) -> u32 {
+        (self.predelay_len as u32 * 1000) / self.sample_rate.max(1)
     }
 
     /// Diagnostics: `(L2 norm of all weights, index of the largest-magnitude
@@ -482,12 +706,12 @@ pub async fn aec_task(
     mut aec: Aec,
 ) {
     info!(num_taps = aec.num_taps(), "aec task started");
-    // Cap the far backlog at the filter window: far older than `num_taps` can
-    // never be cancelled (its echo would fall past the last tap), so holding
-    // more only lets the near↔far offset drift out of reach. Dropping the
-    // oldest excess keeps near popping far that the filter can actually use. At
-    // steady state the streams are balanced and this rarely fires.
-    let max_backlog = aec.num_taps().max(1);
+    // Cap the far backlog (pipeline jitter only): near and far are count-paired
+    // 1:1, so the residency here should stay tiny. The actual speaker→mic bulk
+    // delay is handled *inside* the Aec by its measured pre-delay, not by
+    // holding samples here, so this cap is just a runaway guard — drop the
+    // oldest beyond ~250 ms. At steady state it never fires.
+    let max_backlog = (sample_rate as usize / 4).max(1);
     let mut far_pending: VecDeque<i16> = VecDeque::new();
 
     // --- Periodic diagnostics (enable with RUST_LOG=audio_io::aec=info) ---
@@ -553,14 +777,18 @@ pub async fn aec_task(
                         if near_rms > 30.0 || far_rms > 30.0 {
                             let erle_db = 20.0 * (near_rms / resid_rms.max(1.0)).log10();
                             let (w_l2, peak_tap, peak_val) = aec.weight_stats();
-                            let peak_ms = peak_tap as u32 * 1000 / sample_rate.max(1);
+                            // Total estimated echo delay = applied pre-delay +
+                            // the filter's own peak tap within the compact window.
+                            let peak_ms =
+                                aec.delay_ms() + peak_tap as u32 * 1000 / sample_rate.max(1);
                             info!(
                                 near_rms = near_rms as i64,
                                 far_rms = far_rms as i64,
                                 resid_rms = resid_rms as i64,
                                 erle_db = format!("{erle_db:.1}"),
-                                peak_tap,
+                                delay_ms = aec.delay_ms(),
                                 peak_ms,
+                                erl = format!("{:.3}", aec.erl()),
                                 peak_val = format!("{peak_val:.3}"),
                                 w_l2 = format!("{w_l2:.3}"),
                                 nlp_g = format!("{:.2}", aec.nlp_gain()),
@@ -669,13 +897,40 @@ mod tests {
     }
 
     #[test]
+    fn delay_estimator_finds_bulk_delay() {
+        // near = far delayed by a known bulk delay; the estimator should report
+        // it within one decimation step.
+        let rate = 16000;
+        let true_delay = 1600; // 100 ms
+        let mut est = DelayEstimator::new(rate);
+        let mut seed = 0xabcd_1234u64;
+        let mut line: VecDeque<f32> = VecDeque::from(vec![0.0; true_delay]);
+        let mut found: Option<usize> = None;
+        // ~2 s of audio, well past the estimator warm-up.
+        for _ in 0..rate * 2 {
+            let far = lcg(&mut seed) as f32 / 32768.0;
+            line.push_back(far);
+            let near = 0.5 * line.pop_front().unwrap_or(0.0);
+            if let Some(d) = est.push(far, near) {
+                found = Some(d);
+            }
+        }
+        let d = found.expect("estimator never produced a confident estimate");
+        let err = (d as i64 - true_delay as i64).unsigned_abs() as usize;
+        assert!(
+            err <= DELAY_DECIM,
+            "estimated delay {d} too far from {true_delay} (err {err})"
+        );
+    }
+
+    #[test]
     fn aec_cancels_pure_echo() {
         // far-end = noise; near = far delayed by D samples and attenuated
         // (a pure linear echo, no near-end voice). After the filter adapts,
         // the residual RMS should fall well below the echo RMS (high ERLE).
         let rate = 16000;
         let delay = 50; // samples of echo path delay
-        let mut aec = Aec::new(rate, 80, delay as u32 * 1000 / rate); // ~3ms delay hint
+        let mut aec = Aec::new(rate, 80);
         let mut seed = 0x1234_5678u64;
 
         let frame_len = 320;
@@ -717,7 +972,7 @@ mod tests {
         // quieter.
         let rate = 16000;
         let delay = 40;
-        let mut aec = Aec::new(rate, 80, delay as u32 * 1000 / rate);
+        let mut aec = Aec::new(rate, 80);
         let mut seed = 0x0bad_c0de_u64;
         let frame_len = 320;
         let mut echo_delay_line: VecDeque<i16> = VecDeque::from(vec![0i16; delay]);
@@ -748,15 +1003,13 @@ mod tests {
     }
 
     #[test]
-    fn aec_cancels_when_echo_delay_far_below_hint() {
-        // Regression for the "echo passes through untouched" bug: the real
-        // echo delay (here ~1 ms) is much SMALLER than initial_delay_ms (120
-        // ms). The old code pre-shifted the far-end by the full hint, putting
-        // the echo *before* the filter window → zero cancellation. With the
-        // window anchored at delay 0 the filter must still find and cancel it.
+    fn aec_cancels_short_delay_echo() {
+        // A very short echo delay (~1 ms) must be cancelled with no delay hint:
+        // the bulk-delay estimator reports ~0 (below the head margin), so the
+        // compact filter models it directly from tap 0.
         let rate = 16000;
-        let delay = 16; // ~1 ms echo, far below the 40 ms hint below
-        let mut aec = Aec::new(rate, 60, 40); // window = 100 ms, hint ≫ echo
+        let delay = 16; // ~1 ms echo
+        let mut aec = Aec::new(rate, 60);
         let mut seed = 0xfeed_face_u64;
         let frame_len = 320;
         let mut echo_delay_line: VecDeque<i16> = VecDeque::from(vec![0i16; delay]);
@@ -778,22 +1031,20 @@ mod tests {
         let erle = 20.0 * (last_echo_rms / last_resid_rms.max(1.0)).log10();
         assert!(
             erle > 12.0,
-            "echo not cancelled when delay ≪ hint: {erle:.1} dB (echo={last_echo_rms:.0}, resid={last_resid_rms:.0})"
+            "short-delay echo not cancelled: {erle:.1} dB (echo={last_echo_rms:.0}, resid={last_resid_rms:.0})"
         );
     }
 
     #[test]
     fn aec_preserves_uncorrelated_near_voice() {
-        // far-end = noise echoed into near, PLUS a near-end tone uncorrelated
-        // with the far-end. The tone (the human voice we must keep) should
-        // survive cancellation. Uses the *gentle* suppressor setting: the
-        // aggressive default deliberately dents double-talk to clear echo-only
-        // stretches (that trade-off is `aec.suppression`); this checks the
-        // gentle end preserves an overlapping talker.
+        // A near-end talker overlapping playback (double-talk) must survive.
+        // First a stretch of echo-only audio lets the adaptive ERL learn the
+        // true leftover-echo floor; then a near-end tone is mixed in (a barge-in
+        // burst) and must still come through — the suppressor must not mistake
+        // it for residual echo and gate it away.
         let rate = 16000;
         let delay = 40;
-        let mut aec = Aec::new(rate, 80, delay as u32 * 1000 / rate);
-        aec.set_suppression(0.1);
+        let mut aec = Aec::new(rate, 80);
         let mut seed = 0xdead_beefu64;
         let frame_len = 320;
         let mut echo_delay_line: VecDeque<i16> = VecDeque::from(vec![0i16; delay]);
@@ -801,7 +1052,19 @@ mod tests {
         let mut last_voice_only_rms = 0.0;
         let mut last_resid_rms = 0.0;
 
+        // Phase 1: echo only (no near voice) — the ERL tracker learns the floor.
         for _ in 0..200 {
+            let far: Vec<i16> = (0..frame_len).map(|_| lcg(&mut seed)).collect();
+            let mut near = Vec::with_capacity(frame_len);
+            for &f in &far {
+                echo_delay_line.push_back(f);
+                let delayed = echo_delay_line.pop_front().unwrap_or(0);
+                near.push((delayed as f32 * 0.5) as i16);
+            }
+            aec.process_frame(&near, &far);
+        }
+        // Phase 2: short double-talk burst — near voice mixed into the echo.
+        for _ in 0..20 {
             let far: Vec<i16> = (0..frame_len).map(|_| lcg(&mut seed)).collect();
             let mut near = Vec::with_capacity(frame_len);
             let mut voice_only = Vec::with_capacity(frame_len);
@@ -835,7 +1098,7 @@ mod tests {
         // Here there's almost no real echo (far is near-silent), so a correct
         // filter must just pass the loud near through — not annihilate it.
         let rate = 16000;
-        let mut aec = Aec::new(rate, 60, 3);
+        let mut aec = Aec::new(rate, 60);
         let frame_len = 320;
         let mut t: f32 = 0.0;
         let mut resid_acc: Vec<i16> = Vec::new();

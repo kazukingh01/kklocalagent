@@ -76,12 +76,10 @@ pub async fn start_services(state: &AppState) -> Result<()> {
             n_tracks,
             state.config.audio.frame_ms,
         ));
-        let mut aec = Aec::new(
+        let aec = Aec::new(
             state.config.audio.sample_rate,
             state.config.aec.filter_length_ms,
-            state.config.aec.initial_delay_ms,
         );
-        aec.set_suppression(state.config.aec.suppression);
         let canceller = tokio::spawn(aec_task(
             state.mic_tx.subscribe(),
             state.ref_tx.subscribe(),
@@ -93,8 +91,7 @@ pub async fn start_services(state: &AppState) -> Result<()> {
         info!(
             backend = %state.config.aec.backend,
             filter_length_ms = state.config.aec.filter_length_ms,
-            initial_delay_ms = state.config.aec.initial_delay_ms,
-            "aec enabled"
+            "aec enabled (bulk delay auto-estimated, residual suppressor adaptive)"
         );
     }
 

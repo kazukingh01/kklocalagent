@@ -51,20 +51,12 @@ enabled = false
 # Adaptive-filter backend. Only "nlms" (pure-Rust normalized LMS — no native
 # dependency, cross-compiles to the mingw Windows target as-is) is implemented.
 backend = "nlms"
-# Adaptive filter length (ms). The filter window is initial_delay_ms +
-# filter_length_ms, anchored at zero delay, so the echo is found wherever it
-# lands in that window. Longer = covers more delay/reverb but converges slower
-# and costs more CPU (taps = ms * sample_rate). 100-150 ms suits realtime-paced
-# playback (small speaker->mic delay).
-filter_length_ms = 150
-# Extra head-room (ms) for a LARGE bulk delay (e.g. a deep playback buffer).
-# It just extends the window; it is NOT a fixed pre-shift, so too-high only
-# wastes taps (slower convergence) — it never kills cancellation. Leave at 0
-# unless the real echo delay exceeds filter_length_ms.
-initial_delay_ms = 0
-# Residual echo suppressor strength. The linear filter alone only reaches
-# ~10-15 dB; this Wiener-style post-gain removes the rest. 0.0 = off (linear
-# only), ~0.3 = gentle (best double-talk preservation), 0.5 = default (clears
-# echo-only stretches well), higher = more aggressive (may dent your own voice
-# when it overlaps playback).
-suppression = 0.5
+# Adaptive filter length (ms) = the reverb TAIL the filter models. It no longer
+# has to cover the speaker->mic bulk delay: that delay is measured automatically
+# and removed with a pre-delay, so a compact filter works for any delay (deep
+# playback buffers, distant mic, different machines) with no per-environment
+# tuning. Longer captures more reverberant rooms at higher CPU; 100-150 ms is
+# plenty for typical rooms. The residual echo suppressor that mops up what the
+# linear filter leaves is fully automatic (it measures the leftover-echo level
+# from the signal), so there is nothing else to tune here.
+filter_length_ms = 128

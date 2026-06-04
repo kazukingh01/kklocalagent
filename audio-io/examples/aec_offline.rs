@@ -17,7 +17,7 @@
 //!   cargo run --example aec_offline -- --far tts.wav [--far2 file.wav] \
 //!       [--near-voice voice.wav] [--near recorded.wav] \
 //!       [--delay-ms 120] [--gain 0.5] \
-//!       [--filter-ms 150] [--aec-delay-ms 120] [--out-dir /tmp/aec]
+//!       [--filter-ms 128] [--out-dir /tmp/aec]
 //!
 //! Inputs must be 16 kHz, 16-bit PCM WAV. Mono is used as-is; stereo is
 //! downmixed. Convert anything else first, e.g.
@@ -156,8 +156,7 @@ fn main() -> Result<(), String> {
                --near-voice FILE   near-end voice to mix into the synthetic echo\n  \
                --delay-ms N        synthetic echo delay (default 120)\n  \
                --gain F            synthetic echo attenuation (default 0.5)\n  \
-               --filter-ms N       AEC adaptive filter length (default 150)\n  \
-               --aec-delay-ms N    AEC bulk delay hint (default = --delay-ms)\n  \
+               --filter-ms N       AEC reverb-tail filter length (default 128)\n  \
                --out-dir DIR       output dir (default ./aec_out)\n\n\
              example:\n  \
                cargo run --example aec_offline -- --far tts.wav --near-voice me.wav"
@@ -167,8 +166,7 @@ fn main() -> Result<(), String> {
 
     let delay_ms: u32 = arg_or(&args, "--delay-ms", 120);
     let gain: f32 = arg_or(&args, "--gain", 0.5);
-    let filter_ms: u32 = arg_or(&args, "--filter-ms", 150);
-    let aec_delay_ms: u32 = arg_or(&args, "--aec-delay-ms", delay_ms);
+    let filter_ms: u32 = arg_or(&args, "--filter-ms", 128);
     let out_dir = arg(&args, "--out-dir").unwrap_or_else(|| "aec_out".into());
 
     // Far-end = mix of track0 (+ optional track1), the audio audio-io plays.
@@ -210,7 +208,8 @@ fn main() -> Result<(), String> {
     };
 
     // Run the production AEC, frame by frame (20 ms), as the live path does.
-    let mut aec = Aec::new(RATE, filter_ms, aec_delay_ms);
+    // The bulk delay is auto-estimated inside the AEC; no hint is passed.
+    let mut aec = Aec::new(RATE, filter_ms);
     let mut residual = Vec::with_capacity(near.len());
     let mut i = 0;
     while i < near.len() {
@@ -250,8 +249,9 @@ fn main() -> Result<(), String> {
         f64::INFINITY
     };
     println!(
-        "AEC offline result ({} taps, aec_delay={aec_delay_ms}ms)",
-        aec.num_taps()
+        "AEC offline result ({} taps, est. delay={}ms)",
+        aec.num_taps(),
+        aec.delay_ms()
     );
     println!("  echo-only near RMS  : {near_e:8.1}");
     println!("  echo-only resid RMS : {resid_e:8.1}");
