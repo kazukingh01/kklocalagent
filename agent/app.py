@@ -259,6 +259,53 @@ def build_react_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
     )
 
 
+async def warm_system_prefix() -> None:
+    """Prime ollama's KV cache with the system-prompt prefix the graphs send.
+
+    Best-effort, run as a background task at startup. The model is already
+    resident (llm/init.sh warms it on load + first decode), but the very first
+    *real* turn still has to prefill the long system prompt — `AGENT_SYSTEM_PROMPT`
+    (+ the tool guidance when tools are on, + the bound tool schemas). Sending
+    one inference here with the *exact* same effective system text and tool set
+    leaves that prefix cached, so the first real turn only evaluates the user
+    message. We rebuild the system text the same way the graphs do — legacy =
+    `SYSTEM_PROMPT`; react = `SYSTEM_PROMPT + TOOL_SYSTEM_SUFFIX` with `all_tools()`
+    bound — so the cached prefix matches token-for-token.
+
+    Never fatal: on any error the first turn just pays the prefill as before.
+    The wake-word flow means no real turn arrives before this finishes.
+    """
+    if TOOLS_ENABLED:
+        system_text = (SYSTEM_PROMPT + TOOL_SYSTEM_SUFFIX) if SYSTEM_PROMPT else TOOL_SYSTEM_SUFFIX.strip()
+    else:
+        system_text = SYSTEM_PROMPT
+    messages = []
+    if system_text:
+        messages.append(SystemMessage(content=system_text))
+    messages.append(HumanMessage(content="ウォームアップ"))
+    # Dedicated capped client: a couple of tokens fill the prefix KV and warm
+    # the decode path without generating a real reply. Bind the same tools so
+    # the request — and thus the cached prefix — matches the react path exactly.
+    warm_llm = ChatOllama(
+        base_url=OLLAMA_BASE_URL, model=MODEL_NAME, temperature=0, num_predict=2,
+    )
+    target = warm_llm.bind_tools(all_tools()) if TOOLS_ENABLED else warm_llm
+    # ollama may still be loading right after this container starts; retry briefly.
+    for attempt in range(1, 11):
+        try:
+            await target.ainvoke(messages)
+            log.info(
+                "agent: system-prefix warmup done (attempt=%d tools=%s sys_chars=%d)",
+                attempt, TOOLS_ENABLED, len(system_text),
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 — warmup is strictly best-effort
+            if attempt == 10:
+                log.warning("agent: system-prefix warmup gave up: %s", exc)
+                return
+            await asyncio.sleep(2)
+
+
 def extract_user_text(body: dict) -> str:
     """Pluck the last `role:user` content from an ollama-compatible
     /api/chat body.
@@ -527,9 +574,15 @@ async def amain() -> None:
     await site.start()
     log.info("agent listening on :%d", PORT)
 
+    # Prime ollama's KV cache with the system-prompt prefix in the background
+    # so the first real turn doesn't re-prefill it. Best-effort; serving has
+    # already started, and the wake-word flow means no real turn lands first.
+    warmup_task = asyncio.create_task(warm_system_prefix())
+
     try:
         await asyncio.Event().wait()
     finally:
+        warmup_task.cancel()
         await runner.cleanup()
         await conn.close()
 
