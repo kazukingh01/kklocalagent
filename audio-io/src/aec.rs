@@ -70,23 +70,26 @@ const NLMS_LEAK: f32 = 1e-5;
 // stretches while backing off when near-end speech is there so it isn't
 // clipped.
 //
-/// Fraction of the echo-estimate energy assumed to survive the linear filter as
-/// residual echo. Residual energy beyond this is treated as near-end speech and
-/// preserved. Higher = more aggressive echo removal (and more risk of denting
-/// near speech during double-talk).
-const NLP_RESIDUAL_ECHO_FRAC: f64 = 0.3;
+/// Default residual-echo fraction when none is configured (see
+/// [`Aec::set_suppression`] / `aec.suppression`). Fraction of the echo-estimate
+/// energy assumed to survive the linear filter as residual echo; residual
+/// beyond it is treated as near-end speech and kept.
+const NLP_DEFAULT_SUPPRESSION: f64 = 0.5;
 /// Lowest gain the suppressor applies, so echo-only output is strongly
-/// attenuated but never fully muted (keeps a natural floor; ≈ -24 dB).
-const NLP_GAIN_FLOOR: f32 = 0.06;
+/// attenuated but never fully muted (keeps a natural floor; ≈ -30 dB).
+const NLP_GAIN_FLOOR: f32 = 0.03;
 /// Far-end power (mean x² with x in [-1,1]) below which nothing is playing, so
 /// there is no echo to suppress and the gain is released to unity.
 const NLP_FAR_FLOOR: f64 = 1e-6;
 /// Per-frame smoothing for the suppression gain. Attack (toward more
-/// suppression) is brisk so echo is caught within a couple of 20 ms frames;
-/// release (back to unity) is a touch faster so a near-end talker's onset is
-/// not clipped.
-const NLP_ATTACK: f32 = 0.5;
-const NLP_RELEASE: f32 = 0.7;
+/// suppression) is brisk so echo is caught within a couple of 20 ms frames.
+const NLP_ATTACK: f32 = 0.6;
+/// Release back toward unity is SLOW while the far-end is still active, so a
+/// brief residual-echo spike or a gap between far-end words can't pop the gain
+/// back up and leak echo mid-playback; it only fully releases once playback
+/// stops (then [`NLP_RELEASE_IDLE`] restores normal mic capture promptly).
+const NLP_RELEASE_FAR_ACTIVE: f32 = 0.12;
+const NLP_RELEASE_IDLE: f32 = 0.7;
 
 fn now_ns() -> u64 {
     SystemTime::now()
@@ -221,6 +224,10 @@ pub struct Aec {
     /// per frame from the frame's far / echo-estimate / residual energies and
     /// applied to every residual sample of that frame.
     nlp_g: f32,
+    /// Suppressor strength: fraction of the echo-estimate energy treated as
+    /// residual echo to remove (0.0 = suppressor off). Set from config via
+    /// [`set_suppression`](Self::set_suppression).
+    nlp_frac: f64,
 }
 
 impl Aec {
@@ -238,7 +245,16 @@ impl Aec {
             num_taps,
             reg: NLMS_REG_PER_TAP * num_taps as f32,
             nlp_g: 1.0,
+            nlp_frac: NLP_DEFAULT_SUPPRESSION,
         }
+    }
+
+    /// Set the residual-echo-suppressor strength (`aec.suppression`). `0.0`
+    /// disables it (linear AEC only); higher removes more echo at the cost of
+    /// denting near-end speech that overlaps playback. Negative inputs clamp to
+    /// 0. Takes effect on the next frame.
+    pub fn set_suppression(&mut self, frac: f32) {
+        self.nlp_frac = frac.max(0.0) as f64;
     }
 
     /// Zero the adaptive state. Called when the filter has gone non-finite
@@ -327,30 +343,37 @@ impl Aec {
     /// Update and return the residual-echo-suppressor gain for this frame.
     ///
     /// Wiener-style: of the residual energy `sum_ee`, the part attributable to
-    /// leftover echo is estimated as a fixed fraction of the echo-estimate
-    /// energy `sum_yy`; whatever remains is treated as near-end speech to keep.
-    /// The gain is `near / residual`, floored so output is never fully muted,
-    /// and smoothed across frames. Self-gating: when nothing is playing
-    /// (`sum_xx` below the floor) or the filter predicts no echo (`sum_yy` ≈ 0,
-    /// e.g. no acoustic coupling), the target is unity, so normal mic capture is
-    /// untouched.
+    /// leftover echo is estimated as `nlp_frac` of the echo-estimate energy
+    /// `sum_yy`; whatever remains is treated as near-end speech to keep. The
+    /// gain is `near / residual`, floored so output is never fully muted, and
+    /// smoothed across frames. Self-gating: when nothing is playing (`sum_xx`
+    /// below the floor) or the filter predicts no echo (`sum_yy` ≈ 0, e.g. no
+    /// acoustic coupling) or the suppressor is disabled (`nlp_frac == 0`), the
+    /// target is unity, so normal mic capture is untouched.
+    ///
+    /// Release is slow while the far-end is active (hangover) so a residual
+    /// spike or an inter-word gap can't bounce the gain back up and leak echo
+    /// mid-playback; once playback stops it releases promptly.
     fn update_nlp_gain(&mut self, sum_xx: f64, sum_yy: f64, sum_ee: f64, n: usize) -> f32 {
         if n == 0 {
             return self.nlp_g;
         }
         let far_pow = sum_xx / n as f64;
-        let target = if far_pow < NLP_FAR_FLOOR {
+        let far_active = far_pow >= NLP_FAR_FLOOR;
+        let target = if !far_active || self.nlp_frac == 0.0 {
             1.0
         } else {
-            let resid_echo = sum_yy * NLP_RESIDUAL_ECHO_FRAC;
+            let resid_echo = sum_yy * self.nlp_frac;
             let near_pow = (sum_ee - resid_echo).max(0.0);
             ((near_pow / (sum_ee + 1e-9)) as f32).clamp(0.0, 1.0)
         };
         let target = target.max(NLP_GAIN_FLOOR);
         let coef = if target < self.nlp_g {
             NLP_ATTACK
+        } else if far_active {
+            NLP_RELEASE_FAR_ACTIVE
         } else {
-            NLP_RELEASE
+            NLP_RELEASE_IDLE
         };
         self.nlp_g += coef * (target - self.nlp_g);
         self.nlp_g
@@ -763,10 +786,14 @@ mod tests {
     fn aec_preserves_uncorrelated_near_voice() {
         // far-end = noise echoed into near, PLUS a near-end tone uncorrelated
         // with the far-end. The tone (the human voice we must keep) should
-        // survive cancellation.
+        // survive cancellation. Uses the *gentle* suppressor setting: the
+        // aggressive default deliberately dents double-talk to clear echo-only
+        // stretches (that trade-off is `aec.suppression`); this checks the
+        // gentle end preserves an overlapping talker.
         let rate = 16000;
         let delay = 40;
         let mut aec = Aec::new(rate, 80, delay as u32 * 1000 / rate);
+        aec.set_suppression(0.1);
         let mut seed = 0xdead_beefu64;
         let frame_len = 320;
         let mut echo_delay_line: VecDeque<i16> = VecDeque::from(vec![0i16; delay]);

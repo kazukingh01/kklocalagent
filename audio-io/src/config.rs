@@ -83,6 +83,16 @@ pub struct AecConfig {
     /// kills cancellation the way the old pre-delay did. Leave at 0 unless the
     /// real echo delay exceeds `filter_length_ms`.
     pub initial_delay_ms: u32,
+    /// Residual echo suppressor (post-NLP) strength. After the linear filter,
+    /// a Wiener-style gain attenuates the echo it can't reach. This is the
+    /// fraction of the filter's echo-estimate energy treated as leftover echo
+    /// to remove; residual beyond it is kept as near-end speech.
+    ///
+    /// `0.0` disables the suppressor (linear AEC only). `~0.3` is gentle and
+    /// preserves double-talk well; `0.5` (default) removes echo-only stretches
+    /// much more thoroughly; higher digs in harder at the cost of denting
+    /// near-end speech that overlaps playback.
+    pub suppression: f32,
 }
 
 impl Default for Config {
@@ -143,6 +153,7 @@ impl Default for AecConfig {
             backend: "nlms".into(),
             filter_length_ms: 150,
             initial_delay_ms: 0,
+            suppression: 0.5,
         }
     }
 }

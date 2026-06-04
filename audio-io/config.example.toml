@@ -62,3 +62,9 @@ filter_length_ms = 150
 # wastes taps (slower convergence) — it never kills cancellation. Leave at 0
 # unless the real echo delay exceeds filter_length_ms.
 initial_delay_ms = 0
+# Residual echo suppressor strength. The linear filter alone only reaches
+# ~10-15 dB; this Wiener-style post-gain removes the rest. 0.0 = off (linear
+# only), ~0.3 = gentle (best double-talk preservation), 0.5 = default (clears
+# echo-only stretches well), higher = more aggressive (may dent your own voice
+# when it overlaps playback).
+suppression = 0.5
