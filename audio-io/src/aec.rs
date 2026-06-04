@@ -19,19 +19,19 @@
 //! exceeded the filter window and killed all cancellation.)
 //!
 //! Three pieces:
-//! * Each playback track's output callback emits its consumed PCM as a 16 kHz
-//!   mono frame tagged with the wall-clock consumption time.
+//! * Each playback track's output callback emits its consumed PCM as 16 kHz
+//!   mono frames.
 //! * [`ReferenceMixer`] sums those per-track frames into one continuous 16 kHz
 //!   mono stream (silence when nothing plays — the adaptive filter needs a
-//!   gap-free far-end timeline) and carries the play timestamp through.
+//!   gap-free far-end timeline).
 //! * [`Aec`] is a pure-Rust normalized-LMS (NLMS) adaptive filter. Pure Rust
 //!   (no native dep) so it cross-compiles to the mingw Windows target with
-//!   zero extra build setup; the `backend` config field leaves room for a
-//!   `speex`/`webrtc` swap later. [`aec_task`] time-aligns far to near using
-//!   the carried timestamps (capture and consumption share the system clock),
-//!   so the echo always lands inside the filter's `[0, filter_length_ms]`
-//!   window regardless of when each stream started — no fixed delay hint
-//!   needed.
+//!   zero extra build setup; the `backend` config field selects it or the
+//!   Speex backend. [`aec_task`] pairs far to near by *count* (one far sample
+//!   per near sample): both are real-time 16 kHz streams that start together,
+//!   so the constant far-path latency plus the acoustic delay just becomes a
+//!   tap inside the filter window, which the adaptive filter (and its measured
+//!   pre-delay) finds — no fixed delay hint or timestamp alignment needed.
 
 mod mixer;
 mod nlms;
@@ -43,7 +43,7 @@ use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, info, warn};
 
-use crate::pcm::{bytes_to_i16, epoch_ns, i16_to_bytes};
+use crate::pcm::{bytes_to_i16, i16_to_bytes};
 
 pub use mixer::ReferenceMixer;
 pub use nlms::Aec;
@@ -87,8 +87,8 @@ fn sum_sq(samples: &[i16]) -> f64 {
 /// one mixed frame every `frame_ms` on `ref_tx`. Runs until both inputs close
 /// (services stopped / handle aborted).
 pub async fn reference_mixer_task(
-    mut ref_in_rx: broadcast::Receiver<(usize, u64, Bytes)>,
-    ref_tx: broadcast::Sender<(u64, Bytes)>,
+    mut ref_in_rx: broadcast::Receiver<(usize, Bytes)>,
+    ref_tx: broadcast::Sender<Bytes>,
     sample_rate: u32,
     samples_per_frame: usize,
     n_tracks: usize,
@@ -96,6 +96,11 @@ pub async fn reference_mixer_task(
 ) {
     let mut mixer = ReferenceMixer::new(sample_rate, samples_per_frame, n_tracks);
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(frame_ms as u64));
+    // Report per-track backlog drops about once per second (in ticks), so a
+    // playback clock outrunning the mix timer is visible rather than silent.
+    let warn_every = (1000 / frame_ms.max(1)).max(1) as u64;
+    let mut ticks: u64 = 0;
+    let mut last_dropped: u64 = 0;
     info!(
         samples_per_frame,
         n_tracks, frame_ms, "reference mixer started"
@@ -103,20 +108,25 @@ pub async fn reference_mixer_task(
     loop {
         tokio::select! {
             inbound = ref_in_rx.recv() => match inbound {
-                Ok((track_id, ts, bytes)) => mixer.push(track_id, ts, &bytes),
+                Ok((track_id, bytes)) => mixer.push(track_id, &bytes),
                 Err(RecvError::Lagged(n)) => {
                     warn!("reference mixer: lagged {n} far-end frames");
                 }
                 Err(RecvError::Closed) => break,
             },
             _ = interval.tick() => {
-                let (ts, frame) = mixer.tick();
-                // Before the first playback frame the timeline has no anchor;
-                // fall back to wall-clock so silence frames still carry a sane
-                // (monotonic-ish) timestamp.
-                let ts = ts.unwrap_or_else(epoch_ns);
+                let frame = mixer.tick();
                 // No subscribers (AEC task gone) → send errors, ignored.
-                let _ = ref_tx.send((ts, Bytes::from(frame)));
+                let _ = ref_tx.send(Bytes::from(frame));
+                ticks += 1;
+                if ticks.is_multiple_of(warn_every) && mixer.dropped() > last_dropped {
+                    warn!(
+                        dropped = mixer.dropped() - last_dropped,
+                        "reference mixer: per-track backlog over cap, dropped oldest \
+                         far samples (playback clock outrunning the mix timer?)"
+                    );
+                    last_dropped = mixer.dropped();
+                }
             }
         }
     }
@@ -144,7 +154,7 @@ pub async fn reference_mixer_task(
 /// silence.
 pub async fn aec_task(
     mut mic_rx: broadcast::Receiver<(u64, Bytes)>,
-    mut ref_rx: broadcast::Receiver<(u64, Bytes)>,
+    mut ref_rx: broadcast::Receiver<Bytes>,
     aec_tx: broadcast::Sender<(u64, Bytes)>,
     sample_rate: u32,
     mut canceller: Box<dyn EchoCanceller>,
@@ -158,7 +168,7 @@ pub async fn aec_task(
     let max_backlog = (sample_rate as usize / 4).max(1);
     let mut far_pending: VecDeque<i16> = VecDeque::new();
 
-    // --- Periodic diagnostics (enable with RUST_LOG=audio_io::aec=info) ---
+    // --- Periodic diagnostics (enable with RUST_LOG=audio_io::aec=debug) ---
     // From one ~0.5 s line:
     //   far_rms  — is the reference flowing? (0 ⇒ tap broken / nothing played)
     //   erle_db  — echo removed (near_rms vs resid_rms)
@@ -176,7 +186,7 @@ pub async fn aec_task(
     loop {
         tokio::select! {
             far = ref_rx.recv() => match far {
-                Ok((_ts, bytes)) => {
+                Ok(bytes) => {
                     far_pending.extend(bytes_to_i16(&bytes));
                     if far_pending.len() > max_backlog {
                         let excess = far_pending.len() - max_backlog;

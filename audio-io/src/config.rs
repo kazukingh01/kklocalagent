@@ -53,8 +53,7 @@ pub struct RuntimeConfig {
 
 /// Acoustic echo cancellation. Runs *inside* audio-io because near-end
 /// (mic capture) and far-end (the mixed `/spk` track PCM) live in the same
-/// process on the same clock — so the echo-cancelled mic can be served to
-/// every consumer (VAD, wake-word-detection) from a single computation via
+/// process on the same clock — so the echo-cancelled mic can be served via
 /// `/mic` to every consumer (VAD, wake-word-detection) from a single
 /// computation. Disabled by default; when off, no mixer/AEC task is spawned
 /// and `/mic` serves the raw capture (byte-identical to pre-#20). When on,
@@ -63,11 +62,14 @@ pub struct RuntimeConfig {
 #[serde(default)]
 pub struct AecConfig {
     pub enabled: bool,
-    /// Adaptive-filter backend. Only `"nlms"` (a pure-Rust normalized LMS
-    /// filter — no native dependency, cross-compiles cleanly to the mingw
-    /// Windows target) is implemented today; the field exists so a
-    /// `"speex"` / `"webrtc"` backend can be added later without a config
-    /// break.
+    /// Adaptive-filter backend:
+    /// * `"nlms"` — the built-in pure-Rust normalized-LMS canceller. No native
+    ///   dependency, cross-compiles cleanly to the mingw Windows target, and is
+    ///   always available (the default).
+    /// * `"speex"` — Speex DSP (MDF echo canceller + preprocessor) via the
+    ///   `aec-rs` crate. Only present when built with `--features speex`;
+    ///   selecting it in a binary built without that feature is a clear startup
+    ///   error rather than a config-load failure.
     pub backend: String,
     /// Adaptive filter length in milliseconds — the reverb *tail* the filter
     /// models. It no longer has to cover the bulk speaker→mic delay: that is
