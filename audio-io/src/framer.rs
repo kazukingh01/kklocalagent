@@ -1,4 +1,5 @@
 use anyhow::Result;
+use cpal::{FromSample, Sample};
 use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
@@ -61,19 +62,23 @@ impl CaptureFramer {
         })
     }
 
+    /// Accept native device samples of any cpal sample type and emit 16 kHz
+    /// mono s16le frames. `T` is converted to normalized f32 via cpal, then
+    /// downmixed and resampled. One generic entry point replaces the former
+    /// per-format `push_i16` / `push_u16` methods.
+    pub fn push<T>(&mut self, data: &[T]) -> Vec<Vec<u8>>
+    where
+        T: Sample,
+        f32: FromSample<T>,
+    {
+        self.downmix(data, |v| f32::from_sample(*v));
+        self.emit()
+    }
+
+    /// Convenience for the already-f32 paths (the playback reference tap and the
+    /// tests). Equivalent to [`push::<f32>`](Self::push).
     pub fn push_f32(&mut self, data: &[f32]) -> Vec<Vec<u8>> {
-        self.downmix(data, |v| *v);
-        self.emit()
-    }
-
-    pub fn push_i16(&mut self, data: &[i16]) -> Vec<Vec<u8>> {
-        self.downmix(data, |v| *v as f32 / 32768.0);
-        self.emit()
-    }
-
-    pub fn push_u16(&mut self, data: &[u16]) -> Vec<Vec<u8>> {
-        self.downmix(data, |v| (*v as f32 - 32768.0) / 32768.0);
-        self.emit()
+        self.push(data)
     }
 
     fn downmix<T, F: Fn(&T) -> f32>(&mut self, data: &[T], to_f32: F) {

@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, StreamConfig};
+use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 use tokio::sync::broadcast;
 use tracing::{error, info};
 
@@ -110,38 +110,17 @@ fn run_capture(
     let frame_ns: u64 =
         (audio.samples_per_frame() as u64 * 1_000_000_000) / audio.sample_rate as u64;
 
-    let err_fn = |e| error!("cpal input stream error: {e}");
-
+    // One generic callback covers every device sample format (cpal converts
+    // T → f32 inside the framer). `framer` is moved into whichever arm runs.
     let stream = match sample_format {
         SampleFormat::F32 => {
-            let mut framer = framer;
-            let tx = mic_tx.clone();
-            device.build_input_stream(
-                &stream_config,
-                move |data: &[f32], _| dispatch(framer.push_f32(data), &tx, frame_ns),
-                err_fn,
-                None,
-            )?
+            build_input_stream::<f32>(&device, &stream_config, framer, mic_tx.clone(), frame_ns)?
         }
         SampleFormat::I16 => {
-            let mut framer = framer;
-            let tx = mic_tx.clone();
-            device.build_input_stream(
-                &stream_config,
-                move |data: &[i16], _| dispatch(framer.push_i16(data), &tx, frame_ns),
-                err_fn,
-                None,
-            )?
+            build_input_stream::<i16>(&device, &stream_config, framer, mic_tx.clone(), frame_ns)?
         }
         SampleFormat::U16 => {
-            let mut framer = framer;
-            let tx = mic_tx.clone();
-            device.build_input_stream(
-                &stream_config,
-                move |data: &[u16], _| dispatch(framer.push_u16(data), &tx, frame_ns),
-                err_fn,
-                None,
-            )?
+            build_input_stream::<u16>(&device, &stream_config, framer, mic_tx.clone(), frame_ns)?
         }
         other => anyhow::bail!("unsupported input sample format: {other:?}"),
     };
@@ -152,6 +131,30 @@ fn run_capture(
     drop(stream);
     info!("capture stopped");
     Ok(())
+}
+
+/// Build a cpal input stream for device sample type `T`. One generic body for
+/// f32/i16/u16: the framer converts `T` → 16 kHz mono internally, replacing
+/// three near-identical per-format callbacks.
+fn build_input_stream<T>(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    mut framer: CaptureFramer,
+    tx: broadcast::Sender<(u64, Bytes)>,
+    frame_ns: u64,
+) -> Result<cpal::Stream>
+where
+    T: SizedSample + Send + 'static,
+    f32: FromSample<T>,
+{
+    let err_fn = |e| error!("cpal input stream error: {e}");
+    let stream = device.build_input_stream(
+        config,
+        move |data: &[T], _| dispatch(framer.push(data), &tx, frame_ns),
+        err_fn,
+        None,
+    )?;
+    Ok(stream)
 }
 
 fn dispatch(frames: Vec<Vec<u8>>, tx: &broadcast::Sender<(u64, Bytes)>, frame_ns: u64) {
