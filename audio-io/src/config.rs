@@ -176,9 +176,12 @@ impl Config {
             anyhow::bail!("runtime.playback_tracks must be >= 1");
         }
         if self.aec.enabled {
-            if self.aec.backend != "nlms" {
+            // "speex" is accepted here regardless of build features; if the
+            // binary wasn't built with `--features speex`, start_services emits
+            // a clear runtime error rather than failing config load.
+            if !matches!(self.aec.backend.as_str(), "nlms" | "speex") {
                 anyhow::bail!(
-                    "aec.backend '{}' is not supported (only 'nlms')",
+                    "aec.backend '{}' is not supported (use 'nlms' or 'speex')",
                     self.aec.backend
                 );
             }

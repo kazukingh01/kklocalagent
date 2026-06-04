@@ -5,6 +5,9 @@ pub mod framer;
 pub mod http;
 pub mod playback;
 pub mod service;
+/// Speex DSP echo-cancellation backend, compiled only with `--features speex`.
+#[cfg(feature = "speex")]
+pub mod speex;
 pub mod state;
 pub mod ws;
 

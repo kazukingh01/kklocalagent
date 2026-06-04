@@ -695,6 +695,54 @@ impl Aec {
     }
 }
 
+/// Per-frame diagnostics surfaced in the `aec stats` log line. Backend-specific
+/// fields are best-effort: a backend that doesn't expose them leaves them at 0.
+#[derive(Default, Clone, Copy)]
+pub struct CancellerStats {
+    /// Applied bulk pre-delay (ms).
+    pub delay_ms: u32,
+    /// Total estimated echo delay (ms).
+    pub peak_ms: u32,
+    /// Measured residual-echo ratio.
+    pub erl: f32,
+    /// Residual-suppressor gain (1.0 = none).
+    pub nlp_gain: f32,
+    /// L2 norm of the adaptive weights (convergence indicator).
+    pub w_l2: f32,
+}
+
+/// A pluggable acoustic echo canceller, selected by `aec.backend`. Both the
+/// pure-Rust [`Aec`] and (behind the `speex` feature) the Speex DSP backend
+/// implement it, so the rest of the pipeline ([`aec_task`]) is backend-agnostic.
+/// `Send` so the canceller can live in the spawned AEC task.
+pub trait EchoCanceller: Send {
+    /// Cancel the echo of `far` from `near` (one frame each, equal length) and
+    /// return the cleaned near frame.
+    fn process_frame(&mut self, near: &[i16], far: &[i16]) -> Vec<i16>;
+    /// Optional per-frame diagnostics (default: none).
+    fn stats(&self) -> CancellerStats {
+        CancellerStats::default()
+    }
+}
+
+impl EchoCanceller for Aec {
+    fn process_frame(&mut self, near: &[i16], far: &[i16]) -> Vec<i16> {
+        Aec::process_frame(self, near, far)
+    }
+
+    fn stats(&self) -> CancellerStats {
+        let (w_l2, peak_tap, _) = self.weight_stats();
+        let delay_ms = self.delay_ms();
+        CancellerStats {
+            delay_ms,
+            peak_ms: delay_ms + peak_tap as u32 * 1000 / self.sample_rate.max(1),
+            erl: self.erl(),
+            nlp_gain: self.nlp_gain(),
+            w_l2,
+        }
+    }
+}
+
 /// Sum of squares as f64 (energy), for RMS-based AEC diagnostics.
 fn sum_sq(samples: &[i16]) -> f64 {
     samples.iter().map(|&s| (s as f64) * (s as f64)).sum()
@@ -764,9 +812,9 @@ pub async fn aec_task(
     mut ref_rx: broadcast::Receiver<(u64, Bytes)>,
     aec_tx: broadcast::Sender<(u64, Bytes)>,
     sample_rate: u32,
-    mut aec: Aec,
+    mut canceller: Box<dyn EchoCanceller>,
 ) {
-    info!(num_taps = aec.num_taps(), "aec task started");
+    info!("aec task started");
     // Cap the far backlog (pipeline jitter only): near and far are count-paired
     // 1:1, so the residency here should stay tiny. The actual speaker→mic bulk
     // delay is handled *inside* the Aec by its measured pre-delay, not by
@@ -821,7 +869,7 @@ pub async fn aec_task(
                             }
                         }
                     }
-                    let cleaned = aec.process_frame(&near, &far);
+                    let cleaned = canceller.process_frame(&near, &far);
 
                     near_sq += sum_sq(&near);
                     far_sq += sum_sq(&far);
@@ -836,23 +884,20 @@ pub async fn aec_task(
                         // Only log when something is actually playing/speaking,
                         // so an idle session doesn't spam a line every 0.5 s.
                         if near_rms > 30.0 || far_rms > 30.0 {
+                            // erle_db is the backend-agnostic comparison metric
+                            // (works for nlms and speex alike).
                             let erle_db = 20.0 * (near_rms / resid_rms.max(1.0)).log10();
-                            let (w_l2, peak_tap, peak_val) = aec.weight_stats();
-                            // Total estimated echo delay = applied pre-delay +
-                            // the filter's own peak tap within the compact window.
-                            let peak_ms =
-                                aec.delay_ms() + peak_tap as u32 * 1000 / sample_rate.max(1);
+                            let s = canceller.stats(); // backend-specific extras
                             info!(
                                 near_rms = near_rms as i64,
                                 far_rms = far_rms as i64,
                                 resid_rms = resid_rms as i64,
                                 erle_db = format!("{erle_db:.1}"),
-                                delay_ms = aec.delay_ms(),
-                                peak_ms,
-                                erl = format!("{:.3}", aec.erl()),
-                                peak_val = format!("{peak_val:.3}"),
-                                w_l2 = format!("{w_l2:.3}"),
-                                nlp_g = format!("{:.2}", aec.nlp_gain()),
+                                delay_ms = s.delay_ms,
+                                peak_ms = s.peak_ms,
+                                erl = format!("{:.3}", s.erl),
+                                w_l2 = format!("{:.3}", s.w_l2),
+                                nlp_g = format!("{:.2}", s.nlp_gain),
                                 far_buf = far_pending.len(),
                                 dropped = acc_dropped,
                                 padded = acc_padded,

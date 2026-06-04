@@ -29,6 +29,16 @@ anyhow = "1"
 thiserror = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
+# Optional Speex DSP echo-cancellation backend (aec.backend = "speex"), enabled
+# by the `speex` feature. Pulls in aec-rs, which builds the bundled speexdsp
+# from source (needs cmake + a C compiler + libclang on the build host). The
+# default build does NOT include it, so it stays dependency-free and easy to
+# cross-compile unless you opt in.
+aec-rs = { version = "1", optional = true }
+
+[features]
+# Build with `--features speex` to enable the Speex DSP backend.
+speex = ["dep:aec-rs"]
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

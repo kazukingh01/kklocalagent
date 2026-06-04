@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use tracing::info;
 
-use crate::aec::{aec_task, reference_mixer_task, Aec};
+use crate::aec::{aec_task, reference_mixer_task, Aec, EchoCanceller};
 use crate::capture::start_capture;
 use crate::playback::start_playback;
 use crate::state::{AppState, FlushSignals, PlaybackTrack, ServiceHandles};
@@ -76,22 +76,34 @@ pub async fn start_services(state: &AppState) -> Result<()> {
             n_tracks,
             state.config.audio.frame_ms,
         ));
-        let aec = Aec::new(
-            state.config.audio.sample_rate,
-            state.config.aec.filter_length_ms,
-        );
-        let canceller = tokio::spawn(aec_task(
+        // Select the echo-cancellation backend (`aec.backend`). "nlms" is the
+        // built-in pure-Rust canceller; "speex" wraps Speex DSP and only exists
+        // when compiled with `--features speex`.
+        let sr = state.config.audio.sample_rate;
+        let flen = state.config.aec.filter_length_ms;
+        let canceller: Box<dyn EchoCanceller> = match state.config.aec.backend.as_str() {
+            "nlms" => Box::new(Aec::new(sr, flen)),
+            #[cfg(feature = "speex")]
+            "speex" => Box::new(crate::speex::SpeexAec::new(sr, spf, flen)),
+            other => {
+                return Err(anyhow!(
+                    "aec.backend '{other}' is not available — rebuild with \
+                     `--features speex` to enable the Speex DSP backend"
+                ));
+            }
+        };
+        let aec_handle = tokio::spawn(aec_task(
             state.mic_tx.subscribe(),
             state.ref_tx.subscribe(),
             state.mic_aec_tx.clone(),
-            state.config.audio.sample_rate,
-            aec,
+            sr,
+            canceller,
         ));
-        handles.aec_tasks = vec![mixer, canceller];
+        handles.aec_tasks = vec![mixer, aec_handle];
         info!(
             backend = %state.config.aec.backend,
-            filter_length_ms = state.config.aec.filter_length_ms,
-            "aec enabled (bulk delay auto-estimated, residual suppressor adaptive)"
+            filter_length_ms = flen,
+            "aec enabled"
         );
     }
 

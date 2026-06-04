@@ -48,8 +48,13 @@ playback_tracks = 2
 # client change). Disabled by default — when off this whole section is a
 # no-op and `/mic` is byte-identical to before.
 enabled = false
-# Adaptive-filter backend. Only "nlms" (pure-Rust normalized LMS — no native
-# dependency, cross-compiles to the mingw Windows target as-is) is implemented.
+# Echo-cancellation backend:
+#   "nlms"  - built-in pure-Rust canceller (NLMS + auto delay + adaptive
+#             residual suppressor). No native dependency; always available.
+#   "speex" - Speex DSP (MDF echo canceller + preprocessor). Often better on
+#             real double-talk. Requires building with `--features speex`
+#             (compiles bundled speexdsp via cmake/clang). With "speex" set but
+#             the binary built without that feature, startup errors clearly.
 backend = "nlms"
 # Adaptive filter length (ms) = the reverb TAIL the filter models. It no longer
 # has to cover the speaker->mic bulk delay: that delay is measured automatically
