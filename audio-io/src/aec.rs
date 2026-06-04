@@ -61,6 +61,33 @@ const NLMS_REG_PER_TAP: f32 = 1e-4;
 /// cancellation.
 const NLMS_LEAK: f32 = 1e-5;
 
+// --- Residual echo suppressor (post-NLP) ---
+// The linear NLMS alone reaches only ~10-15 dB ERLE on a real speaker→mic path
+// (speaker nonlinearity, long reverb tail, slow convergence on correlated
+// speech), which leaves the echo clearly audible. A Wiener-style gain on the
+// residual — keyed off the filter's *own* echo estimate, so it self-gates on
+// whether an echo is actually present — removes the rest during echo-only
+// stretches while backing off when near-end speech is there so it isn't
+// clipped.
+//
+/// Fraction of the echo-estimate energy assumed to survive the linear filter as
+/// residual echo. Residual energy beyond this is treated as near-end speech and
+/// preserved. Higher = more aggressive echo removal (and more risk of denting
+/// near speech during double-talk).
+const NLP_RESIDUAL_ECHO_FRAC: f64 = 0.3;
+/// Lowest gain the suppressor applies, so echo-only output is strongly
+/// attenuated but never fully muted (keeps a natural floor; ≈ -24 dB).
+const NLP_GAIN_FLOOR: f32 = 0.06;
+/// Far-end power (mean x² with x in [-1,1]) below which nothing is playing, so
+/// there is no echo to suppress and the gain is released to unity.
+const NLP_FAR_FLOOR: f64 = 1e-6;
+/// Per-frame smoothing for the suppression gain. Attack (toward more
+/// suppression) is brisk so echo is caught within a couple of 20 ms frames;
+/// release (back to unity) is a touch faster so a near-end talker's onset is
+/// not clipped.
+const NLP_ATTACK: f32 = 0.5;
+const NLP_RELEASE: f32 = 0.7;
+
 fn now_ns() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -173,6 +200,11 @@ impl ReferenceMixer {
 /// reach larger bulk delays. The filter adapts continuously, so steady
 /// speaker→mic echo is cancelled while uncorrelated near-end speech passes
 /// through.
+///
+/// The linear residual is then passed through a Wiener-style residual echo
+/// suppressor (see the `NLP_*` constants) that attenuates the leftover echo the
+/// linear stage can't reach — without it, ~12 dB of cancellation still leaves
+/// the played audio plainly audible.
 pub struct Aec {
     weights: VecDeque<f32>,
     /// Filter input history, newest at the front, paired index-for-index
@@ -185,6 +217,10 @@ pub struct Aec {
     /// Regularization constant in the NLMS denominator (`= NLMS_REG_PER_TAP *
     /// num_taps`), precomputed so the per-sample hot loop stays a single add.
     reg: f32,
+    /// Smoothed residual-echo-suppressor gain (1.0 = pass-through). Updated once
+    /// per frame from the frame's far / echo-estimate / residual energies and
+    /// applied to every residual sample of that frame.
+    nlp_g: f32,
 }
 
 impl Aec {
@@ -201,6 +237,7 @@ impl Aec {
             energy: 0.0,
             num_taps,
             reg: NLMS_REG_PER_TAP * num_taps as f32,
+            nlp_g: 1.0,
         }
     }
 
@@ -234,7 +271,12 @@ impl Aec {
 
     /// near/far must be the same length (one 20 ms frame each).
     pub fn process_frame(&mut self, near: &[i16], far: &[i16]) -> Vec<i16> {
-        let mut out = Vec::with_capacity(near.len());
+        // First pass: linear NLMS. Collect the float residual per sample plus
+        // the frame energies the residual suppressor needs.
+        let mut resid = Vec::with_capacity(near.len());
+        let mut sum_xx = 0.0f64; // far energy
+        let mut sum_yy = 0.0f64; // echo-estimate energy
+        let mut sum_ee = 0.0f64; // residual energy
         for (i, &d) in near.iter().enumerate() {
             let x = far.get(i).copied().unwrap_or(0) as f32 / 32768.0;
             self.push_far(x);
@@ -251,10 +293,10 @@ impl Aec {
 
             // Numerical safety net: if the estimate has gone non-finite, the
             // filter has diverged — reset it and pass the raw near sample
-            // through this frame rather than casting NaN to a silent 0.
+            // through this sample rather than casting NaN to a silent 0.
             if !e.is_finite() {
                 self.reset_filter();
-                out.push(d);
+                resid.push(d_f);
                 continue;
             }
 
@@ -267,13 +309,60 @@ impl Aec {
                 *w = (1.0 - NLMS_LEAK) * *w + g * h;
             }
 
-            out.push((e.clamp(-1.0, 1.0) * 32767.0) as i16);
+            sum_xx += (x * x) as f64;
+            sum_yy += (y * y) as f64;
+            sum_ee += (e * e) as f64;
+            resid.push(e);
         }
-        out
+
+        // Second pass: residual echo suppressor. One smoothed gain for the
+        // whole frame, then apply it.
+        let gain = self.update_nlp_gain(sum_xx, sum_yy, sum_ee, near.len());
+        resid
+            .into_iter()
+            .map(|e| ((e * gain).clamp(-1.0, 1.0) * 32767.0) as i16)
+            .collect()
+    }
+
+    /// Update and return the residual-echo-suppressor gain for this frame.
+    ///
+    /// Wiener-style: of the residual energy `sum_ee`, the part attributable to
+    /// leftover echo is estimated as a fixed fraction of the echo-estimate
+    /// energy `sum_yy`; whatever remains is treated as near-end speech to keep.
+    /// The gain is `near / residual`, floored so output is never fully muted,
+    /// and smoothed across frames. Self-gating: when nothing is playing
+    /// (`sum_xx` below the floor) or the filter predicts no echo (`sum_yy` ≈ 0,
+    /// e.g. no acoustic coupling), the target is unity, so normal mic capture is
+    /// untouched.
+    fn update_nlp_gain(&mut self, sum_xx: f64, sum_yy: f64, sum_ee: f64, n: usize) -> f32 {
+        if n == 0 {
+            return self.nlp_g;
+        }
+        let far_pow = sum_xx / n as f64;
+        let target = if far_pow < NLP_FAR_FLOOR {
+            1.0
+        } else {
+            let resid_echo = sum_yy * NLP_RESIDUAL_ECHO_FRAC;
+            let near_pow = (sum_ee - resid_echo).max(0.0);
+            ((near_pow / (sum_ee + 1e-9)) as f32).clamp(0.0, 1.0)
+        };
+        let target = target.max(NLP_GAIN_FLOOR);
+        let coef = if target < self.nlp_g {
+            NLP_ATTACK
+        } else {
+            NLP_RELEASE
+        };
+        self.nlp_g += coef * (target - self.nlp_g);
+        self.nlp_g
     }
 
     pub fn num_taps(&self) -> usize {
         self.num_taps
+    }
+
+    /// Current residual-suppressor gain (1.0 = no suppression). For diagnostics.
+    pub fn nlp_gain(&self) -> f32 {
+        self.nlp_g
     }
 
     /// Diagnostics: `(L2 norm of all weights, index of the largest-magnitude
@@ -451,6 +540,7 @@ pub async fn aec_task(
                                 peak_ms,
                                 peak_val = format!("{peak_val:.3}"),
                                 w_l2 = format!("{w_l2:.3}"),
+                                nlp_g = format!("{:.2}", aec.nlp_gain()),
                                 far_buf = far_pending.len(),
                                 dropped = acc_dropped,
                                 padded = acc_padded,
@@ -592,6 +682,45 @@ mod tests {
         assert!(
             erle > 12.0,
             "expected >12 dB echo reduction, got {erle:.1} dB (echo={last_echo_rms:.0}, resid={last_resid_rms:.0})"
+        );
+    }
+
+    #[test]
+    fn aec_suppressor_deepens_echo_only_cancellation() {
+        // Echo-only (no near speech): the linear filter removes the bulk, then
+        // the residual suppressor should drive its gain toward the floor and
+        // push total ERLE well past what the linear stage reaches alone — this
+        // is the piece that makes played audio actually inaudible, not just
+        // quieter.
+        let rate = 16000;
+        let delay = 40;
+        let mut aec = Aec::new(rate, 80, delay as u32 * 1000 / rate);
+        let mut seed = 0x0bad_c0de_u64;
+        let frame_len = 320;
+        let mut echo_delay_line: VecDeque<i16> = VecDeque::from(vec![0i16; delay]);
+        let mut last_echo_rms = 0.0;
+        let mut last_resid_rms = 0.0;
+        for _ in 0..300 {
+            let far: Vec<i16> = (0..frame_len).map(|_| lcg(&mut seed)).collect();
+            let mut near = Vec::with_capacity(frame_len);
+            for &f in &far {
+                echo_delay_line.push_back(f);
+                let delayed = echo_delay_line.pop_front().unwrap_or(0);
+                near.push((delayed as f32 * 0.5) as i16);
+            }
+            let resid = aec.process_frame(&near, &far);
+            last_echo_rms = rms(&near);
+            last_resid_rms = rms(&resid);
+        }
+        let erle = 20.0 * (last_echo_rms / last_resid_rms.max(1.0)).log10();
+        assert!(
+            erle > 24.0,
+            "suppressor should push echo-only ERLE well past linear-only, got {erle:.1} dB"
+        );
+        assert!(
+            aec.nlp_gain() < 0.2,
+            "suppressor gain should be low on echo-only, got {:.2}",
+            aec.nlp_gain()
         );
     }
 
