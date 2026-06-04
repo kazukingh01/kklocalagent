@@ -343,79 +343,25 @@ pub async fn reference_mixer_task(
     info!("reference mixer exiting");
 }
 
-/// Time-aligns the far-end reference to a near (mic) frame and returns one far
-/// sample per near sample, on the near frame's timeline.
-///
-/// Both timestamps are wall-clock (capture stamps near at the input callback,
-/// the playback tap stamps far at the output callback), so we feed the far
-/// sample that was *played* at the same instant each near sample was
-/// *captured*. The real echo — far played `d` ms earlier (DAC→air→mic) — then
-/// lands at tap `d` inside the filter window, wherever `d` happens to be, so
-/// the constant offset between when each stream started no longer matters.
-///
-/// `far_front_ts` is the play time of `far_buf.front()`. Far older than the
-/// near frame start is dropped (its echo is already past); if far lags (front
-/// newer than the near start) the unmatched head is padded with silence.
-/// Returns `(far, dropped, padded)`: the aligned far samples, how many stale
-/// far samples were dropped to catch up to the near frame, and how many head
-/// samples were silence-padded because far was lagging. The two counts are
-/// diagnostics — at steady state both should be ~0 (far tracks near exactly).
-fn align_far(
-    far_buf: &mut VecDeque<i16>,
-    far_front_ts: &mut Option<u64>,
-    near_ts: u64,
-    n: usize,
-    period_ns: u64,
-) -> (Vec<i16>, usize, usize) {
-    let mut far = Vec::with_capacity(n);
-    let near_first_ts = near_ts.saturating_sub((n as u64).saturating_sub(1) * period_ns);
-    let mut dropped = 0usize;
-    match *far_front_ts {
-        // No far timeline yet (nothing has played) → reference is silence.
-        None => {
-            far.resize(n, 0);
-            (far, 0, n)
-        }
-        Some(mut fts) => {
-            // Drop far strictly older than this near frame's start: its echo
-            // belongs to already-processed near frames.
-            while fts + period_ns <= near_first_ts {
-                if far_buf.pop_front().is_none() {
-                    fts = near_first_ts;
-                    break;
-                }
-                fts += period_ns;
-                dropped += 1;
-            }
-            // Far lagging: front is newer than the near start, so the head of
-            // this frame has no reference yet → silence-pad it.
-            let lead = if fts > near_first_ts {
-                ((fts - near_first_ts) / period_ns) as usize
-            } else {
-                0
-            };
-            let pad = lead.min(n);
-            far.resize(pad, 0);
-            for _ in pad..n {
-                far.push(far_buf.pop_front().unwrap_or(0));
-            }
-            let consumed = (n - pad) as u64;
-            *far_front_ts = if far_buf.is_empty() {
-                None
-            } else {
-                Some(fts + consumed * period_ns)
-            };
-            (far, dropped, pad)
-        }
-    }
-}
-
 /// Subscribes to the raw mic (`mic_rx`, near-end) and the mixed far-end
-/// (`ref_rx`), time-aligns the two streams by their carried wall-clock
-/// timestamps (see [`align_far`]), runs each near frame through [`Aec`], and
-/// publishes the echo-cancelled mic on `aec_tx` (served as `/mic` when
-/// enabled). Near frames drive the clock; far samples are buffered and aligned
-/// to each near frame, padding with silence if the far-end momentarily lags.
+/// (`ref_rx`), pairs them sample-for-sample in arrival order, runs each near
+/// frame through [`Aec`], and publishes the echo-cancelled mic on `aec_tx`
+/// (served as `/mic` when enabled).
+///
+/// Pairing is by *count*, not timestamp. Now that the reference is tapped at
+/// playback consumption (not the `/spk` ingress), near and far are both
+/// real-time 16 kHz streams that start together, so feeding one far sample per
+/// near sample lines them up to within the far path's small, *constant* extra
+/// latency. That constant offset (plus the acoustic delay) just becomes a tap
+/// inside the filter window — the adaptive filter finds it. An earlier version
+/// aligned by the carried wall-clock timestamps and dropped far whose timestamp
+/// was older than the current near frame; but the far path (consumption tap →
+/// mixer's timer → broadcast) is a few frames more latent than the mic path, so
+/// its correctly-old frames kept arriving *after* the matching near had already
+/// been emitted and were discarded wholesale (far_rms→0, zero cancellation).
+/// Counting tolerates that latency. `far_pending` is capped so a burst can't
+/// push the echo past the window; underflow (far momentarily behind) feeds
+/// silence.
 pub async fn aec_task(
     mut mic_rx: broadcast::Receiver<(u64, Bytes)>,
     mut ref_rx: broadcast::Receiver<(u64, Bytes)>,
@@ -424,17 +370,21 @@ pub async fn aec_task(
     mut aec: Aec,
 ) {
     info!(num_taps = aec.num_taps(), "aec task started");
-    let period_ns = 1_000_000_000 / sample_rate.max(1) as u64;
-    let mut far_buf: VecDeque<i16> = VecDeque::new();
-    // Play time of far_buf.front(); None when the buffer is empty / unanchored.
-    let mut far_front_ts: Option<u64> = None;
+    // Cap the far backlog at the filter window: far older than `num_taps` can
+    // never be cancelled (its echo would fall past the last tap), so holding
+    // more only lets the near↔far offset drift out of reach. Dropping the
+    // oldest excess keeps near popping far that the filter can actually use. At
+    // steady state the streams are balanced and this rarely fires.
+    let max_backlog = aec.num_taps().max(1);
+    let mut far_pending: VecDeque<i16> = VecDeque::new();
 
     // --- Periodic diagnostics (enable with RUST_LOG=audio_io::aec=info) ---
-    // Accumulated over ~1 s so an operator can answer, from one log line:
-    //   far_rms   — is the reference actually flowing? (0 ⇒ tap broken/idle)
-    //   erle_db   — how much echo is being removed (near_rms vs resid_rms)
-    //   peak_ms   — the delay the filter locked onto; must be < window
-    //   drop/pad  — alignment health (large/persistent ⇒ skew or clock drift)
+    // From one ~0.5 s line:
+    //   far_rms  — is the reference flowing? (0 ⇒ tap broken / nothing played)
+    //   erle_db  — echo removed (near_rms vs resid_rms)
+    //   peak_ms  — the delay the filter locked onto; must be < window
+    //   dropped  — far dropped by the backlog cap (should stay ~0)
+    //   padded   — near samples that found far_pending empty (far behind)
     let log_every = (sample_rate as usize / 2).max(1); // ~0.5 s of samples
     let mut near_sq = 0.0f64;
     let mut far_sq = 0.0f64;
@@ -446,38 +396,40 @@ pub async fn aec_task(
     loop {
         tokio::select! {
             far = ref_rx.recv() => match far {
-                Ok((ts, bytes)) => {
-                    // Re-anchor the front timestamp to the playback clock every
-                    // frame: this frame's first sample plays at `ts` and sits
-                    // `far_buf.len()` samples behind the current front, so the
-                    // front plays at `ts - len*period`. Re-anchoring (vs only
-                    // when empty) tracks any drift between the playback and
-                    // capture hardware clocks instead of accumulating it.
-                    let behind = far_buf.len() as u64;
-                    far_front_ts = Some(ts.saturating_sub(behind * period_ns));
-                    far_buf.extend(bytes_to_i16(&bytes));
+                Ok((_ts, bytes)) => {
+                    far_pending.extend(bytes_to_i16(&bytes));
+                    if far_pending.len() > max_backlog {
+                        let excess = far_pending.len() - max_backlog;
+                        far_pending.drain(..excess);
+                        acc_dropped += excess;
+                    }
                 }
                 Err(RecvError::Lagged(n)) => {
-                    // A gap breaks timeline continuity; reset so the next frame
-                    // re-anchors rather than splicing across the hole.
                     warn!("aec: lagged {n} far-end frames");
-                    far_buf.clear();
-                    far_front_ts = None;
+                    far_pending.clear();
                 }
                 Err(RecvError::Closed) => break,
             },
             near = mic_rx.recv() => match near {
                 Ok((ts, bytes)) => {
                     let near = bytes_to_i16(&bytes);
-                    let (far, dropped, padded) =
-                        align_far(&mut far_buf, &mut far_front_ts, ts, near.len(), period_ns);
+                    let mut far = Vec::with_capacity(near.len());
+                    let mut padded = 0usize;
+                    for _ in 0..near.len() {
+                        match far_pending.pop_front() {
+                            Some(s) => far.push(s),
+                            None => {
+                                far.push(0);
+                                padded += 1;
+                            }
+                        }
+                    }
                     let cleaned = aec.process_frame(&near, &far);
 
                     near_sq += sum_sq(&near);
                     far_sq += sum_sq(&far);
                     resid_sq += sum_sq(&cleaned);
                     acc_samples += near.len();
-                    acc_dropped += dropped;
                     acc_padded += padded;
                     if acc_samples >= log_every {
                         let denom = acc_samples as f64;
@@ -499,7 +451,7 @@ pub async fn aec_task(
                                 peak_ms,
                                 peak_val = format!("{peak_val:.3}"),
                                 w_l2 = format!("{w_l2:.3}"),
-                                far_buf = far_buf.len(),
+                                far_buf = far_pending.len(),
                                 dropped = acc_dropped,
                                 padded = acc_padded,
                                 "aec stats"
@@ -593,41 +545,6 @@ mod tests {
         assert_eq!(m.tick().0, Some(last - 3 * P));
         // The now-idle tick advances the timeline by one frame (4 samples).
         assert_eq!(m.tick().0, Some(last - 3 * P + 4 * P));
-    }
-
-    #[test]
-    fn align_far_aligns_by_timestamp() {
-        // Far front plays at t=0; near frame's first sample is at t=0 too →
-        // the front far samples are taken 1:1 with no skew.
-        let mut far_buf: VecDeque<i16> = VecDeque::from(vec![10, 20, 30, 40]);
-        let mut fts = Some(0u64);
-        // n=2, near_ts = P → near_first = 0.
-        let (far, dropped, padded) = align_far(&mut far_buf, &mut fts, P, 2, P);
-        assert_eq!(far, vec![10, 20]);
-        assert_eq!((dropped, padded), (0, 0));
-        assert_eq!(fts, Some(2 * P)); // remaining [30,40] front now at t=2P
-    }
-
-    #[test]
-    fn align_far_drops_stale_far() {
-        // Far front at t=0 but the near frame doesn't start until t=3P, so the
-        // three oldest far samples (their echo is already past) are dropped.
-        let mut far_buf: VecDeque<i16> = VecDeque::from(vec![1, 2, 3, 4, 5, 6]);
-        let mut fts = Some(0u64);
-        let (far, dropped, padded) = align_far(&mut far_buf, &mut fts, 4 * P, 2, P); // near_first = 3P
-        assert_eq!(far, vec![4, 5]);
-        assert_eq!((dropped, padded), (3, 0)); // three stale samples dropped
-    }
-
-    #[test]
-    fn align_far_pads_when_far_lags() {
-        // Far front is newer (t=2P) than the near frame start (t=0): the head
-        // of the frame has no reference yet and must be silence-padded.
-        let mut far_buf: VecDeque<i16> = VecDeque::from(vec![7, 8]);
-        let mut fts = Some(2 * P);
-        let (far, dropped, padded) = align_far(&mut far_buf, &mut fts, 3 * P, 4, P); // near_first = 0
-        assert_eq!(far, vec![0, 0, 7, 8]);
-        assert_eq!((dropped, padded), (0, 2)); // two head samples silence-padded
     }
 
     // Deterministic pseudo-random far-end (LCG) so the test needs no rng dep.
