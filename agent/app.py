@@ -496,7 +496,16 @@ async def chat_handler(request: web.Request) -> web.StreamResponse:
         raise
     except Exception as e:  # noqa: BLE001
         log.error("chat stream failed: %s", e)
-    await resp.write_eof()
+    # write_eof() can itself raise on a client that already went away — a
+    # barge-in resets the orchestrator→agent connection mid-stream, the
+    # `except ConnectionResetError` above logs that as a normal cancel, but
+    # the terminating chunk here would then throw a *second* reset that
+    # aiohttp surfaces as an ERROR + traceback. Guard it so an aborted turn
+    # stays quiet. (The CancelledError branch re-raises before reaching here.)
+    try:
+        await resp.write_eof()
+    except ConnectionResetError:
+        pass
     return resp
 
 
