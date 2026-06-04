@@ -5,6 +5,8 @@ use rubato::{
 };
 use tracing::error;
 
+use crate::pcm::f32_to_i16;
+
 fn make_resampler(input_rate: u32, output_rate: u32, chunk_size: usize) -> Result<SincFixedIn<f32>> {
     let params = SincInterpolationParameters {
         sinc_len: 128,
@@ -106,8 +108,7 @@ impl CaptureFramer {
         while self.resampled_buf.len() >= self.target_samples_per_frame {
             let mut bytes = Vec::with_capacity(self.target_samples_per_frame * 2);
             for s in self.resampled_buf.drain(..self.target_samples_per_frame) {
-                let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-                bytes.extend_from_slice(&v.to_le_bytes());
+                bytes.extend_from_slice(&f32_to_i16(s).to_le_bytes());
             }
             frames.push(bytes);
         }

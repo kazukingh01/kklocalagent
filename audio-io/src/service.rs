@@ -1,18 +1,16 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::Context;
 use tracing::info;
 
 use crate::aec::{aec_task, reference_mixer_task, Aec, EchoCanceller};
 use crate::capture::start_capture;
+use crate::error::AudioError;
 use crate::playback::start_playback;
 use crate::state::{AppState, FlushSignals, PlaybackTrack, ServiceHandles};
 
-pub async fn start_services(state: &AppState) -> Result<()> {
-    let mut handles = state
-        .handles
-        .try_lock()
-        .map_err(|_| anyhow!("start/stop already in progress"))?;
+pub async fn start_services(state: &AppState) -> Result<(), AudioError> {
+    let mut handles = state.handles.try_lock().map_err(|_| AudioError::Busy)?;
     if handles.capture.is_some() || !handles.playback.is_empty() {
         info!("start_services: restarting existing services");
         drop_inner(&mut handles);
@@ -24,7 +22,8 @@ pub async fn start_services(state: &AppState) -> Result<()> {
         state.config.audio.clone(),
         state.mic_tx.clone(),
     )
-    .context("start_capture")?;
+    .context("start_capture")
+    .map_err(AudioError::from_chain)?;
     handles.capture = Some(capture);
 
     // Open `playback_tracks` independent cpal output streams against the
@@ -51,7 +50,8 @@ pub async fn start_services(state: &AppState) -> Result<()> {
             flush.clone(),
             ref_tap.clone(),
         )
-        .with_context(|| format!("start_playback (track {track_id})"))?;
+        .with_context(|| format!("start_playback (track {track_id})"))
+        .map_err(AudioError::from_chain)?;
         new_tracks.push(PlaybackTrack {
             sender: playback.sender(),
             flush,
@@ -85,12 +85,7 @@ pub async fn start_services(state: &AppState) -> Result<()> {
             "nlms" => Box::new(Aec::new(sr, flen)),
             #[cfg(feature = "speex")]
             "speex" => Box::new(crate::speex::SpeexAec::new(sr, spf, flen)),
-            other => {
-                return Err(anyhow!(
-                    "aec.backend '{other}' is not available — rebuild with \
-                     `--features speex` to enable the Speex DSP backend"
-                ));
-            }
+            other => return Err(AudioError::UnsupportedBackend(other.to_string())),
         };
         let aec_handle = tokio::spawn(aec_task(
             state.mic_tx.subscribe(),
@@ -111,11 +106,8 @@ pub async fn start_services(state: &AppState) -> Result<()> {
     Ok(())
 }
 
-pub async fn stop_services(state: &AppState) -> Result<()> {
-    let mut handles = state
-        .handles
-        .try_lock()
-        .map_err(|_| anyhow!("start/stop already in progress"))?;
+pub async fn stop_services(state: &AppState) -> Result<(), AudioError> {
+    let mut handles = state.handles.try_lock().map_err(|_| AudioError::Busy)?;
     drop_inner(&mut handles);
     state.spk_tracks.lock().await.clear();
     info!("services stopped");

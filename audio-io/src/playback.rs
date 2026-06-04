@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
@@ -14,7 +14,9 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use crate::config::AudioConfig;
+use crate::error::AudioError;
 use crate::framer::{CaptureFramer, PlaybackFramer};
+use crate::pcm::epoch_ns;
 use crate::state::FlushSignals;
 
 /// One unit of work for the playback producer task.
@@ -261,14 +263,14 @@ fn find_output_device(name: &str) -> Result<cpal::Device> {
     if name == "default" {
         return host
             .default_output_device()
-            .ok_or_else(|| anyhow!("no default output device"));
+            .ok_or_else(|| AudioError::NoDefaultDevice("output").into());
     }
     for dev in host.output_devices().context("listing output devices")? {
         if dev.name().unwrap_or_default() == name {
             return Ok(dev);
         }
     }
-    Err(anyhow!("output device '{name}' not found"))
+    Err(AudioError::DeviceNotFound(name.into()).into())
 }
 
 /// Emit the playback tap's downsampled reference frames to the AEC mixer.
@@ -285,10 +287,7 @@ fn emit_ref(
     if frames.is_empty() {
         return;
     }
-    let now_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
+    let now_ns = epoch_ns();
     let n = frames.len();
     for (i, frame) in frames.into_iter().enumerate() {
         let end_ns = now_ns.saturating_sub(((n - 1 - i) as u64) * frame_ns);

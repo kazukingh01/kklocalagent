@@ -34,12 +34,13 @@
 //!   needed.
 
 use std::collections::VecDeque;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, info, warn};
+
+use crate::pcm::{bytes_to_i16, epoch_ns, f32_to_i16, i16_to_bytes, i16_to_f32};
 
 /// NLMS step size. 0 < mu < 2 for stability; 0.3 is a conservative value
 /// that converges in a few hundred ms without ringing on a 16 kHz stream.
@@ -141,28 +142,6 @@ const DELAY_RELOCK_MS: u32 = 64;
 /// Head-room left ahead of the estimated echo inside the filter, so estimation
 /// error and frame-level jitter still land within the taps.
 const DELAY_HEAD_MARGIN_MS: u32 = 32;
-
-fn now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
-
-fn bytes_to_i16(bytes: &[u8]) -> Vec<i16> {
-    bytes
-        .chunks_exact(2)
-        .map(|p| i16::from_le_bytes([p[0], p[1]]))
-        .collect()
-}
-
-fn i16_to_bytes(samples: &[i16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(samples.len() * 2);
-    for s in samples {
-        out.extend_from_slice(&s.to_le_bytes());
-    }
-    out
-}
 
 /// Sums the per-track far-end PCM into one 16 kHz mono s16le stream, carrying
 /// the wall-clock *play* time of the emitted samples.
@@ -534,8 +513,8 @@ impl Aec {
         let mut sum_ee = 0.0f64; // residual energy
         let mut new_delay: Option<usize> = None;
         for (i, &d) in near.iter().enumerate() {
-            let x_raw = far.get(i).copied().unwrap_or(0) as f32 / 32768.0;
-            let d_f = d as f32 / 32768.0;
+            let x_raw = i16_to_f32(far.get(i).copied().unwrap_or(0));
+            let d_f = i16_to_f32(d);
             // Measure the bulk delay on the RAW (un-pre-delayed) streams.
             if let Some(delay) = self.estimator.push(x_raw, d_f) {
                 new_delay = Some(delay);
@@ -586,10 +565,7 @@ impl Aec {
         // Second pass: residual echo suppressor. One smoothed gain for the
         // whole frame, then apply it.
         let gain = self.update_nlp_gain(sum_xx, sum_yy, sum_ee, near.len());
-        resid
-            .into_iter()
-            .map(|e| ((e * gain).clamp(-1.0, 1.0) * 32767.0) as i16)
-            .collect()
+        resid.into_iter().map(|e| f32_to_i16(e * gain)).collect()
     }
 
     /// Update and return the residual-echo-suppressor gain for this frame.
@@ -779,7 +755,7 @@ pub async fn reference_mixer_task(
                 // Before the first playback frame the timeline has no anchor;
                 // fall back to wall-clock so silence frames still carry a sane
                 // (monotonic-ish) timestamp.
-                let ts = ts.unwrap_or_else(now_ns);
+                let ts = ts.unwrap_or_else(epoch_ns);
                 // No subscribers (AEC task gone) → send errors, ignored.
                 let _ = ref_tx.send((ts, Bytes::from(frame)));
             }

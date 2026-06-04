@@ -1,5 +1,4 @@
 use std::sync::mpsc as std_mpsc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
@@ -9,7 +8,9 @@ use tokio::sync::broadcast;
 use tracing::{error, info};
 
 use crate::config::AudioConfig;
+use crate::error::AudioError;
 use crate::framer::CaptureFramer;
+use crate::pcm::epoch_ns;
 
 pub struct CaptureHandle {
     shutdown: std_mpsc::SyncSender<()>,
@@ -63,14 +64,14 @@ fn find_input_device(name: &str) -> Result<cpal::Device> {
     if name == "default" {
         return host
             .default_input_device()
-            .ok_or_else(|| anyhow!("no default input device"));
+            .ok_or_else(|| AudioError::NoDefaultDevice("input").into());
     }
     for dev in host.input_devices().context("listing input devices")? {
         if dev.name().unwrap_or_default() == name {
             return Ok(dev);
         }
     }
-    Err(anyhow!("input device '{name}' not found"))
+    Err(AudioError::DeviceNotFound(name.into()).into())
 }
 
 fn run_capture(
@@ -169,10 +170,7 @@ fn dispatch(frames: Vec<Vec<u8>>, tx: &broadcast::Sender<(u64, Bytes)>, frame_ns
     // returns — i.e. immediately after the *last* emitted frame's tail
     // sample arrived. Earlier frames in this batch ended `frame_ns`
     // earlier, so we subtract a per-position offset.
-    let now_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
+    let now_ns = epoch_ns();
     let n = frames.len();
     for (i, frame) in frames.into_iter().enumerate() {
         let end_ns = now_ns.saturating_sub(((n - 1 - i) as u64) * frame_ns);

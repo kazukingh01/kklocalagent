@@ -1,8 +1,10 @@
 pub mod aec;
 pub mod capture;
 pub mod config;
+pub mod error;
 pub mod framer;
 pub mod http;
+pub mod pcm;
 pub mod playback;
 pub mod service;
 /// Speex DSP echo-cancellation backend, compiled only with `--features speex`.
