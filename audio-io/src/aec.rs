@@ -39,7 +39,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// NLMS step size. 0 < mu < 2 for stability; 0.3 is a conservative value
 /// that converges in a few hundred ms without ringing on a 16 kHz stream.
@@ -881,14 +881,16 @@ pub async fn aec_task(
                         let near_rms = (near_sq / denom).sqrt();
                         let far_rms = (far_sq / denom).sqrt();
                         let resid_rms = (resid_sq / denom).sqrt();
-                        // Only log when something is actually playing/speaking,
-                        // so an idle session doesn't spam a line every 0.5 s.
+                        // DEBUG level: a per-0.5 s tuning/diagnostic line, off
+                        // under the default `info` filter. Enable when needed
+                        // with `RUST_LOG=audio_io::aec=debug`. Also gated on
+                        // actual playback/speech so an idle session is silent.
                         if near_rms > 30.0 || far_rms > 30.0 {
                             // erle_db is the backend-agnostic comparison metric
                             // (works for nlms and speex alike).
                             let erle_db = 20.0 * (near_rms / resid_rms.max(1.0)).log10();
                             let s = canceller.stats(); // backend-specific extras
-                            info!(
+                            debug!(
                                 near_rms = near_rms as i64,
                                 far_rms = far_rms as i64,
                                 resid_rms = resid_rms as i64,
