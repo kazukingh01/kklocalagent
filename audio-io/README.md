@@ -17,7 +17,7 @@ ALSA development headers are required to build `cpal`:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y libasound2-dev pkg-config build-essential
+sudo apt-get install -y libasound2-dev pkg-config build-essential clang libclang-dev cmake
 pkg-config --modversion alsa   # verify: → 1.2.x
 
 cd audio-io
@@ -33,6 +33,7 @@ rustup target add x86_64-pc-windows-gnu
 
 cd audio-io
 cargo build --release --target x86_64-pc-windows-gnu
+LIBCLANG_PATH=/lib/x86_64-linux-gnu CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc CXX_x86_64_pc_windows_gnu=x86_64-w64-mingw32-g++ cargo build --release --target x86_64-pc-windows-gnu --features speex
 ```
 
 ## Run
@@ -112,6 +113,5 @@ cargo install websocat
 # terminal A
 ffmpeg -i ../automatic-speech-recognition/test/samples/test-ja.wav -ar 16000 -ac 1 -f s16le - 2>/dev/null | pv -q -L 32000 | websocat -b ws://$(ip route show | awk '/default/ {print $3}'):7010/spk?track=1
 # terminal B
-websocat -b ws://$(ip route show | awk '/default/ {print $3}'):7010/mic | head -c 320000 > near.raw # speak anything
-ffmpeg -y -f s16le -ar 16000 -ac 1 -i near.raw near.wav
+websocat -b ws://$(ip route show | awk '/default/ {print $3}'):7010/mic | head -c 320000 > near.raw && ffmpeg -y -f s16le -ar 16000 -ac 1 -i near.raw near.wav
 ```
