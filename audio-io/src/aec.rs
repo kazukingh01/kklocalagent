@@ -122,13 +122,25 @@ const DELAY_WINDOW_MS: u32 = 256;
 const DELAY_ESTIMATE_MS: u32 = 250;
 /// Minimum normalized correlation to trust an estimate (rejects double-talk /
 /// no-echo frames, which don't correlate cleanly).
-const DELAY_CONFIDENCE: f32 = 0.5;
+const DELAY_CONFIDENCE: f32 = 0.6;
+/// Mean-envelope floor (|x| in [0,1]) the far-end must exceed in the
+/// correlation window before a delay is estimated at all — quiet/transition
+/// frames correlate to noise and produced spurious jumps.
+const DELAY_ENV_FLOOR: f32 = 0.01;
+/// Consecutive agreeing confident estimates required before the delay is
+/// (re)locked. Stops a single spurious frame from moving the pre-delay.
+const DELAY_LOCK_COUNT: u32 = 3;
+/// How close (ms) successive estimates must be to count as "agreeing". Loose
+/// enough that a few-ms jitter still locks (the filter head-room absorbs the
+/// slack), tight enough to reject the wild spurious jumps.
+const DELAY_AGREE_MS: u32 = 16;
+/// Once locked, only re-lock when a *new* stable estimate differs by more than
+/// this. Small drift is left for the filter's head-room to absorb, so the
+/// expensive filter reset happens at most a handful of times per session.
+const DELAY_RELOCK_MS: u32 = 64;
 /// Head-room left ahead of the estimated echo inside the filter, so estimation
 /// error and frame-level jitter still land within the taps.
 const DELAY_HEAD_MARGIN_MS: u32 = 32;
-/// Only re-apply the pre-delay (which resets the filter) when the estimate moves
-/// by more than this, so small fluctuations don't thrash convergence.
-const DELAY_HYSTERESIS_MS: u32 = 20;
 
 fn now_ns() -> u64 {
     SystemTime::now()
@@ -252,6 +264,15 @@ struct DelayEstimator {
     acc_n: usize,
     interval: usize,
     since: usize,
+    agree: usize,  // estimates within this many samples count as agreeing
+    relock: usize, // re-lock threshold (full-rate samples)
+    // Lock state: only a delay confirmed `DELAY_LOCK_COUNT` times in a row is
+    // applied, and once applied it is held until a new stable estimate differs
+    // by more than `relock` — so the filter is reset at most a few times, not
+    // every estimate (the bug that thrashed convergence).
+    locked: Option<usize>,
+    cand: usize,
+    cand_n: u32,
 }
 
 impl DelayEstimator {
@@ -271,11 +292,17 @@ impl DelayEstimator {
             acc_n: 0,
             interval: (sample_rate as usize * DELAY_ESTIMATE_MS as usize / 1000).max(1),
             since: 0,
+            agree: (sample_rate as usize * DELAY_AGREE_MS as usize / 1000).max(DELAY_DECIM),
+            relock: (sample_rate as usize * DELAY_RELOCK_MS as usize / 1000).max(1),
+            locked: None,
+            cand: 0,
+            cand_n: 0,
         }
     }
 
-    /// Feed one full-rate (far, near) pair. Returns a freshly accepted bulk
-    /// delay (full-rate samples) when one is produced this call.
+    /// Feed one full-rate (far, near) pair. Returns a delay (full-rate samples)
+    /// only when it (re)locks — i.e. rarely — so the caller resets the filter
+    /// at most a handful of times.
     fn push(&mut self, far: f32, near: f32) -> Option<usize> {
         self.far_acc += far.abs();
         self.near_acc += near.abs();
@@ -296,7 +323,9 @@ impl DelayEstimator {
         None
     }
 
-    fn estimate_now(&mut self) -> Option<usize> {
+    /// Raw confident estimate this tick (full-rate samples), or None when the
+    /// far-end is too quiet or the correlation isn't confident.
+    fn raw_estimate(&self) -> Option<usize> {
         if self.near_env.len() < self.window + self.max_lag {
             return None;
         }
@@ -305,10 +334,13 @@ impl DelayEstimator {
         let nlen = near.len();
         let n0 = nlen - self.window; // start of the most-recent `window` of near
         let mut near_e = 0.0f32;
-        for &v in &near[n0..nlen] {
-            near_e += v * v;
+        let mut far_recent = 0.0f32; // mean |far| over the freshest window (gate)
+        for j in 0..self.window {
+            near_e += near[n0 + j] * near[n0 + j];
+            far_recent += far[n0 + j];
         }
-        if near_e <= 1e-9 {
+        // Gate: don't estimate unless the far-end is actually playing.
+        if near_e <= 1e-9 || far_recent / self.window as f32 <= DELAY_ENV_FLOOR {
             return None;
         }
         let mut best_lag = 0usize;
@@ -335,6 +367,33 @@ impl DelayEstimator {
             Some(best_lag * DELAY_DECIM)
         } else {
             None
+        }
+    }
+
+    fn estimate_now(&mut self) -> Option<usize> {
+        let raw = self.raw_estimate()?;
+        // Build confidence: agreeing values (within `agree`) must recur
+        // `DELAY_LOCK_COUNT` times before they can move the pre-delay.
+        if raw.abs_diff(self.cand) <= self.agree {
+            self.cand_n += 1;
+        } else {
+            self.cand = raw;
+            self.cand_n = 1;
+        }
+        if self.cand_n < DELAY_LOCK_COUNT {
+            return None;
+        }
+        // Confirmed. Lock on first acquisition, or re-lock only on a large move.
+        match self.locked {
+            None => {
+                self.locked = Some(self.cand);
+                Some(self.cand)
+            }
+            Some(cur) if self.cand.abs_diff(cur) > self.relock => {
+                self.locked = Some(self.cand);
+                Some(self.cand)
+            }
+            _ => None,
         }
     }
 }
@@ -386,10 +445,9 @@ pub struct Aec {
     /// filter only has to model the reverb tail, not the bulk transport delay.
     predelay: VecDeque<f32>,
     predelay_len: usize,
-    /// Head-room (samples) kept ahead of the estimated echo, and the minimum
-    /// estimate change (samples) before the pre-delay is re-applied.
+    /// Head-room (samples) kept ahead of the estimated echo so estimation error
+    /// and frame-level jitter still land within the filter taps.
     head_margin: usize,
-    hysteresis: usize,
 }
 
 impl Aec {
@@ -412,17 +470,16 @@ impl Aec {
             predelay: VecDeque::new(),
             predelay_len: 0,
             head_margin: (sample_rate as usize * DELAY_HEAD_MARGIN_MS as usize / 1000),
-            hysteresis: (sample_rate as usize * DELAY_HYSTERESIS_MS as usize / 1000).max(1),
         }
     }
 
-    /// Apply a freshly measured bulk delay: pre-delay the reference by
-    /// `delay - head_margin` so the echo lands `head_margin` into the filter.
-    /// Only acts on a change larger than the hysteresis (resetting the filter is
-    /// disruptive); the filter then re-converges around the new alignment.
+    /// Apply a (re)locked bulk delay: pre-delay the reference by
+    /// `delay - head_margin` so the echo lands `head_margin` into the filter,
+    /// then reset the filter to re-converge around the new alignment. The
+    /// estimator only (re)locks rarely, so this disruptive reset is rare.
     fn apply_delay(&mut self, delay_samples: usize) {
         let target = delay_samples.saturating_sub(self.head_margin);
-        if target.abs_diff(self.predelay_len) <= self.hysteresis {
+        if target == self.predelay_len {
             return;
         }
         self.predelay_len = target;
@@ -561,11 +618,15 @@ impl Aec {
         }
         let far_pow = sum_xx / n as f64;
         let far_active = far_pow >= NLP_FAR_FLOOR;
+        // Only meaningful once the filter actually predicts an echo: right after
+        // a reset `sum_yy ≈ 0`, where `sum_ee / sum_yy` would explode and drag
+        // the ERL estimate to its ceiling.
+        let echo_predicted = sum_yy / n as f64 >= NLP_FAR_FLOOR;
 
-        // Track the residual-echo ratio (minimum-statistics style) only while an
-        // echo is actually present to measure.
-        if far_active && sum_yy > 1e-9 {
-            let ratio = (sum_ee / sum_yy) as f32;
+        // Track the residual-echo ratio (minimum-statistics style). The ratio is
+        // clamped to the ERL ceiling so a transient can't take a huge step.
+        if far_active && echo_predicted {
+            let ratio = ((sum_ee / sum_yy) as f32).clamp(0.0, NLP_ERL_MAX);
             let coef = if ratio < self.erl {
                 NLP_ERL_TRACK_DOWN
             } else {
