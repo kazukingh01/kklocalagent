@@ -9,11 +9,13 @@
 # Model cache lives at /root/.ollama — mount a named volume there so
 # the first-boot pull persists across `docker compose down && up`.
 # Pinned to a named release rather than `latest` so the image is
-# reproducible. 0.23.2 is the first stable release that bundles
-# PR #15980 (Gemma 4 multi-token prediction speculative decoding) —
-# bump alongside the drafter / target model upgrade when we wire it
-# up. Override at build time with `--build-arg OLLAMA_TAG=…`.
-ARG OLLAMA_TAG=0.23.2
+# reproducible. 0.30.3 is the first stable release that supports the
+# Gemma 4 12B encoder-free multimodal architecture (gemma4:12b); 0.30.4
+# is the current patch (and still bundles the Gemma 4 MTP speculative
+# decoding from the older 0.23.x pin). Bump alongside any newer model
+# that needs updated runtime support. Override at build time with
+# `--build-arg OLLAMA_TAG=…`.
+ARG OLLAMA_TAG=0.30.4
 
 FROM ollama/ollama:${OLLAMA_TAG}
 
@@ -29,11 +31,12 @@ RUN apt-get update \
     && pip3 install --no-cache-dir --break-system-packages \
         "huggingface_hub[cli]>=0.25,<1.0"
 
-# Default model per design v0.2 (#4 §9). Override at runtime via
-# compose `environment:` — the HEALTHCHECK CMD below is a shell-form
-# command, so ${LLM_MODEL} is expanded in the container at probe time
-# and runtime overrides are honored.
-ENV LLM_MODEL=gemma3:4b
+# Standalone default model. Override at runtime via compose
+# `environment:` (production sets it through the LLM_MODEL anchor) — the
+# HEALTHCHECK CMD below is a shell-form command, so ${LLM_MODEL} is
+# expanded in the container at probe time and runtime overrides are
+# honored. gemma4:12b needs Ollama >= 0.30.3 (see OLLAMA_TAG above).
+ENV LLM_MODEL=gemma4:12b
 
 COPY init.sh /usr/local/bin/init.sh
 RUN chmod +x /usr/local/bin/init.sh
@@ -49,7 +52,7 @@ RUN chmod +x /usr/local/bin/init.sh
 #      between this container and the orchestrator would 404 every
 #      chat).
 #
-# start_period is generous because cold-pulling gemma3:4b (~3.3 GB)
+# start_period is generous because cold-pulling gemma4:12b (~9 GB)
 # can take 10+ minutes on a slow link; retries*interval = ~10 min
 # extra grace if the pull stalls.
 HEALTHCHECK --interval=15s --timeout=5s --start-period=12000s --retries=40 \
