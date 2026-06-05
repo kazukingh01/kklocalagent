@@ -338,6 +338,11 @@ async fn enter_speak(state: AppState, text: String, mode: ApiMode) -> Response {
             .into_response();
     }
 
+    // `prime` = "a /spk/stop just fired for this turn" (a real barge-in).
+    // When set, speak_one prepends a tiny silent frame so audio-io's armed
+    // playback flush is consumed on the throwaway instead of the real head
+    // of this utterance (head-clip mitigation, Plan B).
+    let mut prime = false;
     if mode == ApiMode::Speak {
         // Barge-in: tear down EVERY task scheduled for the previous
         // turn — the one currently holding speak_permit AND any
@@ -388,12 +393,13 @@ async fn enter_speak(state: AppState, text: String, mode: ApiMode) -> Response {
                 }
             }
         }
+        prime = had_active;
         state.burst_budget.lock().await.reset();
     }
     // Append doesn't cancel or reset — the previous task (if any) will
     // complete naturally, and speak_permit serialises us behind it.
 
-    let task = tokio::spawn(speak_one(state.clone(), text));
+    let task = tokio::spawn(speak_one(state.clone(), text, prime));
     let abort = task.abort_handle();
     {
         // Append our handle so a future /speak can cancel us. Reap
@@ -508,7 +514,7 @@ async fn stop(State(state): State<AppState>) -> Json<Value> {
 
 // --- core flow -----------------------------------------------------
 
-async fn speak_one(state: AppState, text: String) -> Result<Value> {
+async fn speak_one(state: AppState, text: String, prime: bool) -> Result<Value> {
     // Serialise speak_one regardless of which caller spawned us. The
     // /speak handler aborts the previous task before spawning a new
     // one, but abort only takes effect at .await boundaries — a task
@@ -565,6 +571,7 @@ async fn speak_one(state: AppState, text: String) -> Result<Value> {
         &pcm,
         state.cfg.ws_pacing_ms,
         state.burst_budget.clone(),
+        prime,
     )
     .await?;
     info!(
@@ -735,6 +742,7 @@ async fn push_to_spk(
     pcm: &[u8],
     cadence_ms: u64,
     burst_budget: Arc<Mutex<BurstBudget>>,
+    prime: bool,
 ) -> Result<usize> {
     const FRAMES_PER_BATCH: usize = 25;
     const BYTES_PER_BATCH: usize = FRAMES_PER_BATCH * BYTES_PER_FRAME;
@@ -747,6 +755,14 @@ async fn push_to_spk(
     // backlog so `tx.send().await` is effectively non-blocking even
     // through a multi-second WSL2 stall.
     const CHANNEL_DEPTH: usize = 32;
+    // Head-clip mitigation (Plan B): when `prime` is set (this utterance
+    // followed a barge-in /spk/stop), prepend a short silent throwaway frame
+    // + settle so audio-io's armed playback-producer flush is consumed on the
+    // silence rather than the real head of this burst. A plain delay can't do
+    // this — audio-io consumes that flush on the *first frame* it sees, so the
+    // first frame must be a sacrificial one.
+    const PRIME_FRAMES: usize = 2; // 40 ms of silence
+    const PRIME_SETTLE_MS: u64 = 50;
 
     let connect_t = Instant::now();
     let (ws, _resp) = tokio_tungstenite::connect_async(spk_url)
@@ -795,6 +811,16 @@ async fn push_to_spk(
     let bb_for_pacing = burst_budget.clone();
     let pacing = async move {
         let mut batches_iter = batches.into_iter();
+
+        // Plan B: absorb a just-fired /spk/stop's producer-side flush on a
+        // throwaway silent frame so it doesn't eat the real head, then settle
+        // so audio-io's producer clears the flush before the real burst lands.
+        if prime {
+            let silent = vec![0u8; PRIME_FRAMES * BYTES_PER_FRAME];
+            if tx.send(silent).await.is_ok() {
+                sleep(Duration::from_millis(PRIME_SETTLE_MS)).await;
+            }
+        }
 
         // Burst phase: queue the first `burst_batches` back-to-back
         // without waiting. The writer drains as fast as the WS allows
