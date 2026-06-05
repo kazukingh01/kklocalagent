@@ -419,71 +419,83 @@ def _resolve_audio_path(path: str) -> Path:
 _PLAYBACK_TASKS: set = set()
 
 
-async def _stream_pcm_to_spk(pcm: bytes, bytes_per_frame: int, label: str) -> None:
-    """Realtime-stream `pcm` to audio-io /spk, then EOS/drain. Runs detached so
-    `play_audio_file` returns immediately and the agent/LLM stay free during
-    playback. Stops when the file ends, or when `/spk/stop?track=N` is hit
-    (the stop_audio tool, the orchestrator's barge-in, or any external POST):
-    audio-io flushes the ring AND closes this WS, so the next send raises and
-    we exit cleanly."""
-    client_timeout = aiohttp.ClientTimeout(total=None, sock_connect=10.0)
+async def _stream_pcm_to_spk(
+    session: aiohttp.ClientSession,
+    ws: aiohttp.ClientWebSocketResponse,
+    pcm: bytes,
+    bytes_per_frame: int,
+    label: str,
+) -> None:
+    """Background half of play_audio_file: realtime-stream `pcm` over an
+    ALREADY-CONNECTED `ws`, then EOS/drain, and always close ws + session.
+
+    The connection is established in the FOREGROUND by the caller, so a connect
+    failure (audio-io down / wrong host / bad track) is surfaced to the LLM
+    instead of being silently swallowed here. Only this realtime streaming runs
+    detached, so play_audio_file stays non-blocking. Stops early when the file
+    ends or when `/spk/stop?track=N` closes the ws (the next send raises)."""
     try:
-        async with aiohttp.ClientSession(timeout=client_timeout) as session:
-            async with session.ws_connect(_AUDIO_IO_SPK_URL) as ws:
-                start = time.monotonic()
-                frame_idx = 0
-                offset = 0
-                while offset < len(pcm):
-                    chunk = pcm[offset : offset + bytes_per_frame]
-                    offset += len(chunk)
-                    # audio-io は奇数バイトの WS frame を拒否する (末尾の半端な
-                    # chunk が来た場合だけパディング)。
-                    if len(chunk) % 2 != 0:
-                        chunk = chunk + b"\x00"
-                    await ws.send_bytes(chunk)
-                    frame_idx += 1
-                    # 実時間ペーシング。audio-io 側の ring を溢れさせない目的。
-                    target = start + frame_idx * _AUDIO_PLAY_FRAME_MS / 1000.0
-                    sleep_for = target - time.monotonic()
-                    if sleep_for > 0:
-                        await asyncio.sleep(sleep_for)
-                # Drain handshake: eos を送ってから "drained" が戻るまで待つ。
-                await ws.send_str(json.dumps({"type": "eos"}))
-                try:
-                    msg = await asyncio.wait_for(
-                        ws.receive(), timeout=_AUDIO_DRAIN_TIMEOUT_S
-                    )
-                    if msg.type != aiohttp.WSMsgType.TEXT:
-                        log.warning(
-                            "play_audio_file: drain reply was %s, not TEXT", msg.type
-                        )
-                except asyncio.TimeoutError:
-                    log.warning(
-                        "play_audio_file: drain handshake timed out after %.0fs",
-                        _AUDIO_DRAIN_TIMEOUT_S,
-                    )
+        start = time.monotonic()
+        frame_idx = 0
+        offset = 0
+        while offset < len(pcm):
+            chunk = pcm[offset : offset + bytes_per_frame]
+            offset += len(chunk)
+            # audio-io は奇数バイトの WS frame を拒否する (末尾の半端な chunk
+            # が来た場合だけパディング)。
+            if len(chunk) % 2 != 0:
+                chunk = chunk + b"\x00"
+            await ws.send_bytes(chunk)
+            frame_idx += 1
+            # 実時間ペーシング。audio-io 側の ring を溢れさせない目的。
+            target = start + frame_idx * _AUDIO_PLAY_FRAME_MS / 1000.0
+            sleep_for = target - time.monotonic()
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
+        # Drain handshake: eos を送ってから "drained" が戻るまで待つ。
+        await ws.send_str(json.dumps({"type": "eos"}))
+        try:
+            msg = await asyncio.wait_for(
+                ws.receive(), timeout=_AUDIO_DRAIN_TIMEOUT_S
+            )
+            if msg.type != aiohttp.WSMsgType.TEXT:
+                log.warning(
+                    "play_audio_file: drain reply was %s, not TEXT", msg.type
+                )
+        except asyncio.TimeoutError:
+            log.warning(
+                "play_audio_file: drain handshake timed out after %.0fs",
+                _AUDIO_DRAIN_TIMEOUT_S,
+            )
         log.info("play_audio_file: finished playback (%s)", label)
     except asyncio.CancelledError:
         log.info("play_audio_file: playback cancelled (%s)", label)
         raise
     except Exception as e:  # noqa: BLE001
-        # WS closed by /spk/stop, connection dropped, or anything else — for a
-        # detached task these are all just "playback ended early"; log and move on.
+        # WS closed by /spk/stop mid-stream, connection dropped, etc. Once
+        # streaming has started these are normal "playback ended" conditions
+        # (setup failures were already caught at connect time), so just log.
         log.info(
             "play_audio_file: playback ended early (%s): %s", type(e).__name__, e
         )
+    finally:
+        # Always release the foreground-opened ws + session.
+        try:
+            await ws.close()
+        finally:
+            await session.close()
 
 
 async def _play_audio_file_impl(paths: list[str] | str) -> str:
-    """play_audio_file 本体。1 本の audio-io /spk (?track=N) WS に、渡された
-    全 WAV の PCM を順に realtime ペーシングで流し込み、最後に一度だけ
-    `{"type":"eos"}` で drain handshake して終わる (ギャップレス連続再生)。
+    """play_audio_file 本体。全 WAV を検証・デコードし、audio-io /spk (?track=N)
+    WS を **前景で接続** してから、realtime 送信＋drain を **背景タスク** に投げて
+    即 return する (非ブロック・ギャップレス連続再生)。
 
-    全例外は `_safe_invoke` で string 化される。barge-in は orchestrator が
-    /api/chat の HTTP を切ることで `asyncio.CancelledError` を伝播させて
-    アボートする — その時点で `async with` の context manager が WS を閉じ、
-    audio-io 側もリングが drain → close を見て後始末する。これは連続再生の
-    途中でも効くので、複数ファイルでも 1 回の wake-word で全停止できる。
+    接続失敗 (audio-io 未到達 / track 不正) はこの前景で raise され `_safe_invoke`
+    が string 化して LLM に返す (= 再生できなかったと気付ける)。再生開始後の停止は
+    `stop_audio` ツール / 任意プロセスの `POST /spk/stop?track=N` / wake-word
+    barge-in のいずれでも効く (audio-io が ring flush ＋ その track の WS close →
+    背景タスクの送信が例外で終了)。背景タスクは終了時に ws+session を必ず閉じる。
     """
     if not _AUDIO_IO_SPK_URL:
         raise RuntimeError(
@@ -538,13 +550,27 @@ async def _play_audio_file_impl(paths: list[str] | str) -> str:
         names, convert_note, _AUDIO_IO_SPK_URL,
     )
 
-    # Fire-and-forget: stream in a detached background task so this tool returns
-    # immediately and the agent/LLM stay free while the audio plays. Validation
-    # + decode above already ran on the await path, so a bad file still errors
-    # synchronously and nothing starts. Stop it with the stop_audio tool (or any
-    # POST to /spk/stop?track=N); otherwise it ends by itself at end of file.
+    # Connect to audio-io in the FOREGROUND so a connection failure (audio-io
+    # down, wrong host, bad track) raises here and is surfaced to the LLM via
+    # _safe_invoke — instead of being silently swallowed by the detached task,
+    # which used to make the agent claim "started" while nothing played. Only
+    # the realtime streaming is backgrounded, so playback stays non-blocking.
     label = f"{duration_s:.1f}s from {len(clips)} file(s): {names}"
-    task = asyncio.create_task(_stream_pcm_to_spk(pcm, bytes_per_frame, label))
+    session = aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=None, sock_connect=10.0)
+    )
+    try:
+        ws = await session.ws_connect(_AUDIO_IO_SPK_URL)
+    except Exception as e:  # noqa: BLE001
+        await session.close()
+        raise RuntimeError(
+            f"could not connect to audio output at {_AUDIO_IO_SPK_URL} "
+            f"({type(e).__name__}: {e}) — audio was NOT played"
+        ) from e
+    # Hand the live connection to the detached streamer (it closes ws+session).
+    task = asyncio.create_task(
+        _stream_pcm_to_spk(session, ws, pcm, bytes_per_frame, label)
+    )
     _PLAYBACK_TASKS.add(task)
     task.add_done_callback(_PLAYBACK_TASKS.discard)
     return (
