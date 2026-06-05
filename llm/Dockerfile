@@ -36,7 +36,7 @@ RUN apt-get update \
 # HEALTHCHECK CMD below is a shell-form command, so ${LLM_MODEL} is
 # expanded in the container at probe time and runtime overrides are
 # honored. gemma4:12b needs Ollama >= 0.30.3 (see OLLAMA_TAG above).
-ENV LLM_MODEL=gemma4:12b
+ENV LLM_MODEL=hf.co/unsloth/gemma-4-12b-it-GGUF:Q4_K_M
 
 COPY init.sh /usr/local/bin/init.sh
 RUN chmod +x /usr/local/bin/init.sh
