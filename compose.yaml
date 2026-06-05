@@ -154,13 +154,16 @@ services:
       # Context window. Voice multi-turn benefits from a long enough
       # window to keep a handful of turns in checkpointed history, but
       # the cost is KV cache size + per-token attention compute.
-      # 8 k @ q8 KV ≈ ~250 MiB cache (vs ~1 GiB at 32k) and trims
-      # ~5-10 % off per-token latency on a 4090 Laptop. Voice replies
-      # almost never need more than a few hundred tokens of context
-      # for the agent to keep state coherent, so 8 k is the sweet
-      # spot for this workload. Bump if you find the agent forgetting
-      # mid-conversation.
-      OLLAMA_CONTEXT_LENGTH: "${OLLAMA_CONTEXT_LENGTH:-8192}"
+      # 16 k @ q8 KV ≈ ~500 MiB cache on a 4090 Laptop. Bumped from 8 k
+      # because tool-using turns (web-search results in the agent's
+      # checkpointed history) used to fill 8 k after a few turns — the
+      # prompt then left no room to generate, the reply truncated to
+      # empty, and the agent got stuck emitting its fallback line every
+      # turn. The agent now also trims its history to a token budget
+      # (AGENT_MAX_HISTORY_TOKENS) before each call; 16 k gives that
+      # trimming comfortable headroom over the system prompt + tool
+      # schemas + generation.
+      OLLAMA_CONTEXT_LENGTH: "${OLLAMA_CONTEXT_LENGTH:-16384}"
       # Force the quantised matrix-multiplication CUDA kernel (MMQ)
       # instead of the cuBLAS-on-dequantised path. For Q4_K_M models
       # on Ada (RTX 4090 / 4090 Laptop, compute 8.9) MMQ is reliably

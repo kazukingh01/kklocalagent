@@ -59,6 +59,7 @@ from langchain_core.messages import (
     HumanMessage,
     SystemMessage,
     ToolMessage,
+    trim_messages,
 )
 from langchain_ollama import ChatOllama
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -88,6 +89,15 @@ TOOLS_ENABLED = os.environ.get("AGENT_TOOLS_ENABLED", "false").lower() in ("1", 
 # voice line rather than loop forever. issue #19 オープン項目 #6 の retry
 # リミット。
 RECURSION_LIMIT = int(os.environ.get("AGENT_TOOL_RECURSION_LIMIT", "6"))
+# Trim the accumulated chat history to this many (estimated) tokens before
+# each LLM call. Without it, a long tool-heavy conversation grows the
+# checkpointed history until it fills ollama's context window — the prompt
+# then leaves no room to generate, the reply truncates to empty, and the
+# agent gets stuck emitting its fallback line every turn (only recovering on
+# session idle-rotation / restart). Kept well under OLLAMA_CONTEXT_LENGTH
+# (default 16384) since the system prompt + tool schemas + generation room
+# are *on top* of this budget (they are not part of state["messages"]).
+MAX_HISTORY_TOKENS = int(os.environ.get("AGENT_MAX_HISTORY_TOKENS", "4096"))
 # Recovery line spoken whenever a turn would otherwise end with no
 # spoken text — either the ReAct loop exceeded RECURSION_LIMIT, or the
 # stream finished after a failed/denied tool without the LLM producing
@@ -195,6 +205,39 @@ class SessionManager:
             return self.current_session
 
 
+def _approx_tokens(messages: list) -> int:
+    """Cheap local token estimate for [`_trim_history`], no `/tokenize` round-trip.
+
+    ~0.5 tokens/char + per-message overhead. This under-counts dense CJK, so
+    the budget ([`MAX_HISTORY_TOKENS`]) is deliberately set well under the
+    context window to keep a safety margin even when the estimate is low.
+    """
+    total = 0
+    for m in messages:
+        content = m.content if isinstance(m.content, str) else str(m.content)
+        total += len(content) // 2 + 8
+    return total
+
+
+def _trim_history(messages: list) -> list:
+    """Keep the most recent messages within [`MAX_HISTORY_TOKENS`].
+
+    `start_on="human"` guarantees the kept window begins on a user turn so a
+    tool-call AIMessage and its ToolMessage result are never split (an orphan
+    ToolMessage would be an invalid prompt). The system prompt is added by the
+    caller, on top of this budget, so `include_system=False` here.
+    """
+    return trim_messages(
+        messages,
+        max_tokens=MAX_HISTORY_TOKENS,
+        token_counter=_approx_tokens,
+        strategy="last",
+        include_system=False,
+        start_on="human",
+        allow_partial=False,
+    )
+
+
 def build_legacy_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
     """Single-node chat graph (pre-tools fallback).
 
@@ -216,7 +259,7 @@ def build_legacy_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
     """
 
     async def chat_node(state: MessagesState):
-        messages = list(state["messages"])
+        messages = _trim_history(list(state["messages"]))
         if SYSTEM_PROMPT:
             messages = [SystemMessage(content=SYSTEM_PROMPT), *messages]
         # ainvoke (not astream) inside the node — LangGraph's
@@ -246,15 +289,25 @@ def build_react_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
     needed here.
     """
     tools = all_tools()
-    prompt = (SYSTEM_PROMPT + TOOL_SYSTEM_SUFFIX) if SYSTEM_PROMPT else TOOL_SYSTEM_SUFFIX.strip()
-    # `prompt=` is injected as a SystemMessage on every LLM call, same
-    # pattern as the legacy graph — i.e. not persisted in state. So
-    # restarting with a different AGENT_SYSTEM_PROMPT still takes effect
-    # on the next turn.
+    system_text = (SYSTEM_PROMPT + TOOL_SYSTEM_SUFFIX) if SYSTEM_PROMPT else TOOL_SYSTEM_SUFFIX.strip()
+
+    # `prompt` is a callable so we can, on every LLM call: (a) inject the
+    # system text without persisting it in state — same pattern as the legacy
+    # graph, so changing AGENT_SYSTEM_PROMPT takes effect on the next turn —
+    # and (b) trim the accumulated history to MAX_HISTORY_TOKENS first, so a
+    # long tool-heavy conversation can't fill the context window and stall the
+    # agent in empty-reply fallbacks. System + tools stay first so the
+    # prompt-cache prefix is preserved.
+    def react_prompt(state):
+        trimmed = _trim_history(list(state["messages"]))
+        if system_text:
+            return [SystemMessage(content=system_text), *trimmed]
+        return trimmed
+
     return create_react_agent(
         llm,
         tools,
-        prompt=prompt,
+        prompt=react_prompt,
         checkpointer=checkpointer,
     )
 
