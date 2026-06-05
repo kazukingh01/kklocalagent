@@ -33,12 +33,13 @@ Architecture decisions:
   after `AGENT_SESSION_IDLE_SEC` of no /api/chat traffic (assume the
   operator walked away; the next turn is a fresh conversation).
 * **Tools (issue #19)** are gated behind `AGENT_TOOLS_ENABLED`. When
-  on, the chat graph is replaced with `create_react_agent` (LLM ↔
-  tool loop). When off, the legacy single-node graph is used so
-  pre-tools behaviour is preserved bit-for-bit. The stream filter
-  drops tool-call deltas (would TTS structured data otherwise) and
-  injects a per-tool "filler ack" chunk (e.g. "ちょっと検索してみるね")
-  before slow tools so the user doesn't sit through a silent gap.
+  on, the chat graph is a hand-rolled ReAct loop (agent ↔ tools) — see
+  `build_react_graph`; a "terminal" tool like stop_audio ends the turn
+  without a second LLM call. When off, the legacy single-node graph is
+  used so pre-tools behaviour is preserved bit-for-bit. The stream
+  filter drops tool-call deltas (would TTS structured data otherwise)
+  and injects a per-tool "filler ack" chunk (e.g. "ちょっと検索してみるね")
+  when the tool is invoked so the user doesn't sit through a silent gap.
 """
 
 from __future__ import annotations
@@ -55,6 +56,7 @@ from typing import AsyncIterator
 import aiosqlite
 from aiohttp import web
 from langchain_core.messages import (
+    AIMessage,
     AIMessageChunk,
     HumanMessage,
     SystemMessage,
@@ -65,7 +67,7 @@ from langchain_ollama import ChatOllama
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, MessagesState, StateGraph
-from langgraph.prebuilt import create_react_agent
+from langgraph.prebuilt import ToolNode, tools_condition
 
 from tools import TOOL_ACK_PHRASES, all_tools
 
@@ -98,6 +100,12 @@ RECURSION_LIMIT = int(os.environ.get("AGENT_TOOL_RECURSION_LIMIT", "6"))
 # (default 16384) since the system prompt + tool schemas + generation room
 # are *on top* of this budget (they are not part of state["messages"]).
 MAX_HISTORY_TOKENS = int(os.environ.get("AGENT_MAX_HISTORY_TOKENS", "4096"))
+# Tools whose *successful* result ends the turn with a fixed confirmation (their
+# TOOL_ACK_PHRASES line) instead of a second LLM call. They are instant and
+# deterministic — re-invoking the model just to paraphrase "done" only adds a
+# whole model-call of latency. A failed one falls back to the LLM so it can
+# explain. See build_react_graph's terminal-tool routing.
+TERMINAL_TOOLS = {"stop_audio"}
 # Recovery line spoken whenever a turn would otherwise end with no
 # spoken text — either the ReAct loop exceeded RECURSION_LIMIT, or the
 # stream finished after a failed/denied tool without the LLM producing
@@ -277,39 +285,78 @@ def build_legacy_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
 
 
 def build_react_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
-    """ReAct (agent_node ↔ tools) graph for AGENT_TOOLS_ENABLED=true.
+    """ReAct (agent ↔ tools) graph for AGENT_TOOLS_ENABLED=true.
 
-    `create_react_agent` handles tool binding, the agent-vs-tools router,
-    and the loop back to agent_node after each tool result. We only
-    customise the prompt (system prompt + tool-usage guidance) so the
-    voice-agent persona is preserved while the LLM learns it has tools.
+    Hand-rolled instead of `create_react_agent` so we can add one thing the
+    prebuilt agent can't: when a *terminal* tool (`TERMINAL_TOOLS`, e.g.
+    stop_audio) runs successfully, end the turn WITHOUT a second LLM call.
+    Those tools are instant + deterministic, so re-invoking the model just to
+    paraphrase "done" adds a whole model-call of latency for nothing; the
+    user-facing confirmation comes from the tool's `TOOL_ACK_PHRASES` line
+    (spoken/streamed when the tool is invoked). A failed terminal tool, and
+    every non-terminal tool, loop back to the LLM as usual.
 
-    Tools live in `tools.py::all_tools()`. Adding one there + entering
-    its name in `TOOL_ACK_PHRASES` is enough to wire it — no changes
-    needed here.
+    The LLM call lives in `agent_node`, which injects the system prompt (not
+    persisted in state — so AGENT_SYSTEM_PROMPT changes take effect next turn)
+    and trims history to MAX_HISTORY_TOKENS, keeping system + tools first so the
+    prompt-cache prefix is stable. `ainvoke` inside the node still streams token
+    deltas via stream_mode="messages".
     """
     tools = all_tools()
     system_text = (SYSTEM_PROMPT + TOOL_SYSTEM_SUFFIX) if SYSTEM_PROMPT else TOOL_SYSTEM_SUFFIX.strip()
+    llm_with_tools = llm.bind_tools(tools)
 
-    # `prompt` is a callable so we can, on every LLM call: (a) inject the
-    # system text without persisting it in state — same pattern as the legacy
-    # graph, so changing AGENT_SYSTEM_PROMPT takes effect on the next turn —
-    # and (b) trim the accumulated history to MAX_HISTORY_TOKENS first, so a
-    # long tool-heavy conversation can't fill the context window and stall the
-    # agent in empty-reply fallbacks. System + tools stay first so the
-    # prompt-cache prefix is preserved.
-    def react_prompt(state):
-        trimmed = _trim_history(list(state["messages"]))
+    async def agent_node(state: MessagesState):
+        messages = _trim_history(list(state["messages"]))
         if system_text:
-            return [SystemMessage(content=system_text), *trimmed]
-        return trimmed
+            messages = [SystemMessage(content=system_text), *messages]
+        return {"messages": [await llm_with_tools.ainvoke(messages)]}
 
-    return create_react_agent(
-        llm,
-        tools,
-        prompt=react_prompt,
-        checkpointer=checkpointer,
+    def route_after_tools(state: MessagesState) -> str:
+        # Look at the ToolMessages this tools step just appended (the trailing
+        # run). If a terminal tool succeeded (_safe_invoke prefixes failures
+        # with [error]/[denied]), end via terminal_reply; otherwise loop back.
+        for msg in reversed(state["messages"]):
+            if not isinstance(msg, ToolMessage):
+                break
+            if msg.name in TERMINAL_TOOLS and not str(msg.content).startswith(
+                ("[error]", "[denied]")
+            ):
+                return "terminal_reply"
+        return "agent"
+
+    def terminal_reply(state: MessagesState):
+        # Fixed assistant message so the persisted history stays a well-formed
+        # ReAct exchange. NOT re-streamed (stream_mode="messages" only surfaces
+        # LLM output) — the spoken/printed confirmation already came from the
+        # tool's ack phrase, so we reuse that same phrase here for consistency.
+        name = next(
+            (
+                m.name
+                for m in reversed(state["messages"])
+                if isinstance(m, ToolMessage) and m.name in TERMINAL_TOOLS
+            ),
+            None,
+        )
+        text = (TOOL_ACK_PHRASES.get(name) if name else None) or "はい。"
+        return {"messages": [AIMessage(content=text)]}
+
+    builder = StateGraph(MessagesState)
+    builder.add_node("agent", agent_node)
+    builder.add_node("tools", ToolNode(tools))
+    builder.add_node("terminal_reply", terminal_reply)
+    builder.add_edge(START, "agent")
+    # agent → "tools" when the LLM emitted tool_calls, else → END.
+    builder.add_conditional_edges("agent", tools_condition)
+    # tools → terminal_reply (end, no 2nd LLM) on a successful terminal tool,
+    # else back to agent.
+    builder.add_conditional_edges(
+        "tools",
+        route_after_tools,
+        {"agent": "agent", "terminal_reply": "terminal_reply"},
     )
+    builder.add_edge("terminal_reply", END)
+    return builder.compile(checkpointer=checkpointer)
 
 
 async def warm_system_prefix() -> None:

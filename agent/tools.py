@@ -759,8 +759,9 @@ TOOL_ACK_PHRASES: dict[str, str | None] = {
         if _AUDIO_IO_SPK_URL
         else None
     ),
-    # stop は即応 (flush signal を投げるだけ) なので ack 不要。
-    "stop_audio": None,
+    # stop は即応かつ決定的なので、2回目の LLM 生成を省く (agent 側で stop_audio
+    # を terminal tool 扱いにして即 END)。確認文はこの固定 ack で返す。
+    "stop_audio": os.environ.get("AGENT_TOOL_ACK_STOP_AUDIO", "止めたよ。"),
 }
 
 
