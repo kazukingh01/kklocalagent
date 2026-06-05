@@ -414,6 +414,66 @@ def _resolve_audio_path(path: str) -> Path:
     return p
 
 
+# Detached playback tasks (fire-and-forget). Hold strong refs so the event
+# loop doesn't GC a running task mid-stream; the done-callback drops them.
+_PLAYBACK_TASKS: set = set()
+
+
+async def _stream_pcm_to_spk(pcm: bytes, bytes_per_frame: int, label: str) -> None:
+    """Realtime-stream `pcm` to audio-io /spk, then EOS/drain. Runs detached so
+    `play_audio_file` returns immediately and the agent/LLM stay free during
+    playback. Stops when the file ends, or when `/spk/stop?track=N` is hit
+    (the stop_audio tool, the orchestrator's barge-in, or any external POST):
+    audio-io flushes the ring AND closes this WS, so the next send raises and
+    we exit cleanly."""
+    client_timeout = aiohttp.ClientTimeout(total=None, sock_connect=10.0)
+    try:
+        async with aiohttp.ClientSession(timeout=client_timeout) as session:
+            async with session.ws_connect(_AUDIO_IO_SPK_URL) as ws:
+                start = time.monotonic()
+                frame_idx = 0
+                offset = 0
+                while offset < len(pcm):
+                    chunk = pcm[offset : offset + bytes_per_frame]
+                    offset += len(chunk)
+                    # audio-io は奇数バイトの WS frame を拒否する (末尾の半端な
+                    # chunk が来た場合だけパディング)。
+                    if len(chunk) % 2 != 0:
+                        chunk = chunk + b"\x00"
+                    await ws.send_bytes(chunk)
+                    frame_idx += 1
+                    # 実時間ペーシング。audio-io 側の ring を溢れさせない目的。
+                    target = start + frame_idx * _AUDIO_PLAY_FRAME_MS / 1000.0
+                    sleep_for = target - time.monotonic()
+                    if sleep_for > 0:
+                        await asyncio.sleep(sleep_for)
+                # Drain handshake: eos を送ってから "drained" が戻るまで待つ。
+                await ws.send_str(json.dumps({"type": "eos"}))
+                try:
+                    msg = await asyncio.wait_for(
+                        ws.receive(), timeout=_AUDIO_DRAIN_TIMEOUT_S
+                    )
+                    if msg.type != aiohttp.WSMsgType.TEXT:
+                        log.warning(
+                            "play_audio_file: drain reply was %s, not TEXT", msg.type
+                        )
+                except asyncio.TimeoutError:
+                    log.warning(
+                        "play_audio_file: drain handshake timed out after %.0fs",
+                        _AUDIO_DRAIN_TIMEOUT_S,
+                    )
+        log.info("play_audio_file: finished playback (%s)", label)
+    except asyncio.CancelledError:
+        log.info("play_audio_file: playback cancelled (%s)", label)
+        raise
+    except Exception as e:  # noqa: BLE001
+        # WS closed by /spk/stop, connection dropped, or anything else — for a
+        # detached task these are all just "playback ended early"; log and move on.
+        log.info(
+            "play_audio_file: playback ended early (%s): %s", type(e).__name__, e
+        )
+
+
 async def _play_audio_file_impl(paths: list[str] | str) -> str:
     """play_audio_file 本体。1 本の audio-io /spk (?track=N) WS に、渡された
     全 WAV の PCM を順に realtime ペーシングで流し込み、最後に一度だけ
@@ -478,48 +538,19 @@ async def _play_audio_file_impl(paths: list[str] | str) -> str:
         names, convert_note, _AUDIO_IO_SPK_URL,
     )
 
-    # ws_connect の sock_connect で接続フェーズを短く (audio-io が居なければ
-    # ここで即落ちて [error] にする)。全体 timeout は意図的に None — 長尺
-    # 再生中ずっと send/recv するので。
-    client_timeout = aiohttp.ClientTimeout(total=None, sock_connect=10.0)
-    async with aiohttp.ClientSession(timeout=client_timeout) as session:
-        async with session.ws_connect(_AUDIO_IO_SPK_URL) as ws:
-            start = time.monotonic()
-            frame_idx = 0
-            offset = 0
-            while offset < len(pcm):
-                chunk = pcm[offset : offset + bytes_per_frame]
-                offset += len(chunk)
-                # audio-io は奇数バイトの WS frame を拒否する (s16le なので
-                # 通常は偶数だが、末尾の半端な chunk が来た場合だけパディング)。
-                if len(chunk) % 2 != 0:
-                    chunk = chunk + b"\x00"
-                await ws.send_bytes(chunk)
-                frame_idx += 1
-                # 実時間ペーシング。各 frame は frame_idx * FRAME_MS のタイミングで
-                # 送出する。audio-io 側の ring (deafult 10s) を溢れさせない目的。
-                target = start + frame_idx * _AUDIO_PLAY_FRAME_MS / 1000.0
-                sleep_for = target - time.monotonic()
-                if sleep_for > 0:
-                    await asyncio.sleep(sleep_for)
-            # Drain handshake: eos を送ってから "drained" が戻るまで待つ。
-            # これで audio-io の cpal リングが本当に空になったことが保証される。
-            await ws.send_str(json.dumps({"type": "eos"}))
-            try:
-                msg = await asyncio.wait_for(
-                    ws.receive(), timeout=_AUDIO_DRAIN_TIMEOUT_S
-                )
-                if msg.type != aiohttp.WSMsgType.TEXT:
-                    log.warning(
-                        "play_audio_file: drain reply was %s, not TEXT",
-                        msg.type,
-                    )
-            except asyncio.TimeoutError:
-                log.warning(
-                    "play_audio_file: drain handshake timed out after %.0fs",
-                    _AUDIO_DRAIN_TIMEOUT_S,
-                )
-    return f"played {duration_s:.1f}s from {len(clips)} file(s): {names}"
+    # Fire-and-forget: stream in a detached background task so this tool returns
+    # immediately and the agent/LLM stay free while the audio plays. Validation
+    # + decode above already ran on the await path, so a bad file still errors
+    # synchronously and nothing starts. Stop it with the stop_audio tool (or any
+    # POST to /spk/stop?track=N); otherwise it ends by itself at end of file.
+    label = f"{duration_s:.1f}s from {len(clips)} file(s): {names}"
+    task = asyncio.create_task(_stream_pcm_to_spk(pcm, bytes_per_frame, label))
+    _PLAYBACK_TASKS.add(task)
+    task.add_done_callback(_PLAYBACK_TASKS.discard)
+    return (
+        f"started playing {label} in the background; you're free now. "
+        f"It stops at the end of the file, or immediately when stop_audio is called."
+    )
 
 
 def _build_play_audio_description() -> str:
@@ -560,8 +591,10 @@ def _build_play_audio_description() -> str:
         "asking the user.\n\n"
         "Call this when the user asks to play specific audio file(s) — "
         "for example a pre-rendered news summary or notification produced "
-        "by another agent. The tool blocks until playback completes; if "
-        "the user interrupts via wake-word, playback aborts cleanly. "
+        "by another agent. Playback runs in the BACKGROUND: this returns "
+        "immediately (you stay free to keep talking and handle other turns) "
+        "while the audio keeps playing, and it stops at the end of the file, "
+        "when stop_audio is called, or on wake-word barge-in. "
         f"Total duration across all files is capped at {_AUDIO_PLAY_MAX_S:.0f} "
         "seconds."
     )

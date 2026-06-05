@@ -112,7 +112,11 @@ pub async fn spk_stop(
         Some(idx) => match tracks.get(idx) {
             Some(t) => {
                 t.flush.trigger();
-                info!(track = idx, "spk_stop: flush signaled");
+                // Also close this track's active /spk WS so a continuously
+                // streaming client (agent fire-and-forget playback) stops
+                // sending instead of refilling the just-flushed ring.
+                t.close.notify_waiters();
+                info!(track = idx, "spk_stop: flush + ws close signaled");
                 (
                     StatusCode::OK,
                     Json(serde_json::json!({ "status": "flushed", "track": idx })),
@@ -139,10 +143,11 @@ pub async fn spk_stop(
         None => {
             for t in tracks.iter() {
                 t.flush.trigger();
+                t.close.notify_waiters();
             }
             info!(
                 n_tracks = tracks.len(),
-                "spk_stop: flush signaled (all tracks)"
+                "spk_stop: flush + ws close signaled (all tracks)"
             );
             (
                 StatusCode::OK,

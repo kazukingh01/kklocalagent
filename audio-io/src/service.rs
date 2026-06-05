@@ -55,6 +55,7 @@ pub async fn start_services(state: &AppState) -> Result<(), AudioError> {
         new_tracks.push(PlaybackTrack {
             sender: playback.sender(),
             flush,
+            close: Arc::new(tokio::sync::Notify::new()),
         });
         new_handles.push(playback);
     }
