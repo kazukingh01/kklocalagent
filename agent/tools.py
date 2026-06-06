@@ -73,9 +73,9 @@ _AUDIO_IO_WIRE_CHANNELS: int = int(os.environ.get("AGENT_AUDIO_IO_WIRE_CHANNELS"
 # `tomono`、レート変換は `ratecv`)。LLM が「48kHz の WAV ですが？」と
 # 言い訳せず再生できるようにするための保険。
 _AUDIO_SAMPLE_WIDTH = 2  # s16le 固定 (= 16-bit PCM)
-# 単一再生の壁時計上限 (秒)。1 時間の WAV をうっかり渡されると tool が
-# その間 block するので DoS 対策。
-_AUDIO_PLAY_MAX_S: float = float(os.environ.get("AGENT_AUDIO_PLAY_MAX_S", "300"))
+# 合計再生時間の上限は撤廃。ファイルは 1 本ずつ逐次デコードしてストリーミングする
+# (`_stream_files_to_spk`) のでメモリは常に ~1 本ぶんに収まり、長すぎる場合は
+# stop_audio / wake-word で止められる (旧 DoS 上限の代替)。
 
 
 def _derive_stop_url(spk_url: str) -> str:
@@ -326,9 +326,8 @@ def _read_and_convert_wav(p: Path) -> tuple[bytes, float, int, int]:
     """単一 WAV を読んで wire format (rate/channels) に揃えた PCM を返す。
 
     返り値は `(pcm, duration_s, src_rate, src_ch)`。圧縮 / 非 s16le は raise。
-    duration の上限チェックはここではせず、呼び出し側が合計で判定する
-    (複数ファイルの合算で `_AUDIO_PLAY_MAX_S` を超えたら弾くため)。
-    sync I/O + CPU 仕事なので呼び出し側で `asyncio.to_thread` に乗せる。
+    sync I/O + CPU 仕事なので呼び出し側で `asyncio.to_thread` に乗せる
+    (`_stream_files_to_spk` が 1 本ずつ呼んで逐次ストリーミングする)。
     """
     with wave.open(str(p), "rb") as wav:
         comp = wav.getcomptype()
@@ -467,39 +466,66 @@ def _expand_audio_glob(pattern: str) -> list[Path]:
 _PLAYBACK_TASKS: set = set()
 
 
-async def _stream_pcm_to_spk(
+async def _stream_files_to_spk(
     session: aiohttp.ClientSession,
     ws: aiohttp.ClientWebSocketResponse,
-    pcm: bytes,
+    paths: list[Path],
+    first_pcm: bytes,
     bytes_per_frame: int,
     label: str,
 ) -> None:
-    """Background half of play_audio_file: realtime-stream `pcm` over an
-    ALREADY-CONNECTED `ws`, then EOS/drain, and always close ws + session.
+    """Background half of play_audio_file: realtime-stream each file's PCM over
+    an ALREADY-CONNECTED `ws`, gaplessly, then EOS/drain, and always close
+    ws + session.
 
-    The connection is established in the FOREGROUND by the caller, so a connect
-    failure (audio-io down / wrong host / bad track) is surfaced to the LLM
-    instead of being silently swallowed here. Only this realtime streaming runs
-    detached, so play_audio_file stays non-blocking. Stops early when the file
-    ends or when `/spk/stop?track=N` closes the ws (the next send raises)."""
+    Files are decoded ONE AT A TIME, prefetching file i+1 while file i streams
+    (file 0 was decoded in the foreground). So playback starts immediately, only
+    ~one file of PCM is ever in memory, and there is NO total-duration cap — a
+    big "play all" just streams for as long as it takes (stop it with stop_audio
+    or wake-word). A file that fails to decode mid-run is logged and skipped.
+
+    Connect failures were already surfaced to the LLM in the foreground; this
+    detached task only does the realtime work, so play_audio_file stays
+    non-blocking. Stops early when `/spk/stop?track=N` closes the ws."""
+    next_task = None
     try:
         start = time.monotonic()
         frame_idx = 0
-        offset = 0
-        while offset < len(pcm):
-            chunk = pcm[offset : offset + bytes_per_frame]
-            offset += len(chunk)
-            # audio-io は奇数バイトの WS frame を拒否する (末尾の半端な chunk
-            # が来た場合だけパディング)。
-            if len(chunk) % 2 != 0:
-                chunk = chunk + b"\x00"
-            await ws.send_bytes(chunk)
-            frame_idx += 1
-            # 実時間ペーシング。audio-io 側の ring を溢れさせない目的。
-            target = start + frame_idx * _AUDIO_PLAY_FRAME_MS / 1000.0
-            sleep_for = target - time.monotonic()
-            if sleep_for > 0:
-                await asyncio.sleep(sleep_for)
+        pcm = first_pcm
+        for i in range(len(paths)):
+            # Decode the NEXT file while this one streams, so its PCM is ready
+            # the instant the current file ends (gapless). Decode << realtime, so
+            # it finishes during the per-frame sleeps below.
+            next_task = (
+                asyncio.create_task(
+                    asyncio.to_thread(_read_and_convert_wav, paths[i + 1])
+                )
+                if i + 1 < len(paths)
+                else None
+            )
+            offset = 0
+            while offset < len(pcm):
+                chunk = pcm[offset : offset + bytes_per_frame]
+                offset += len(chunk)
+                # 末尾の半端な chunk だけパディング (audio-io は奇数バイト拒否)。
+                if len(chunk) % 2 != 0:
+                    chunk = chunk + b"\x00"
+                await ws.send_bytes(chunk)
+                frame_idx += 1
+                # 実時間ペーシング (連結全体で連続。ファイル境界も跨いで一定)。
+                target = start + frame_idx * _AUDIO_PLAY_FRAME_MS / 1000.0
+                sleep_for = target - time.monotonic()
+                if sleep_for > 0:
+                    await asyncio.sleep(sleep_for)
+            if next_task is not None:
+                try:
+                    pcm, _dur, _rate, _ch = await next_task
+                except Exception as e:  # noqa: BLE001
+                    log.warning(
+                        "play_audio_file: skipping %s (%s: %s)",
+                        paths[i + 1].name, type(e).__name__, e,
+                    )
+                    pcm = b""  # skipped file contributes no audio
         # Drain handshake: eos を送ってから "drained" が戻るまで待つ。
         await ws.send_str(json.dumps({"type": "eos"}))
         try:
@@ -527,7 +553,11 @@ async def _stream_pcm_to_spk(
             "play_audio_file: playback ended early (%s): %s", type(e).__name__, e
         )
     finally:
-        # Always release the foreground-opened ws + session.
+        # Disown any in-flight prefetch decode (e.g. stopped mid-sequence: the
+        # ws was closed by /spk/stop, so the remaining files won't play) and
+        # always release the foreground-opened ws + session.
+        if next_task is not None and not next_task.done():
+            next_task.cancel()
         try:
             await ws.close()
         finally:
@@ -566,49 +596,29 @@ async def _play_audio_file_impl(paths: list[str] | str) -> str:
         else:
             resolved.append(_resolve_audio_path(path))
 
-    # 全ファイルを読んで wire format に揃え、合計 duration で上限を判定する。
-    # WAV パース + リサンプルは sync I/O + CPU 仕事なのでまとめて thread に
-    # オフロード。返すのは連結用の (name, pcm) と、ログ用の変換メモ。
-    def _read_all() -> tuple[list[tuple[str, bytes]], float, list[str]]:
-        clips: list[tuple[str, bytes]] = []
-        total_s = 0.0
-        notes: list[str] = []
-        for p in resolved:
-            pcm, dur, src_rate, src_ch = _read_and_convert_wav(p)
-            total_s += dur
-            if total_s > _AUDIO_PLAY_MAX_S:
-                raise ValueError(
-                    f"total duration {total_s:.1f}s exceeds limit "
-                    f"{_AUDIO_PLAY_MAX_S:.0f}s"
-                )
-            clips.append((p.name, pcm))
-            if (src_rate, src_ch) != (_AUDIO_IO_WIRE_RATE, _AUDIO_IO_WIRE_CHANNELS):
-                notes.append(f"{p.name} {src_rate}Hz/{src_ch}ch→wire")
-        return clips, total_s, notes
-
-    clips, duration_s, notes = await asyncio.to_thread(_read_all)
-    # 連結すると frame 境界が clip 境界をまたぐが、各 clip は wire format で
-    # サンプル境界が揃っているので連結 PCM もそのまま streaming できる
-    # (= ギャップレス)。
-    pcm = b"".join(clip_pcm for _, clip_pcm in clips)
     bytes_per_sample = _AUDIO_SAMPLE_WIDTH * _AUDIO_IO_WIRE_CHANNELS
     samples_per_frame = _AUDIO_IO_WIRE_RATE * _AUDIO_PLAY_FRAME_MS // 1000
     bytes_per_frame = samples_per_frame * bytes_per_sample
+    names = ", ".join(p.name for p in resolved)
 
-    names = ", ".join(name for name, _ in clips)
-    convert_note = f" [converted: {'; '.join(notes)}]" if notes else ""
+    # Decode only the FIRST file up front (in a thread): gives an immediate chunk
+    # to stream and surfaces a gross decode error (corrupt / non-PCM WAV) to the
+    # LLM before we claim playback started. Files 2..N are decoded just-in-time
+    # inside the streamer (prefetched one ahead), so playback starts fast, memory
+    # stays at ~one file, and there is no total-duration cap.
+    first_pcm, _first_dur, _first_rate, _first_ch = await asyncio.to_thread(
+        _read_and_convert_wav, resolved[0]
+    )
+    label = f"{len(resolved)} file(s) [{names}]"
     log.info(
-        "play_audio_file: %d file(s) (%.1fs total, %dHz/%dch wire) [%s]%s → %s",
-        len(clips), duration_s, _AUDIO_IO_WIRE_RATE, _AUDIO_IO_WIRE_CHANNELS,
-        names, convert_note, _AUDIO_IO_SPK_URL,
+        "play_audio_file: %d file(s) [%s] → %s (streamed one at a time)",
+        len(resolved), names, _AUDIO_IO_SPK_URL,
     )
 
     # Connect to audio-io in the FOREGROUND so a connection failure (audio-io
     # down, wrong host, bad track) raises here and is surfaced to the LLM via
-    # _safe_invoke — instead of being silently swallowed by the detached task,
-    # which used to make the agent claim "started" while nothing played. Only
-    # the realtime streaming is backgrounded, so playback stays non-blocking.
-    label = f"{duration_s:.1f}s from {len(clips)} file(s): {names}"
+    # _safe_invoke — instead of being silently swallowed by the detached task.
+    # Only the realtime streaming is backgrounded, so playback stays non-blocking.
     session = aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=None, sock_connect=10.0)
     )
@@ -620,15 +630,17 @@ async def _play_audio_file_impl(paths: list[str] | str) -> str:
             f"could not connect to audio output at {_AUDIO_IO_SPK_URL} "
             f"({type(e).__name__}: {e}) — audio was NOT played"
         ) from e
-    # Hand the live connection to the detached streamer (it closes ws+session).
+    # Hand the live connection + the resolved file list to the detached streamer;
+    # it decodes the rest one-at-a-time and closes ws+session when done.
     task = asyncio.create_task(
-        _stream_pcm_to_spk(session, ws, pcm, bytes_per_frame, label)
+        _stream_files_to_spk(session, ws, resolved, first_pcm, bytes_per_frame, label)
     )
     _PLAYBACK_TASKS.add(task)
     task.add_done_callback(_PLAYBACK_TASKS.discard)
     return (
-        f"started playing {label} in the background; you're free now. "
-        f"It stops at the end of the file, or immediately when stop_audio is called."
+        f"started playing {len(resolved)} file(s) in the background; you're free "
+        f"now. They play gapless in order and stop at the end, or immediately "
+        f"when stop_audio is called."
     )
 
 
@@ -675,10 +687,11 @@ def _build_play_audio_description() -> str:
         "for example a pre-rendered news summary or notification produced "
         "by another agent. Playback runs in the BACKGROUND: this returns "
         "immediately (you stay free to keep talking and handle other turns) "
-        "while the audio keeps playing, and it stops at the end of the file, "
-        "when stop_audio is called, or on wake-word barge-in. "
-        f"Total duration across all files is capped at {_AUDIO_PLAY_MAX_S:.0f} "
-        "seconds."
+        "while the audio keeps playing, and it stops at the end of the file(s), "
+        "when stop_audio is called, or on wake-word barge-in. Files play "
+        "gapless, streamed one at a time, so there is no length limit — for a "
+        "big set, tell the user it may run a while and that they can say "
+        "stop to end it."
     )
 
 
