@@ -32,12 +32,14 @@ import audioop  # 3.11 で deprecated、3.13 で stdlib から削除。3.11 pin 
 import difflib
 import json
 import logging
+import math
 import os
+import struct
 import sys
 import time
 import wave
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 from langchain_core.tools import tool
@@ -941,6 +943,358 @@ async def system_health() -> str:
     return await _safe_invoke("system_health", _system_health_impl())
 
 
+# --- timer (タイマー起動 + 起動中タイマーの確認 + キャンセル) ----------------
+#
+# タイマーは agent プロセス内の asyncio バックグラウンドタスク。発火 (= sleep
+# 満了) すると audio-io の別 track (既定 track=2) にアラーム音を直送する。
+# タイマー発火は「ユーザーのターン」が無い非同期イベントなので、TTS (track 0)
+# や play_audio_file (track 1) と違い orchestrator 経由で喋れない —— track 直送
+# が agent の唯一の自律出力チャネル。track を分けてあるので、発火時に TTS や
+# ファイル再生が鳴っていても WASAPI 共有ミックスで重なって聞こえる。
+#
+# 制約: タイマーは in-memory。agent を再起動すると消える (永続化は将来課題)。
+# アラームは track=2 → audio-io 側で runtime.playback_tracks >= 3 (track 0/1/2)
+# が必要。track が無いと audio-io が WS を即 close し、アラームは鳴らず warn
+# ログだけ残る。
+
+# アラーム送出先 track。play 用 SPK URL の ?track= を差し替えて track=2 を狙う。
+# AGENT_TIMER_SPK_URL で URL ごと、AGENT_TIMER_TRACK で track 番号だけ上書き可。
+_TIMER_TRACK: int = int(os.environ.get("AGENT_TIMER_TRACK", "2"))
+
+
+def _derive_track_url(spk_url: str, track: int) -> str:
+    """spk WS URL の `?track=` を `track` に差し替えた URL を返す。
+
+    他のクエリは温存して track だけ差し替える。空 URL なら空文字 (= 機能無効)。
+    """
+    if not spk_url:
+        return ""
+    parts = urlsplit(spk_url)
+    q = parse_qs(parts.query)
+    q["track"] = [str(track)]
+    new_query = urlencode({k: v[-1] for k, v in q.items()})
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+
+
+_TIMER_SPK_URL: str = (
+    os.environ.get("AGENT_TIMER_SPK_URL", "").strip()
+    or _derive_track_url(_AUDIO_IO_SPK_URL, _TIMER_TRACK)
+)
+# タイマー長の上限 (秒)。誤認識で「3分」が「300分」等にならない保険＋暴走防止。
+_TIMER_MAX_S: float = float(os.environ.get("AGENT_TIMER_MAX_S", "86400"))  # 24h
+
+# 起動中タイマーの registry: id -> {label, fire_at(monotonic), duration_s, task}。
+# check/cancel が参照する。発火 or cancel で entry を pop する。
+_TIMERS: dict[int, dict] = {}
+# タイマー id の採番 (単調増加、再利用しない)。agent 再起動でリセット。
+_timer_seq: int = 0
+# タスクの強参照保持。registry は発火時に entry を pop するので、それだけだと
+# アラーム再生中にタスクが GC されうる。play_audio_file の _PLAYBACK_TASKS と同型。
+_TIMER_TASKS: set = set()
+# 生成アラーム PCM の memo (決定的なので 1 度作れば使い回す)。
+_ALARM_PCM_CACHE: bytes | None = None
+
+
+def _fmt_duration(sec: float) -> str:
+    """秒を「X時間Y分Z秒」の日本語表記に。ゼロの単位は省略。0 以下は「0秒」。"""
+    s = int(round(sec))
+    if s <= 0:
+        return "0秒"
+    h, rem = divmod(s, 3600)
+    m, s2 = divmod(rem, 60)
+    out = ""
+    if h:
+        out += f"{h}時間"
+    if m:
+        out += f"{m}分"
+    if s2:
+        out += f"{s2}秒"
+    return out
+
+
+def _gen_tone(freq: float, dur_s: float, rate: int, amp: float = 0.5) -> bytes:
+    """単一周波数のビープ (s16le mono) を生成。両端 5ms フェードでクリック除去。"""
+    n = int(rate * dur_s)
+    fade = max(1, int(rate * 0.005))
+    peak = amp * 32767.0
+    samples = []
+    for i in range(n):
+        if i < fade:
+            env = i / fade
+        elif i >= n - fade:
+            env = max(0.0, (n - i) / fade)
+        else:
+            env = 1.0
+        samples.append(int(peak * env * math.sin(2.0 * math.pi * freq * i / rate)))
+    return struct.pack("<%dh" % n, *samples)
+
+
+def _alarm_pcm() -> bytes:
+    """キッチンタイマー風「ピピピピ」を 3 回繰り返した s16le PCM を生成する。"""
+    rate = _AUDIO_IO_WIRE_RATE
+    beep = _gen_tone(880.0, 0.12, rate)
+    short_gap = b"\x00\x00" * int(rate * 0.08)
+    long_gap = b"\x00\x00" * int(rate * 0.40)
+    burst = beep + short_gap + beep + short_gap + beep + short_gap + beep
+    pcm = (burst + long_gap) * 3
+    # wire がステレオなら mono→stereo に複製 (既定は mono なので通常は素通り)。
+    if _AUDIO_IO_WIRE_CHANNELS == 2:
+        pcm = audioop.tostereo(pcm, _AUDIO_SAMPLE_WIDTH, 1.0, 1.0)
+    return pcm
+
+
+def _alarm_pcm_cached() -> bytes:
+    """アラーム PCM を返す。AGENT_TIMER_ALARM_WAV があればそれを wire format に
+    変換して使い、無ければ生成ビープ。結果は 1 度だけ作って memo する。"""
+    global _ALARM_PCM_CACHE
+    if _ALARM_PCM_CACHE is not None:
+        return _ALARM_PCM_CACHE
+    pcm: bytes | None = None
+    custom = os.environ.get("AGENT_TIMER_ALARM_WAV", "").strip()
+    if custom:
+        try:
+            p = _resolve_audio_path(custom)
+            pcm, _d, _r, _c = _read_and_convert_wav(p)
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "timer: custom alarm WAV %r unusable (%s: %s); using generated beep",
+                custom, type(e).__name__, e,
+            )
+            pcm = None
+    if pcm is None:
+        pcm = _alarm_pcm()
+    _ALARM_PCM_CACHE = pcm
+    return pcm
+
+
+async def _play_pcm_on_track(spk_url: str, pcm: bytes, label: str) -> None:
+    """生 PCM を指定 track の /spk へ realtime 送信し、drain して閉じる。
+
+    play_audio_file の送信ループと同型だが、対象は in-memory の単一バッファ
+    (ファイル解決 / prefetch 無し)。発火は非同期でターンが無いため、失敗は
+    raise せず warn ログのみ (呼び出し元に拾い手がいない)。track 未設定だと
+    audio-io が WS を即 close するので、その場合もここで warn に落ちる。"""
+    if not spk_url:
+        log.warning("timer alarm: no spk url configured; cannot play (%s)", label)
+        return
+    bytes_per_sample = _AUDIO_SAMPLE_WIDTH * _AUDIO_IO_WIRE_CHANNELS
+    samples_per_frame = _AUDIO_IO_WIRE_RATE * _AUDIO_PLAY_FRAME_MS // 1000
+    bytes_per_frame = samples_per_frame * bytes_per_sample
+    session = aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=None, sock_connect=10.0)
+    )
+    try:
+        ws = await session.ws_connect(spk_url)
+    except Exception as e:  # noqa: BLE001
+        await session.close()
+        log.warning(
+            "timer alarm: could not connect to %s (%s: %s) — alarm NOT played (%s)",
+            spk_url, type(e).__name__, e, label,
+        )
+        return
+    try:
+        start = time.monotonic()
+        frame_idx = 0
+        offset = 0
+        while offset < len(pcm):
+            chunk = pcm[offset : offset + bytes_per_frame]
+            offset += len(chunk)
+            if len(chunk) % 2 != 0:
+                chunk = chunk + b"\x00"
+            await ws.send_bytes(chunk)
+            frame_idx += 1
+            target = start + frame_idx * _AUDIO_PLAY_FRAME_MS / 1000.0
+            sleep_for = target - time.monotonic()
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
+        await ws.send_str(json.dumps({"type": "eos"}))
+        try:
+            await asyncio.wait_for(ws.receive(), timeout=_AUDIO_DRAIN_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            log.warning("timer alarm: drain timed out (%s)", label)
+        log.info("timer alarm: played (%s)", label)
+    except Exception as e:  # noqa: BLE001
+        log.warning(
+            "timer alarm: ended early (%s: %s) — is audio-io track configured? (%s)",
+            type(e).__name__, e, label,
+        )
+    finally:
+        try:
+            await ws.close()
+        finally:
+            await session.close()
+
+
+async def _timer_fire(timer_id: int, label: str) -> None:
+    """発火処理: registry から外し、track にアラームを流す。"""
+    _TIMERS.pop(timer_id, None)
+    tag = f" ({label})" if label else ""
+    log.info("timer #%d fired%s; playing alarm on %s", timer_id, tag, _TIMER_SPK_URL)
+    await _play_pcm_on_track(_TIMER_SPK_URL, _alarm_pcm_cached(), f"timer #{timer_id}{tag}")
+
+
+async def _timer_task(timer_id: int, seconds: float, label: str) -> None:
+    """1 本のタイマー。sleep 満了で発火、cancel されたら静かに終了。"""
+    try:
+        await asyncio.sleep(seconds)
+    except asyncio.CancelledError:
+        log.info("timer #%d cancelled before firing", timer_id)
+        return
+    await _timer_fire(timer_id, label)
+
+
+async def _start_timer_impl(seconds, label: str = "") -> str:
+    """start_timer 本体。タスクを起こして registry に登録、即 return する。"""
+    global _timer_seq
+    if not _TIMER_SPK_URL:
+        raise RuntimeError(
+            "AGENT_AUDIO_IO_SPK_URL is not set — a timer has no way to sound "
+            "its alarm, so timers are disabled"
+        )
+    try:
+        seconds = float(seconds)
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"seconds must be a number of seconds, got {seconds!r}"
+        ) from e
+    if seconds <= 0:
+        raise ValueError("timer duration must be positive (seconds > 0)")
+    if seconds > _TIMER_MAX_S:
+        raise ValueError(
+            f"timer too long ({_fmt_duration(seconds)}); max is "
+            f"{_fmt_duration(_TIMER_MAX_S)}"
+        )
+    label = (label or "").strip()
+    _timer_seq += 1
+    tid = _timer_seq
+    task = asyncio.create_task(_timer_task(tid, seconds, label))
+    _TIMER_TASKS.add(task)
+    _TIMERS[tid] = {
+        "label": label,
+        "fire_at": time.monotonic() + seconds,
+        "duration_s": seconds,
+        "task": task,
+    }
+
+    def _done(t: asyncio.Task, tid: int = tid) -> None:
+        # 強参照を解放しつつ、異常終了でも registry に残骸を残さない
+        # (正常発火 / cancel は既に pop 済みなので no-op)。
+        _TIMER_TASKS.discard(t)
+        _TIMERS.pop(tid, None)
+
+    task.add_done_callback(_done)
+    log.info(
+        "timer #%d set for %s%s",
+        tid, _fmt_duration(seconds), f" ({label})" if label else "",
+    )
+    lead = f"「{label}」の" if label else ""
+    return f"{lead}{_fmt_duration(seconds)}タイマーをかけたよ。（番号{tid}）"
+
+
+async def _check_timers_impl() -> str:
+    """check_timers 本体。起動中タイマーと残り時間を日本語サマリで返す。"""
+    if not _TIMERS:
+        return "今は動いてるタイマーは無いよ。"
+    now = time.monotonic()
+    items = sorted(_TIMERS.items(), key=lambda kv: kv[1]["fire_at"])
+    parts = []
+    for tid, e in items:
+        remaining = max(0.0, e["fire_at"] - now)
+        who = f"「{e['label']}」" if e["label"] else f"番号{tid}"
+        parts.append(f"{who}があと{_fmt_duration(remaining)}")
+    if len(parts) == 1:
+        return parts[0] + "だよ。"
+    return f"タイマーが{len(parts)}件。" + "、".join(parts) + "。"
+
+
+async def _cancel_timer_impl(which: str = "") -> str:
+    """cancel_timer 本体。番号 / ラベル部分一致 / 「全部」/ 唯一 で対象を選び cancel。"""
+    if not _TIMERS:
+        return "今は動いてるタイマーは無いよ。"
+    which = (which or "").strip()
+    if which in ("全部", "すべて", "ぜんぶ", "みんな", "all", "ALL"):
+        target_ids = list(_TIMERS.keys())
+    elif not which:
+        if len(_TIMERS) == 1:
+            target_ids = [next(iter(_TIMERS))]
+        else:
+            opts = "、".join((e["label"] or f"番号{t}") for t, e in _TIMERS.items())
+            return f"タイマーが{len(_TIMERS)}件あるよ。どれ止める？（{opts}）"
+    elif which.isdigit() and int(which) in _TIMERS:
+        target_ids = [int(which)]
+    else:
+        target_ids = [t for t, e in _TIMERS.items() if which in (e["label"] or "")]
+        if not target_ids:
+            return f"「{which}」に合うタイマーが見つからないよ。"
+    cancelled = []
+    for tid in target_ids:
+        e = _TIMERS.pop(tid, None)
+        if e:
+            e["task"].cancel()
+            cancelled.append(e["label"] or f"番号{tid}")
+    return "、".join(cancelled) + "のタイマーを止めたよ。"
+
+
+def _build_start_timer_description() -> str:
+    """start_timer の description を起動時 env (_TIMER_SPK_URL の有無) で生成。"""
+    if not _TIMER_SPK_URL:
+        return (
+            "Start a countdown timer.\n\n"
+            "**CURRENTLY UNAVAILABLE** — AGENT_AUDIO_IO_SPK_URL is not set, so "
+            "there is no audio output to sound the alarm and timers are "
+            "disabled here. Do NOT call this tool; tell the user in one "
+            "sentence that timers aren't configured in this environment."
+        )
+    return (
+        "Start a countdown timer that sounds an alarm when it finishes.\n\n"
+        "`seconds` is the total duration in seconds — YOU convert the user's "
+        "spoken duration to an integer number of seconds (e.g. 「3分」→180, "
+        "「1分30秒」→90, 「1時間」→3600, 「30秒」→30). `label` is an optional "
+        "short name to tell multiple timers apart (e.g. 「パスタ」「洗濯」); "
+        "omit it if the user didn't give one.\n\n"
+        "Runs in the BACKGROUND: returns immediately and you stay free for "
+        "other turns. When it finishes, an alarm plays on the speaker on its "
+        "own audio track (it mixes over any TTS or file playback). Confirm the "
+        "duration you set back to the user so they know you heard it right.\n\n"
+        "Call this when the user asks to set or start a timer/alarm for a "
+        "duration — for example 「3分タイマーかけて」「10分後に教えて」"
+        "「パスタ茹でるから8分タイマーセットして」."
+    )
+
+
+@tool(description=_build_start_timer_description())
+async def start_timer(seconds: int, label: str = "") -> str:
+    # description は @tool(description=...) で動的注入。非 terminal: 返り値
+    # (セットした長さの確認) を LLM が読み上げてユーザーに復唱する。
+    return await _safe_invoke("start_timer", _start_timer_impl(seconds, label))
+
+
+@tool
+async def check_timers() -> str:
+    """List the countdown timers currently running and how long each has left.
+
+    Takes no arguments. Call this when the user asks about running timers —
+    for example 「タイマーあと何分?」「タイマー残りどれくらい?」「今タイマー
+    動いてる?」. Read the result back to the user as your spoken reply.
+    """
+    return await _safe_invoke("check_timers", _check_timers_impl())
+
+
+@tool
+async def cancel_timer(which: str = "") -> str:
+    """Cancel a running countdown timer so its alarm won't sound.
+
+    `which` selects the timer: a label substring (e.g. 「パスタ」), a timer
+    number, or 「全部」 / "all" to cancel every timer. Omit it to cancel the
+    only running timer when exactly one is active; if it's ambiguous the
+    result lists the timers so you can ask the user which one.
+
+    Call this when the user asks to stop or cancel a timer — for example
+    「タイマー止めて」「パスタタイマー消して」「タイマー全部キャンセル」.
+    """
+    return await _safe_invoke("cancel_timer", _cancel_timer_impl(which))
+
+
 @tool
 async def read_file(path: str) -> str:
     """Read a file and return its contents verbatim.
@@ -989,7 +1343,17 @@ def all_tools() -> list:
 
     issue #19 の段階的な追加に伴い後段の PR で別 tool が積まれる可能性あり。
     """
-    return [run_shell, read_file, web_search, play_audio_file, stop_audio, system_health]
+    return [
+        run_shell,
+        read_file,
+        web_search,
+        play_audio_file,
+        stop_audio,
+        system_health,
+        start_timer,
+        check_timers,
+        cancel_timer,
+    ]
 
 
 # tool name → ack phrase。None なら ack 挿入なし。
@@ -1017,6 +1381,11 @@ TOOL_ACK_PHRASES: dict[str, str | None] = {
     # system_health は全サービスを並列 probe する間 (~2.5s) の無音を埋める ack。
     # 結果は非 terminal なので、この ack の後に LLM が診断サマリを読み上げる。
     "system_health": os.environ.get("AGENT_TOOL_ACK_SYSTEM_HEALTH", "確認するね。"),
+    # timer 系は即応 (タスク登録 / registry 参照 / cancel)。filler 不要なので
+    # None。非 terminal なので直後に LLM が結果 (確認文・残り時間) を読み上げる。
+    "start_timer": None,
+    "check_timers": None,
+    "cancel_timer": None,
 }
 
 
@@ -1038,6 +1407,9 @@ TOOL_ACK_PHRASES: dict[str, str | None] = {
 #   python tools.py play_audio_file share/a.wav share/b.wav   # 連続再生
 #   python tools.py stop_audio                                 # 再生停止
 #   python tools.py system_health                              # 自己診断
+#   python tools.py start_timer seconds=10 label=test          # タイマー起動
+#   python tools.py check_timers                               # 起動中の確認
+#   python tools.py cancel_timer which=test                    # 取消
 #   python tools.py run_shell command="ls -la"
 def _cli_list(tools: list) -> None:
     print("available tools:")

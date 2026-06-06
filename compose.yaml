@@ -479,6 +479,23 @@ services:
       # of {name,url,kind} to replace the built-in probe list). Set either in
       # .env if you add services or change ports.
       AGENT_TOOL_ACK_SYSTEM_HEALTH: "${AGENT_TOOL_ACK_SYSTEM_HEALTH:-確認するね。}"
+      # timer tools (start_timer / check_timers / cancel_timer). A timer is a
+      # background task in the agent; when it fires it streams an alarm sound
+      # to audio-io on its OWN track (default track=2, derived from
+      # AGENT_AUDIO_IO_SPK_URL above by swapping ?track=). That keeps the alarm
+      # off the TTS track (0) and the play_audio_file track (1) so it mixes
+      # OVER whatever else is playing. REQUIREMENT: audio-io must run with
+      # `runtime.playback_tracks >= 3` (tracks 0/1/2) — otherwise audio-io
+      # rejects the track and the alarm silently doesn't sound. Timers are
+      # in-memory (lost on agent restart).
+      #   AGENT_TIMER_ALARM_WAV — path (under AGENT_FILE_ROOT) to a custom
+      #     alarm WAV; empty (default) generates a kitchen-timer beep.
+      #   AGENT_TIMER_MAX_S — reject timers longer than this (default 86400=24h;
+      #     guards against an ASR misread like 「3分」→「300分」).
+      #   AGENT_TIMER_TRACK / AGENT_TIMER_SPK_URL — advanced: change the alarm
+      #     track number, or override the whole alarm /spk URL.
+      AGENT_TIMER_ALARM_WAV: "${AGENT_TIMER_ALARM_WAV:-}"
+      AGENT_TIMER_MAX_S: "${AGENT_TIMER_MAX_S:-86400}"
     volumes:
       - agent-data:/data
       # Host share dir → /workspace/share (read-only). The host path is
