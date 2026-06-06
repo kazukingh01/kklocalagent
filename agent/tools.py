@@ -758,6 +758,189 @@ async def stop_audio() -> str:
     return await _safe_invoke("stop_audio", _stop_audio_impl())
 
 
+# --- system_health (自己診断「システムチェックして」, Phase 1) ---------------
+#
+# 各サービスの liveness を 1 ショットで並列集約し、短い日本語サマリを返す
+# self-diagnostic tool。対象 URL は compose ネットワーク内のサービス名 +
+# コンテナ内部ポート (host 公開ポートではない — agent 自身がネットワーク内に
+# いるため)。audio-io だけは Windows ネイティブ (compose 外) なので、再生 tool
+# と同じ SPK URL から host:port を借りて /health を導出する。
+#
+# terminal tool にはしない: 結果が動的 (どれが落ちているか) なので固定 ack
+# では伝わらない。非 terminal にして LLM に ToolMessage (このサマリ) を読ませ、
+# そのまま読み上げさせる。probe 中の無音は "確認するね。" の ack で埋める。
+
+# ollama (llm) の base URL。agent が chat に使うのと同じ env を流用する。
+_OLLAMA_URL: str = os.environ.get("AGENT_OLLAMA_URL", "http://llm:11434").rstrip("/")
+# 各 probe の総タイムアウト (秒)。全 probe は gather で並列に走るので自己診断
+# 全体もおおむねこの時間内に返る。落ちている対象を素早く「不調」と判定するため
+# 短め。
+_HEALTH_TIMEOUT_S: float = float(os.environ.get("AGENT_HEALTH_TIMEOUT_S", "2.5"))
+
+
+def _derive_audio_io_health_url(spk_url: str) -> str:
+    """/spk WS URL から audio-io の /health HTTP URL を導出する。
+
+    `ws://host:7010/spk?track=1` → `http://host:7010/health`。audio-io は
+    Windows ネイティブ (compose 外) で、agent が知っている唯一の到達情報が
+    SPK URL なので、そこから scheme (ws→http) と host:port だけ借り、path は
+    /health に差し替え、track クエリは捨てる。SPK URL 未設定なら空文字を返し、
+    audio-io は probe 対象から外れる。
+    """
+    if not spk_url:
+        return ""
+    parts = urlsplit(spk_url)
+    scheme = {"ws": "http", "wss": "https"}.get(parts.scheme, parts.scheme)
+    return urlunsplit((scheme, parts.netloc, "/health", "", ""))
+
+
+_AUDIO_IO_HEALTH_URL: str = _derive_audio_io_health_url(_AUDIO_IO_SPK_URL)
+
+
+def _default_health_targets() -> list[dict]:
+    """probe 対象のデフォルト一覧。name は音声で読み上げる前提の短い日本語。
+
+    kind:
+      "http"    … HTTP 2xx のみ healthy (liveness + 軽い readiness)。
+      "connect" … HTTP 応答が返れば (ステータス不問) healthy。POST 専用
+                  エンドポイント (whisper.cpp /inference) 用 — GET は 4xx に
+                  なるが「サーバが応答している」= 生きている証拠。
+
+    除外: voice-activity-detection は health エンドポイントを持たない。
+
+    NB: wake-word-detection の /health は「モデル loaded かつ mic WS 接続済」の
+    ときだけ 200 を返す (それ以外 503)。つまり audio-io.exe が落ちて /mic に
+    繋がらないと WWD も 503 になるので、この probe は audio-io 断も間接的に拾う。
+    """
+    targets: list[dict] = []
+    # audio-io (Windows ネイティブ)。SPK URL 未設定ならスキップ。
+    if _AUDIO_IO_HEALTH_URL:
+        targets.append({"name": "音声入出力", "url": _AUDIO_IO_HEALTH_URL, "kind": "http"})
+    # 以降は compose ネットワーク内のサービス。GET /api/tags 200 = ollama 生存
+    # (Phase 1 は liveness のみ — モデルの load 状態確認は Phase 2 に回す)。
+    targets += [
+        {"name": "言語モデル", "url": f"{_OLLAMA_URL}/api/tags", "kind": "http"},
+        {"name": "司令塔", "url": "http://orchestrator:7000/health", "kind": "http"},
+        {
+            "name": "音声認識",
+            "url": "http://automatic-speech-recognition:8080/inference",
+            "kind": "connect",
+        },
+        {"name": "音声合成", "url": "http://text-to-speech:50021/version", "kind": "http"},
+        {"name": "音声合成の送信", "url": "http://tts-streamer:7070/health", "kind": "http"},
+        {"name": "ウェイクワード", "url": "http://wake-word-detection:7030/health", "kind": "http"},
+    ]
+    return targets
+
+
+def _health_targets() -> list[dict]:
+    """probe 対象。env `AGENT_HEALTH_TARGETS` (JSON 配列) があればそれで上書き。
+
+    形式: `[{"name": "...", "url": "http://...", "kind": "http"|"connect"}, ...]`。
+    構成を変えた (サービス追加 / ポート変更) 際にコード変更なしで追従するための
+    逃げ道。パース失敗時は warning を出してデフォルトに倒す。
+    """
+    raw = os.environ.get("AGENT_HEALTH_TARGETS", "").strip()
+    if not raw:
+        return _default_health_targets()
+    try:
+        parsed = json.loads(raw)
+        targets = [
+            {
+                "name": str(t["name"]),
+                "url": str(t["url"]),
+                "kind": str(t.get("kind", "http")),
+            }
+            for t in parsed
+        ]
+        if not targets:
+            raise ValueError("empty target list")
+        return targets
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        log.warning("AGENT_HEALTH_TARGETS invalid (%s); using defaults", e)
+        return _default_health_targets()
+
+
+async def _probe_url(session: aiohttp.ClientSession, target: dict) -> dict:
+    """1 対象を 1 回 GET して `{name, ok, detail}` を返す。
+
+    例外は全て握りつぶして ok=False に変換する — 1 つ落ちている対象が
+    `asyncio.gather` 全体を倒さないため。detail は log / デバッグ用で、音声
+    サマリには name しか出さない。
+    """
+    name = target["name"]
+    url = target["url"]
+    kind = target.get("kind", "http")
+    try:
+        async with session.get(url) as resp:
+            status = resp.status
+            # "connect" は応答が返った時点で生存確認 (POST 専用 endpoint 対策)。
+            # "http" は 2xx のみ healthy (例: WWD は未接続だと 503 を返す)。
+            ok = True if kind == "connect" else (200 <= status < 300)
+            return {"name": name, "ok": ok, "detail": f"HTTP {status}"}
+    except asyncio.TimeoutError:
+        # aiohttp の ServerTimeoutError もここで捕捉される (asyncio.TimeoutError
+        # のサブクラス)。タイムアウト = 応答なし = 不調扱い。
+        return {"name": name, "ok": False, "detail": "timeout"}
+    except aiohttp.ClientError as e:
+        # 接続拒否 / 名前解決失敗 (コンテナ未起動) 等。
+        return {"name": name, "ok": False, "detail": type(e).__name__}
+    except Exception as e:  # noqa: BLE001
+        return {"name": name, "ok": False, "detail": f"{type(e).__name__}: {e}"}
+
+
+async def _system_health_impl() -> str:
+    """system_health 本体。全 probe を並列に走らせ短い日本語サマリを返す。"""
+    targets = _health_targets()
+    timeout = aiohttp.ClientTimeout(total=_HEALTH_TIMEOUT_S)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        results = await asyncio.gather(*(_probe_url(session, t) for t in targets))
+    for r in results:
+        log.info("system_health: %s ok=%s (%s)", r["name"], r["ok"], r["detail"])
+    unhealthy = [r for r in results if not r["ok"]]
+    total = len(results)
+    healthy_n = total - len(unhealthy)
+    log.info(
+        "system_health summary: %d/%d ok, down=%s",
+        healthy_n,
+        total,
+        [r["name"] for r in unhealthy],
+    )
+    if not unhealthy:
+        return f"システムは正常だよ。{total}個のサービス、全部動いてる。"
+    if healthy_n == 0:
+        # 全滅。個別に名前を並べても情報量がない (むしろ network/DNS 障害の
+        # 可能性が高い) ので、まとめて伝える。
+        return f"全部のサービスが応答してないよ。{total}個とも不調。"
+    names = "、".join(r["name"] for r in unhealthy)
+    return f"{names}が不調だよ。ほかの{healthy_n}個は正常。"
+
+
+def _build_system_health_description() -> str:
+    """system_health の description を起動時 env (probe 対象) に応じて生成する。"""
+    names = "、".join(t["name"] for t in _health_targets())
+    return (
+        "Run a self-diagnostic of the voice-assistant system's own backend "
+        "services. Probes each service's health endpoint concurrently and "
+        "returns a short Japanese summary of which are alive and which are "
+        "not responding. Takes no arguments and is read-only (safe to call "
+        "anytime).\n\n"
+        f"Services checked: {names}.\n\n"
+        "Call this when the user asks to run a system check — for example "
+        "「システムチェックして」「システムチェック」. When it returns, read the "
+        "summary back to the user as your spoken reply; do not invent or "
+        "rename services it did not mention."
+    )
+
+
+@tool(description=_build_system_health_description())
+async def system_health() -> str:
+    # description は @tool(description=...) で動的注入。詳細は
+    # `_build_system_health_description` の docstring を参照。非 terminal tool
+    # なので、返り値 (サマリ) は LLM が読み上げる。
+    return await _safe_invoke("system_health", _system_health_impl())
+
+
 @tool
 async def read_file(path: str) -> str:
     """Read a file and return its contents verbatim.
@@ -806,7 +989,7 @@ def all_tools() -> list:
 
     issue #19 の段階的な追加に伴い後段の PR で別 tool が積まれる可能性あり。
     """
-    return [run_shell, read_file, web_search, play_audio_file, stop_audio]
+    return [run_shell, read_file, web_search, play_audio_file, stop_audio, system_health]
 
 
 # tool name → ack phrase。None なら ack 挿入なし。
@@ -831,6 +1014,9 @@ TOOL_ACK_PHRASES: dict[str, str | None] = {
     # stop は即応かつ決定的なので、2回目の LLM 生成を省く (agent 側で stop_audio
     # を terminal tool 扱いにして即 END)。確認文はこの固定 ack で返す。
     "stop_audio": os.environ.get("AGENT_TOOL_ACK_STOP_AUDIO", "止めたよ。"),
+    # system_health は全サービスを並列 probe する間 (~2.5s) の無音を埋める ack。
+    # 結果は非 terminal なので、この ack の後に LLM が診断サマリを読み上げる。
+    "system_health": os.environ.get("AGENT_TOOL_ACK_SYSTEM_HEALTH", "確認するね。"),
 }
 
 
@@ -851,6 +1037,7 @@ TOOL_ACK_PHRASES: dict[str, str | None] = {
 #   python tools.py play_audio_file /workspace/share/foo.wav
 #   python tools.py play_audio_file share/a.wav share/b.wav   # 連続再生
 #   python tools.py stop_audio                                 # 再生停止
+#   python tools.py system_health                              # 自己診断
 #   python tools.py run_shell command="ls -la"
 def _cli_list(tools: list) -> None:
     print("available tools:")
