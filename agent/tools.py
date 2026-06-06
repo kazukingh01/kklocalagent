@@ -414,6 +414,54 @@ def _resolve_audio_path(path: str) -> Path:
     return p
 
 
+def _is_audio_glob(path: str) -> bool:
+    """True if `path` looks like a glob pattern (vs a single file path)."""
+    return any(c in path for c in ("*", "?", "["))
+
+
+def _expand_audio_glob(pattern: str) -> list[Path]:
+    """Expand a glob (e.g. `*.wav`, `news/2026*.wav`, `**/*.wav`) to matching
+    WAV files under `_FILE_ROOT`, sorted by name.
+
+    Confined to the root: an absolute pattern must be inside it, `..` is
+    rejected, and every match is re-checked with `relative_to(root)` (defence
+    in depth). Non-`.wav` matches are skipped — the tool only plays WAV — so a
+    bare `*` plays just the audio files. Raises if nothing matches so the LLM
+    gets a clear error instead of silent no-op."""
+    if not _FILE_ROOT:
+        raise ValueError(
+            f"cannot expand audio glob {pattern!r}: AGENT_FILE_ROOT is not set"
+        )
+    root = Path(_FILE_ROOT).resolve()
+    pat = Path(pattern)
+    if pat.is_absolute():
+        try:
+            rel = pat.relative_to(root)
+        except ValueError as e:
+            raise ValueError(
+                f"glob {pattern!r} is outside the share root {root}"
+            ) from e
+    else:
+        rel = pat
+    if ".." in rel.parts:
+        raise ValueError(f"glob must not contain '..': {pattern!r}")
+    matches: list[Path] = []
+    for p in sorted(root.glob(str(rel))):
+        if not p.is_file() or p.suffix.lower() != ".wav":
+            continue
+        rp = p.resolve()
+        try:
+            rp.relative_to(root)
+        except ValueError:
+            continue
+        matches.append(rp)
+    if not matches:
+        raise FileNotFoundError(
+            f"no .wav files match glob {pattern!r} under the share root"
+        )
+    return matches
+
+
 # Detached playback tasks (fire-and-forget). Hold strong refs so the event
 # loop doesn't GC a running task mid-stream; the done-callback drops them.
 _PLAYBACK_TASKS: set = set()
@@ -508,10 +556,15 @@ async def _play_audio_file_impl(paths: list[str] | str) -> str:
     if not paths:
         raise ValueError("no audio file given; pass at least one WAV path")
 
-    # 1 件でも見つからない / 不正なら、再生を一切始める前に弾く。
-    # 連続再生は単一 drain なので、途中で中断するより全件検証してから
-    # 流し始める方が「半分だけ鳴った」状態を避けられる。
-    resolved = [_resolve_audio_path(path) for path in paths]
+    # 各 entry をファイル or glob として解決する。glob (`*.wav` 等) は root 配下の
+    # 一致 .wav を名前順で展開。1 件でも見つからない / 不正なら、再生を一切始める
+    # 前に弾く (連続再生は単一 drain なので、途中中断より全件検証が安全)。
+    resolved: list[Path] = []
+    for path in paths:
+        if _is_audio_glob(path):
+            resolved.extend(_expand_audio_glob(path))
+        else:
+            resolved.append(_resolve_audio_path(path))
 
     # 全ファイルを読んで wire format に揃え、合計 duration で上限を判定する。
     # WAV パース + リサンプルは sync I/O + CPU 仕事なのでまとめて thread に
@@ -596,8 +649,11 @@ def _build_play_audio_description() -> str:
         f"`paths` is a list of WAV file paths, each inside the share root "
         f"`{_FILE_ROOT}`. Give them relative to that root (e.g. "
         f"`share/foo.wav`) or as an absolute path within it (e.g. "
-        f"`/workspace/share/foo.wav`). Paths outside the root (including "
-        f"via `..` or symlinks) are rejected."
+        f"`/workspace/share/foo.wav`). An entry may also be a glob like "
+        f"`*.wav`, `news/2026*.wav`, or `**/*.wav`, which expands (sorted by "
+        f"name) to every matching .wav under the root — useful when you don't "
+        f"know exact filenames. Paths/globs outside the root (including via "
+        f"`..` or symlinks) are rejected."
         if _FILE_ROOT
         else "`paths` is a list of WAV file paths (AGENT_FILE_ROOT is unset, "
         "so playback is effectively disabled)."
