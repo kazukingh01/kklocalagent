@@ -106,6 +106,27 @@ MAX_HISTORY_TOKENS = int(os.environ.get("AGENT_MAX_HISTORY_TOKENS", "4096"))
 # whole model-call of latency. A failed one falls back to the LLM so it can
 # explain. See build_react_graph's terminal-tool routing.
 TERMINAL_TOOLS = {"stop_audio"}
+# Log every LLM turn's raw output (tool_calls / content / additional_kwargs incl.
+# any reasoning) at INFO so tool-calling can be debugged — e.g. did the model
+# actually emit `stop_audio`, or just reason+text? Set AGENT_LOG_LLM_RAW=false to
+# quiet it once things are working.
+LOG_LLM_RAW = os.environ.get("AGENT_LOG_LLM_RAW", "true").lower() in ("1", "true", "yes")
+# Control gemma4-style "thinking" (ollama `think`, surfaced by ChatOllama's
+# `reasoning`). In a voice agent reasoning adds latency and was suppressing tool
+# calls (the model reasoned + replied with text instead of calling stop_audio),
+# so default it OFF. AGENT_REASONING: off/false (default) → no reasoning;
+# on/true → reasoning on (kept out of content, in additional_kwargs); default/
+# model → leave it to the model.
+def _reasoning_setting():
+    v = os.environ.get("AGENT_REASONING", "off").strip().lower()
+    if v in ("on", "true", "1", "yes"):
+        return True
+    if v in ("default", "model", "none"):
+        return None
+    return False
+
+
+REASONING = _reasoning_setting()
 # Recovery line spoken whenever a turn would otherwise end with no
 # spoken text — either the ReAct loop exceeded RECURSION_LIMIT, or the
 # stream finished after a failed/denied tool without the LLM producing
@@ -310,7 +331,23 @@ def build_react_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
         messages = _trim_history(list(state["messages"]))
         if system_text:
             messages = [SystemMessage(content=system_text), *messages]
-        return {"messages": [await llm_with_tools.ainvoke(messages)]}
+        response = await llm_with_tools.ainvoke(messages)
+        if LOG_LLM_RAW:
+            # Raw output so we can see whether the model emitted a tool_call
+            # (e.g. stop_audio) or just text/reasoning. additional_kwargs is
+            # where ollama/gemma4 reasoning content lands.
+            content = (
+                response.content
+                if isinstance(response.content, str)
+                else str(response.content)
+            )
+            log.info(
+                "llm output: tool_calls=%s | content=%r | additional_kwargs=%r",
+                [(tc.get("name"), tc.get("args")) for tc in (response.tool_calls or [])],
+                content[:1000],
+                dict(response.additional_kwargs or {}),
+            )
+        return {"messages": [response]}
 
     def route_after_tools(state: MessagesState) -> str:
         # Look at the ToolMessages this tools step just appended (the trailing
@@ -388,6 +425,7 @@ async def warm_system_prefix() -> None:
     # the request — and thus the cached prefix — matches the react path exactly.
     warm_llm = ChatOllama(
         base_url=OLLAMA_BASE_URL, model=MODEL_NAME, temperature=0, num_predict=2,
+        reasoning=REASONING,
     )
     target = warm_llm.bind_tools(all_tools()) if TOOLS_ENABLED else warm_llm
     # ollama may still be loading right after this container starts; retry briefly.
@@ -650,6 +688,9 @@ async def amain() -> None:
         base_url=OLLAMA_BASE_URL,
         model=MODEL_NAME,
         temperature=0,
+        # gemma4 の reasoning を既定 off に (AGENT_REASONING)。思考はレイテンシ増＆
+        # ツール呼び出し阻害になりやすいので。
+        reasoning=REASONING,
     )
 
     # Open the checkpoint DB once and keep it open for the process
