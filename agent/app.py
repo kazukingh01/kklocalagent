@@ -112,13 +112,17 @@ TERMINAL_TOOLS = {"stop_audio"}
 # quiet it once things are working.
 LOG_LLM_RAW = os.environ.get("AGENT_LOG_LLM_RAW", "true").lower() in ("1", "true", "yes")
 # Control gemma4-style "thinking" (ollama `think`, surfaced by ChatOllama's
-# `reasoning`). In a voice agent reasoning adds latency and was suppressing tool
-# calls (the model reasoned + replied with text instead of calling stop_audio),
-# so default it OFF. AGENT_REASONING: off/false (default) → no reasoning;
-# on/true → reasoning on (kept out of content, in additional_kwargs); default/
-# model → leave it to the model.
+# `reasoning`). Default ON (operator preference) — reasoning tends to improve
+# answer quality. CAVEAT: it adds latency and has been observed to suppress
+# tool calls on gemma4 12B (the model reasons + replies with text instead of
+# calling e.g. stop_audio; this is exactly why it was briefly defaulted off).
+# If tool-calling regresses, set AGENT_REASONING=off to restore the
+# tool-stable behaviour. Values: true (default) / on / 1 / yes → reasoning on
+# (kept out of content, in additional_kwargs); off/false → no reasoning;
+# default/model → leave it to the model. All that matters downstream is that
+# ChatOllama gets reasoning=True, which the default "true" resolves to.
 def _reasoning_setting():
-    v = os.environ.get("AGENT_REASONING", "off").strip().lower()
+    v = os.environ.get("AGENT_REASONING", "true").strip().lower()
     if v in ("on", "true", "1", "yes"):
         return True
     if v in ("default", "model", "none"):
@@ -135,6 +139,24 @@ FALLBACK_TEXT = os.environ.get(
     "AGENT_TOOL_FALLBACK_TEXT",
     "うまくできませんでした、すみません。",
 )
+# Action tools have a binary, deterministic outcome (the audio played or it
+# didn't; the timer was set or it wasn't). gemma4 has been observed to IGNORE
+# an [error] ToolMessage and falsely confirm success — e.g. reply 「再生したよ」
+# after audio-io was unreachable and the tool returned `[error] … audio was
+# NOT played`. For these tools we do NOT trust the model to report failure:
+# when one returns [error]/[denied] the chat stream suppresses the model's
+# (untrustworthy) reply and speaks a deterministic honest line instead. The
+# system-prompt nudge below is defence-in-depth; this dict is the guarantee.
+# Info/query tools (run_shell, read_file, web_search, system_health,
+# check_timers) are intentionally excluded — there the model's interpretation
+# of the result (summarising, retrying, explaining an error) is the point.
+TOOL_FAIL_PHRASES: dict[str, str] = {
+    "play_audio_file": "ごめん、音声を再生できなかった。",
+    "stop_audio": "ごめん、音声を止められなかった。",
+    "start_timer": "ごめん、タイマーをかけられなかった。",
+    "cancel_timer": "ごめん、タイマーを止められなかった。",
+}
+ACTION_TOOLS = frozenset(TOOL_FAIL_PHRASES)
 # Suffix appended to AGENT_SYSTEM_PROMPT *only when tools are enabled* so we
 # don't tell the LLM about tools that aren't wired. The phrasing matches the
 # voice-agent persona (タメ口 / 短文 / TTS 向き). Override entirely with
@@ -184,6 +206,13 @@ TOOL_SYSTEM_SUFFIX = os.environ.get("AGENT_TOOL_SYSTEM_SUFFIX") or (
     " telling the user it failed. Don't loop more than 2-3 times on"
     " the same tool — if that doesn't work, honestly say you couldn't"
     " do it."
+    # --- Never fabricate success after a failed action. (Backed by a
+    # deterministic guard in the chat stream — see TOOL_FAIL_PHRASES — but
+    # state it here too so the model doesn't even try.)
+    " NEVER claim an action worked when its tool returned `[error]` or"
+    " `[denied]`. Do not say 「再生したよ」「セットしたよ」「止めたよ」 or"
+    " similar after a failure — if it failed, say plainly that it didn't"
+    " work."
     # --- Tiny CoT nudge. We don't have explicit thinking tokens for
     # Gemma so this is the prompt-level equivalent.
     " For requests that involve multiple steps (find a file, then play"
@@ -516,6 +545,12 @@ async def stream_chat(graph, sessions: SessionManager, user_text: str
     # heard the ack and the action happened). Only emit fallback when
     # the silence really does follow a failure.
     last_tool_succeeded: bool | None = None
+    # Name of the most recent ACTION tool (play/stop/timer) that returned
+    # [error]/[denied] and hasn't since succeeded on a retry. When still set at
+    # end of turn, we speak a deterministic failure line and suppress the
+    # model's reply — which for these tools can falsely claim success (gemma4
+    # ignoring the [error]). See TOOL_FAIL_PHRASES / ACTION_TOOLS.
+    failed_action_tool: str | None = None
 
     try:
         async for chunk, _meta in graph.astream(
@@ -523,9 +558,17 @@ async def stream_chat(graph, sessions: SessionManager, user_text: str
         ):
             if isinstance(chunk, ToolMessage):
                 content = chunk.content if isinstance(chunk.content, str) else ""
-                last_tool_succeeded = not content.startswith(
-                    ("[error]", "[denied]")
-                )
+                failed = content.startswith(("[error]", "[denied]"))
+                last_tool_succeeded = not failed
+                # Track action-tool failure so we can override the model's
+                # final reply with a deterministic honest line. A later
+                # SUCCESS of the *same* tool (retry with a fixed arg) clears
+                # it; a different tool succeeding does not mask this failure.
+                if chunk.name in ACTION_TOOLS:
+                    if failed:
+                        failed_action_tool = chunk.name
+                    elif chunk.name == failed_action_tool:
+                        failed_action_tool = None
                 continue
             if not isinstance(chunk, AIMessageChunk):
                 # SystemMessage etc — not for TTS.
@@ -552,6 +595,12 @@ async def stream_chat(graph, sessions: SessionManager, user_text: str
             # `list[ContentBlock]` for multimodal — we ignore those
             # because the orchestrator's parser expects str.
             if isinstance(chunk.content, str) and chunk.content:
+                # If an action tool failed this turn, the model's final text
+                # is untrustworthy (it may claim success despite the [error]).
+                # Drop it; a deterministic failure line is spoken after the
+                # loop instead.
+                if failed_action_tool is not None:
+                    continue
                 real_content_yielded = True
                 yield {"message": {"content": chunk.content}, "done": False}
     except GraphRecursionError:
@@ -564,6 +613,21 @@ async def stream_chat(graph, sessions: SessionManager, user_text: str
             RECURSION_LIMIT, session_id,
         )
         yield {"message": {"content": FALLBACK_TEXT}, "done": False}
+        real_content_yielded = True
+        # Recursion fallback already spoke; don't also emit the action line.
+        failed_action_tool = None
+
+    if failed_action_tool is not None:
+        # Deterministic honest failure for an action tool — bypasses the LLM
+        # entirely so a false 「再生したよ」 can never reach the speaker. The
+        # model's own reply (if any) was suppressed above.
+        fail_line = TOOL_FAIL_PHRASES.get(failed_action_tool) or FALLBACK_TEXT
+        log.info(
+            "action tool %s failed for session %s; speaking deterministic "
+            "failure line (model reply suppressed)",
+            failed_action_tool, session_id,
+        )
+        yield {"message": {"content": fail_line}, "done": False}
         real_content_yielded = True
 
     if not real_content_yielded and last_tool_succeeded is not True:
