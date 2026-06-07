@@ -268,10 +268,9 @@ TOOL_SYSTEM_SUFFIX = os.environ.get("AGENT_TOOL_SYSTEM_SUFFIX") or (
 # auto-assigned (fs0, fs1, …) and matched to the following tool turn(s) in
 # order, so authors never write ids by hand.
 _FEWSHOT_DEFAULT: list[dict] = [
-    {"role": "user", "content": "3分はかって"},
+    {"role": "user", "content": "タイマー3分"},
     {"role": "assistant", "tool_calls": [{"name": "start_timer", "args": {"seconds": 180}}]},
     {"role": "tool", "name": "start_timer", "content": "タイマー#1 を3分でセットしたよ"},
-    {"role": "assistant", "content": "3分でセットしたよ。"},
 
     {"role": "user", "content": "今タイマーいくつ動いてる？"},
     {"role": "assistant", "tool_calls": [{"name": "check_timers", "args": {}}]},
@@ -283,15 +282,51 @@ _FEWSHOT_DEFAULT: list[dict] = [
     {"role": "tool", "name": "cancel_timer", "content": "2件キャンセルした"},
     {"role": "assistant", "content": "全部止めたよ。"},
 
-    {"role": "user", "content": "音止めて"},
+    {"role": "user", "content": "音声止めて"},
     {"role": "assistant", "tool_calls": [{"name": "stop_audio", "args": {}}]},
     {"role": "tool", "name": "stop_audio", "content": "停止した"},
-    {"role": "assistant", "content": "止めたよ。"},
 
     {"role": "user", "content": "今日の天気は？"},
     {"role": "assistant", "tool_calls": [{"name": "web_search", "args": {"query": "今日の天気"}}]},
     {"role": "tool", "name": "web_search", "content": "東京は晴れ、最高22度の見込み。"},
     {"role": "assistant", "content": "東京は晴れで、最高22度くらいみたいだよ。"},
+
+    {"role": "user", "content": "今日って何日だっけ？"},
+    {"role": "assistant", "tool_calls": [{"name": "run_shell", "args": {"command": "date"}}]},
+    {"role": "tool", "name": "run_shell", "content": "Sat Jun  7 11:30:00 JST 2026"},
+    {"role": "assistant", "content": "今日は6月7日だよ。"},
+
+    {"role": "user", "content": "今何時？"},
+    {"role": "assistant", "tool_calls": [{"name": "run_shell", "args": {"command": "date"}}]},
+    {"role": "tool", "name": "run_shell", "content": "Sat Jun  7 11:30:00 JST 2026"},
+    {"role": "assistant", "content": "時刻は11時30分だよ。"},
+
+    {"role": "user", "content": "news フォルダの中に何がある？"},
+    {"role": "assistant", "tool_calls": [{"name": "run_shell", "args": {"command": "ls /workspace/share/news"}}]},
+    {"role": "tool", "name": "run_shell", "content": "20260607_morning.wav"},
+    {"role": "assistant", "content": "音声ファイルが１つ入ってるよ"},
+
+    {"role": "user", "content": "shareのメモ読んで"},
+    {"role": "assistant", "tool_calls": [{"name": "run_shell", "args": {"command": "ls /workspace/share"}}]},
+    {"role": "tool", "name": "run_shell", "content": "memo.txt\nnews/"},
+    {"role": "assistant", "tool_calls": [{"name": "read_file", "args": {"path": "/workspace/share/memo.txt"}}]},
+    {"role": "tool", "name": "read_file", "content": "牛乳を買う\n電池を買う"},
+    {"role": "assistant", "content": "メモには、牛乳と電池を買うって書いてあるよ。"},
+
+    {"role": "user", "content": "〇〇の音声流して"},
+    {"role": "assistant", "tool_calls": [{"name": "play_audio_file", "args": {"paths": ["/workspace/share/news/20260607_morning.wav"]}}]},
+    {"role": "tool", "name": "play_audio_file", "content": "再生を開始した"},
+    {"role": "assistant", "content": "音声を流すね。"},
+
+    {"role": "user", "content": "〇〇の音声全部流して"},
+    {"role": "assistant", "tool_calls": [{"name": "play_audio_file", "args": {"paths": ["/workspace/share/news/*.wav"]}}]},
+    {"role": "tool", "name": "play_audio_file", "content": "再生を開始した"},
+    {"role": "assistant", "content": "音声を流すね。"},
+
+    {"role": "user", "content": "システムチェックして"},
+    {"role": "assistant", "tool_calls": [{"name": "system_health", "args": {}}]},
+    {"role": "tool", "name": "system_health", "content": "agent OK / llm OK / tts OK / audio-io 応答なし"},
+    {"role": "assistant", "content": "だいたい元気だけど、audio-io が応答してないみたい。"},
 ]
 
 
