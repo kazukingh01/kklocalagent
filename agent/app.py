@@ -405,6 +405,30 @@ def _build_fewshot() -> list:
 FEWSHOT_MESSAGES = _build_fewshot()
 
 
+def _fmt_msgs_for_log(messages: list) -> str:
+    """Compact rendering of a message list for debug logs. Surfaces the parts
+    that matter for tool debugging — assistant tool_calls and tool RESULTS
+    (the input fed back to the model after a tool runs) — with content
+    truncated so the line stays readable."""
+    out: list[str] = []
+    for m in messages:
+        if isinstance(m, ToolMessage):
+            c = m.content if isinstance(m.content, str) else str(m.content)
+            out.append(f"Tool[{m.name}]={c[:300]!r}")
+        elif isinstance(m, AIMessage):
+            c = m.content if isinstance(m.content, str) else str(m.content)
+            tcs = [(tc.get("name"), tc.get("args")) for tc in (m.tool_calls or [])]
+            out.append(f"AI(content={c[:200]!r}, tool_calls={tcs})")
+        elif isinstance(m, HumanMessage):
+            c = m.content if isinstance(m.content, str) else str(m.content)
+            out.append(f"Human={c[:200]!r}")
+        elif isinstance(m, SystemMessage):
+            out.append(f"System(chars={len(str(m.content))})")
+        else:
+            out.append(f"{type(m).__name__}={str(getattr(m, 'content', ''))[:120]!r}")
+    return " | ".join(out)
+
+
 class SessionManager:
     """Owns the *current* session id and rotates it after a configurable
     idle gap.
@@ -553,21 +577,35 @@ def build_react_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
             prefix.append(SystemMessage(content=system_text))
         prefix.extend(FEWSHOT_MESSAGES)
         messages = [*prefix, *messages]
+        if LOG_LLM_RAW:
+            # What the model RECEIVES this step. The static prefix (system +
+            # few-shot) is collapsed to a count; the live turn is shown in full
+            # so the tool RESULT fed back after a tool call is visible (this is
+            # the 2nd agent_node call of a turn).
+            log.info(
+                "llm input: [system + %d few-shot] + %s",
+                len(FEWSHOT_MESSAGES),
+                _fmt_msgs_for_log(messages[len(prefix):]),
+            )
         response = await llm_with_tools.ainvoke(messages)
         if LOG_LLM_RAW:
-            # Raw output so we can see whether the model emitted a tool_call
-            # (e.g. stop_audio) or just text/reasoning. additional_kwargs is
-            # where ollama/gemma4 reasoning content lands.
+            # Output, as parsed by ollama. NOTE: the model's *raw* text (with
+            # the tool-call tokens before ollama parses them into tool_calls) is
+            # consumed server-side and is NOT returned over /api/chat — to see
+            # those literal tokens, enable the LLM server's verbose/debug log.
+            # additional_kwargs is where reasoning_content would land;
+            # response_metadata carries ollama's done_reason / counts.
             content = (
                 response.content
                 if isinstance(response.content, str)
                 else str(response.content)
             )
             log.info(
-                "llm output: tool_calls=%s | content=%r | additional_kwargs=%r",
+                "llm output: tool_calls=%s | content=%r | additional_kwargs=%r | response_metadata=%r",
                 [(tc.get("name"), tc.get("args")) for tc in (response.tool_calls or [])],
                 content[:1000],
                 dict(response.additional_kwargs or {}),
+                dict(getattr(response, "response_metadata", {}) or {}),
             )
         return {"messages": [response]}
 
