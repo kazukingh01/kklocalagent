@@ -115,8 +115,9 @@ LOG_LLM_RAW = os.environ.get("AGENT_LOG_LLM_RAW", "true").lower() in ("1", "true
 # distinct ways a model can think, and they are NOT interchangeable across
 # models, so this is a 3-way mode rather than a bool:
 #
-#   0 = off          no thinking. We send NO native `think` (omitted), and
-#                    add no <|think|> token. Safe on every model.
+#   0 = off          no thinking. We send think=FALSE (explicitly — omitting
+#                    it lets a thinking-capable backend default to ON) and add
+#                    no <|think|> token. Safe on every model.
 #   1 = native       ollama's native `think=true` (ChatOllama reasoning=True).
 #                    The thinking is kept out of `content` (it lands in
 #                    additional_kwargs), so it never reaches TTS. Works only
@@ -124,9 +125,9 @@ LOG_LLM_RAW = os.environ.get("AGENT_LOG_LLM_RAW", "true").lower() in ("1", "true
 #                    (e.g. the `gemma4:e4b` library tag). On an imported HF
 #                    GGUF that lacks it, `think=true` returns HTTP 400.
 #   2 = prompt-token gemma4's other mechanism: prepend AGENT_THINK_TOKEN
-#                    (default <|think|>) to the system prompt. We do NOT send
-#                    native `think` here (so it can't 400), the prompt token
-#                    drives the reasoning instead. For GGUFs that reject
+#                    (default <|think|>) to the system prompt. We send
+#                    think=false to suppress native thinking, and the prompt
+#                    token drives the reasoning instead. For GGUFs that reject
 #                    native think (e.g. hf.co/unsloth/gemma-4-12b-it-GGUF).
 #                    NOTE: in this mode the reasoning may surface inline in
 #                    `content`; the orchestrator strips <...> spans before TTS
@@ -147,10 +148,15 @@ def _reasoning_mode() -> int:
 
 
 REASONING_MODE = _reasoning_mode()
-# ChatOllama `reasoning=`: True ONLY for native mode (1). Modes 0 and 2 must
-# not request native thinking — None omits the `think` field entirely so a
-# GGUF without native support never 400s. (Mode 2 thinks via THINK_PREFIX.)
-REASONING = True if REASONING_MODE == 1 else None
+# ChatOllama `reasoning=`: True for native mode (1) → think=true. Modes 0 and 2
+# send think=FALSE (NOT None). This matters: None omits the `think` field, and a
+# thinking-capable backend (recent ollama / llama.cpp peg-gemma4) then falls
+# back to its DEFAULT, which is thinking ON — so AGENT_REASONING=0 would still
+# reason. think=false disables it explicitly, and is safe even on a GGUF that
+# can't think (the "does not support thinking" 400 only fires on think=TRUE —
+# i.e. when you ask it TO think; "don't think" is trivially honoured). Mode 2
+# suppresses native think and reasons via the THINK_PREFIX prompt token instead.
+REASONING = True if REASONING_MODE == 1 else False
 # Token that flips gemma4 into thinking when placed at the START of the system
 # prompt (mode 2). Overridable so a model that spells it differently can be
 # accommodated without a code change. Empty prefix in modes 0/1.

@@ -283,12 +283,11 @@ async fn predict_loop(
         if let Some((name, &score)) = best {
             if !in_cooldown && score >= cfg.threshold {
                 last_fire = Some(now);
-                // Record this detection, prune to the confirm window, and only
-                // forward downstream once `confirm_count` of them are present.
-                // A false positive rarely repeats within a few seconds, so
-                // e.g. 2-within-3s suppresses spurious fires while a deliberate
-                // double trigger still gets through. confirm_count=1 forwards
-                // immediately (legacy behaviour).
+                // Record this (cooldown-deduplicated) single detection and
+                // prune to the confirm window. We forward downstream only once
+                // `confirm_count` of them are present — a false positive rarely
+                // repeats within a few seconds, so e.g. 2-within-3s suppresses
+                // spurious fires. confirm_count=1 forwards immediately.
                 fire_times.push_back(now);
                 while fire_times
                     .front()
@@ -297,7 +296,20 @@ async fn predict_loop(
                 {
                     fire_times.pop_front();
                 }
-                if fire_times.len() as u32 >= cfg.confirm_count {
+                let confirmed = fire_times.len() as u32 >= cfg.confirm_count;
+                // Log EVERY single detection (have/need shows confirmation
+                // progress, e.g. 1/2 then 2/2). The actual sink dispatch is
+                // logged separately as "fired event" by event_sink when
+                // confirmed, so we don't emit a duplicate confirm line here.
+                info!(
+                    model = %name,
+                    score,
+                    have = fire_times.len(),
+                    need = cfg.confirm_count,
+                    confirmed,
+                    "wake detected"
+                );
+                if confirmed {
                     fire_times.clear();
                     let det = Detection {
                         model: name.clone(),
@@ -307,24 +319,9 @@ async fn predict_loop(
                             .map(|d| d.as_secs_f64())
                             .unwrap_or(0.0),
                     };
-                    info!(
-                        model = %name,
-                        score,
-                        confirm_count = cfg.confirm_count,
-                        "wake confirmed -> sink"
-                    );
                     if tx.send(det).await.is_err() {
                         return Ok(());
                     }
-                } else {
-                    debug!(
-                        model = %name,
-                        score,
-                        have = fire_times.len(),
-                        need = cfg.confirm_count,
-                        window_ms = cfg.confirm_window.as_millis() as u64,
-                        "wake candidate (awaiting confirmation)"
-                    );
                 }
             }
 
