@@ -253,6 +253,122 @@ TOOL_SYSTEM_SUFFIX = os.environ.get("AGENT_TOOL_SYSTEM_SUFFIX") or (
     " is done (or you've genuinely hit a wall)."
 )
 
+# --- Tool-use few-shot ------------------------------------------------------
+# gemma4 12B is weak at *deciding to call* a tool (it tends to answer in text
+# or fabricate success). The strongest fix is to show it real example turns —
+# Human → AI(tool_calls) → Tool(result) → AI(reply) — so it sees the exact
+# tool-call shape it should emit, not just an English description. These are
+# injected as a fixed prefix AFTER the system message and BEFORE the live
+# history (so the prompt-cache prefix stays stable), and are NOT persisted to
+# the checkpoint. Controlled by:
+#   AGENT_TOOL_FEWSHOT       on/off (default off in code; compose sets on)
+#   AGENT_TOOL_FEWSHOT_FILE  optional JSON path overriding the builtin examples
+# A turn is {"role": user|assistant|tool, "content": str,
+#            "tool_calls": [{"name","args"}]?, "name": str?}. tool_call ids are
+# auto-assigned (fs0, fs1, …) and matched to the following tool turn(s) in
+# order, so authors never write ids by hand.
+_FEWSHOT_DEFAULT: list[dict] = [
+    {"role": "user", "content": "3分はかって"},
+    {"role": "assistant", "tool_calls": [{"name": "start_timer", "args": {"seconds": 180}}]},
+    {"role": "tool", "name": "start_timer", "content": "タイマー#1 を3分でセットしたよ"},
+    {"role": "assistant", "content": "3分でセットしたよ。"},
+
+    {"role": "user", "content": "今タイマーいくつ動いてる？"},
+    {"role": "assistant", "tool_calls": [{"name": "check_timers", "args": {}}]},
+    {"role": "tool", "name": "check_timers", "content": "タイマー#1 残り2分30秒"},
+    {"role": "assistant", "content": "1個動いてて、残り2分半くらいだよ。"},
+
+    {"role": "user", "content": "タイマー全部止めて"},
+    {"role": "assistant", "tool_calls": [{"name": "cancel_timer", "args": {"which": "全部"}}]},
+    {"role": "tool", "name": "cancel_timer", "content": "2件キャンセルした"},
+    {"role": "assistant", "content": "全部止めたよ。"},
+
+    {"role": "user", "content": "音止めて"},
+    {"role": "assistant", "tool_calls": [{"name": "stop_audio", "args": {}}]},
+    {"role": "tool", "name": "stop_audio", "content": "停止した"},
+    {"role": "assistant", "content": "止めたよ。"},
+
+    {"role": "user", "content": "今日の天気は？"},
+    {"role": "assistant", "tool_calls": [{"name": "web_search", "args": {"query": "今日の天気"}}]},
+    {"role": "tool", "name": "web_search", "content": "東京は晴れ、最高22度の見込み。"},
+    {"role": "assistant", "content": "東京は晴れで、最高22度くらいみたいだよ。"},
+]
+
+
+def _fewshot_turns_to_messages(turns: list[dict]) -> list:
+    """Convert raw few-shot turn dicts into LangChain messages, auto-assigning
+    and matching tool_call ids (fs0, fs1, …). Linear examples only: each tool
+    turn binds to the oldest still-unmatched tool_call (FIFO)."""
+    msgs: list = []
+    pending_ids: list[str] = []
+    counter = 0
+    for t in turns:
+        role = t.get("role")
+        if role == "user":
+            msgs.append(HumanMessage(content=t.get("content", "")))
+        elif role == "assistant":
+            raw_tcs = t.get("tool_calls") or []
+            if raw_tcs:
+                lc_tcs = []
+                for tc in raw_tcs:
+                    tid = f"fs{counter}"
+                    counter += 1
+                    pending_ids.append(tid)
+                    lc_tcs.append({
+                        "name": tc["name"],
+                        "args": tc.get("args", {}),
+                        "id": tid,
+                        "type": "tool_call",
+                    })
+                msgs.append(AIMessage(content=t.get("content", ""), tool_calls=lc_tcs))
+            else:
+                msgs.append(AIMessage(content=t.get("content", "")))
+        elif role == "tool":
+            tid = pending_ids.pop(0) if pending_ids else f"fs{counter}"
+            msgs.append(ToolMessage(
+                content=t.get("content", ""),
+                name=t.get("name"),
+                tool_call_id=tid,
+            ))
+        else:
+            log.warning("few-shot: skipping turn with unknown role %r", role)
+    return msgs
+
+
+def _build_fewshot() -> list:
+    """Build the fixed few-shot message prefix from env. Empty when tools are
+    off or AGENT_TOOL_FEWSHOT is not enabled. A bad AGENT_TOOL_FEWSHOT_FILE
+    warns and falls back to the builtin examples rather than crashing."""
+    if not TOOLS_ENABLED:
+        return []
+    if os.environ.get("AGENT_TOOL_FEWSHOT", "off").strip().lower() not in (
+        "on", "true", "1", "yes"
+    ):
+        return []
+    turns, source = _FEWSHOT_DEFAULT, "builtin"
+    path = os.environ.get("AGENT_TOOL_FEWSHOT_FILE", "").strip()
+    if path:
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, list):
+                raise ValueError("top-level JSON must be a list of turn objects")
+            turns, source = data, "file"
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "few-shot file %r unusable (%s: %s); using builtin examples",
+                path, type(e).__name__, e,
+            )
+    msgs = _fewshot_turns_to_messages(turns)
+    log.info(
+        "agent: tool few-shot enabled: %d turns -> %d messages (source=%s)",
+        len(turns), len(msgs), source,
+    )
+    return msgs
+
+
+FEWSHOT_MESSAGES = _build_fewshot()
+
 
 class SessionManager:
     """Owns the *current* session id and rotates it after a configurable
@@ -394,8 +510,14 @@ def build_react_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
 
     async def agent_node(state: MessagesState):
         messages = _trim_history(list(state["messages"]))
+        # Fixed prefix: system prompt, then the tool-use few-shot, then the live
+        # (trimmed) history. Few-shot sits BEFORE history and is not persisted,
+        # so the cache prefix [system, *few-shot] stays stable across turns.
+        prefix: list = []
         if system_text:
-            messages = [SystemMessage(content=system_text), *messages]
+            prefix.append(SystemMessage(content=system_text))
+        prefix.extend(FEWSHOT_MESSAGES)
+        messages = [*prefix, *messages]
         response = await llm_with_tools.ainvoke(messages)
         if LOG_LLM_RAW:
             # Raw output so we can see whether the model emitted a tool_call
@@ -487,6 +609,10 @@ async def warm_system_prefix() -> None:
     messages = []
     if system_text:
         messages.append(SystemMessage(content=system_text))
+    # Same few-shot prefix the react agent_node injects, so the warmed cache
+    # prefix [system, *few-shot] matches live turns exactly. Empty unless
+    # AGENT_TOOL_FEWSHOT is on (and tools enabled).
+    messages.extend(FEWSHOT_MESSAGES)
     messages.append(HumanMessage(content="ウォームアップ"))
     # Dedicated capped client: a couple of tokens fill the prefix KV and warm
     # the decode path without generating a real reply. Bind the same tools so
