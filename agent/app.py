@@ -111,26 +111,51 @@ TERMINAL_TOOLS = {"stop_audio"}
 # actually emit `stop_audio`, or just reason+text? Set AGENT_LOG_LLM_RAW=false to
 # quiet it once things are working.
 LOG_LLM_RAW = os.environ.get("AGENT_LOG_LLM_RAW", "true").lower() in ("1", "true", "yes")
-# Control gemma4-style "thinking" (ollama `think`, surfaced by ChatOllama's
-# `reasoning`). Default ON (operator preference) — reasoning tends to improve
-# answer quality. CAVEAT: it adds latency and has been observed to suppress
-# tool calls on gemma4 12B (the model reasons + replies with text instead of
-# calling e.g. stop_audio; this is exactly why it was briefly defaulted off).
-# If tool-calling regresses, set AGENT_REASONING=off to restore the
-# tool-stable behaviour. Values: true (default) / on / 1 / yes → reasoning on
-# (kept out of content, in additional_kwargs); off/false → no reasoning;
-# default/model → leave it to the model. All that matters downstream is that
-# ChatOllama gets reasoning=True, which the default "true" resolves to.
-def _reasoning_setting():
-    v = os.environ.get("AGENT_REASONING", "true").strip().lower()
-    if v in ("on", "true", "1", "yes"):
-        return True
-    if v in ("default", "model", "none"):
-        return None
-    return False
+# AGENT_REASONING — gemma4-style "thinking" mode selector. There are TWO
+# distinct ways a model can think, and they are NOT interchangeable across
+# models, so this is a 3-way mode rather than a bool:
+#
+#   0 = off          no thinking. We send NO native `think` (omitted), and
+#                    add no <|think|> token. Safe on every model.
+#   1 = native       ollama's native `think=true` (ChatOllama reasoning=True).
+#                    The thinking is kept out of `content` (it lands in
+#                    additional_kwargs), so it never reaches TTS. Works only
+#                    on models that advertise native thinking to ollama
+#                    (e.g. the `gemma4:e4b` library tag). On an imported HF
+#                    GGUF that lacks it, `think=true` returns HTTP 400.
+#   2 = prompt-token gemma4's other mechanism: prepend AGENT_THINK_TOKEN
+#                    (default <|think|>) to the system prompt. We do NOT send
+#                    native `think` here (so it can't 400), the prompt token
+#                    drives the reasoning instead. For GGUFs that reject
+#                    native think (e.g. hf.co/unsloth/gemma-4-12b-it-GGUF).
+#                    NOTE: in this mode the reasoning may surface inline in
+#                    `content`; the orchestrator strips <...> spans before TTS
+#                    so it isn't spoken.
+#
+# CAVEAT (modes 1 & 2): thinking adds latency and has been observed to
+# suppress tool calls on gemma4 12B (the model reasons + replies with text
+# instead of calling e.g. stop_audio). Use 0 if tool-calling regresses.
+# Back-compat: on/true/yes → 1, off/false/no → 0. Default 1.
+def _reasoning_mode() -> int:
+    v = os.environ.get("AGENT_REASONING", "1").strip().lower()
+    if v in ("0", "off", "false", "no", "none"):
+        return 0
+    if v == "2":
+        return 2
+    # "1" / "on" / "true" / "yes" / "default" / "model" / anything → native
+    return 1
 
 
-REASONING = _reasoning_setting()
+REASONING_MODE = _reasoning_mode()
+# ChatOllama `reasoning=`: True ONLY for native mode (1). Modes 0 and 2 must
+# not request native thinking — None omits the `think` field entirely so a
+# GGUF without native support never 400s. (Mode 2 thinks via THINK_PREFIX.)
+REASONING = True if REASONING_MODE == 1 else None
+# Token that flips gemma4 into thinking when placed at the START of the system
+# prompt (mode 2). Overridable so a model that spells it differently can be
+# accommodated without a code change. Empty prefix in modes 0/1.
+THINK_TOKEN = os.environ.get("AGENT_THINK_TOKEN", "<|think|>")
+THINK_PREFIX = (THINK_TOKEN + "\n") if REASONING_MODE == 2 else ""
 # Recovery line spoken whenever a turn would otherwise end with no
 # spoken text — either the ReAct loop exceeded RECURSION_LIMIT, or the
 # stream finished after a failed/denied tool without the LLM producing
@@ -318,8 +343,10 @@ def build_legacy_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
 
     async def chat_node(state: MessagesState):
         messages = _trim_history(list(state["messages"]))
-        if SYSTEM_PROMPT:
-            messages = [SystemMessage(content=SYSTEM_PROMPT), *messages]
+        # THINK_PREFIX (<|think|>) is empty unless AGENT_REASONING=2.
+        sys_content = THINK_PREFIX + SYSTEM_PROMPT
+        if sys_content:
+            messages = [SystemMessage(content=sys_content), *messages]
         # ainvoke (not astream) inside the node — LangGraph's
         # stream_mode="messages" surfaces token-level chunks from the
         # underlying ChatOllama anyway. The full AIMessage returned
@@ -354,6 +381,9 @@ def build_react_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
     """
     tools = all_tools()
     system_text = (SYSTEM_PROMPT + TOOL_SYSTEM_SUFFIX) if SYSTEM_PROMPT else TOOL_SYSTEM_SUFFIX.strip()
+    # Prepend <|think|> (mode 2 only; empty otherwise). Goes FIRST so it's at
+    # the very start of the system prompt, which is where gemma4 expects it.
+    system_text = THINK_PREFIX + system_text
     llm_with_tools = llm.bind_tools(tools)
 
     async def agent_node(state: MessagesState):
@@ -445,6 +475,9 @@ async def warm_system_prefix() -> None:
         system_text = (SYSTEM_PROMPT + TOOL_SYSTEM_SUFFIX) if SYSTEM_PROMPT else TOOL_SYSTEM_SUFFIX.strip()
     else:
         system_text = SYSTEM_PROMPT
+    # Match the real graph's system prompt exactly (incl. mode-2 <|think|>
+    # prefix) so the warmed prompt-cache prefix lines up with live turns.
+    system_text = THINK_PREFIX + system_text
     messages = []
     if system_text:
         messages.append(SystemMessage(content=system_text))
@@ -740,8 +773,10 @@ async def amain() -> None:
     )
 
     log.info(
-        "agent: ollama=%s model=%s db=%s tools=%s recursion_limit=%d",
+        "agent: ollama=%s model=%s db=%s tools=%s recursion_limit=%d "
+        "reasoning_mode=%d (native_think=%s think_prefix=%r)",
         OLLAMA_BASE_URL, MODEL_NAME, DB_PATH, TOOLS_ENABLED, RECURSION_LIMIT,
+        REASONING_MODE, REASONING is True, THINK_PREFIX,
     )
 
     # ChatOllama streams tokens from ollama via httpx. temperature=0
@@ -752,8 +787,9 @@ async def amain() -> None:
         base_url=OLLAMA_BASE_URL,
         model=MODEL_NAME,
         temperature=0,
-        # gemma4 の reasoning を既定 off に (AGENT_REASONING)。思考はレイテンシ増＆
-        # ツール呼び出し阻害になりやすいので。
+        # reasoning は AGENT_REASONING (mode 0/1/2) 由来。True=native think
+        # (mode 1) のみ、mode 0/2 は None で think を送らない。詳細は
+        # _reasoning_mode / THINK_PREFIX の定義を参照。
         reasoning=REASONING,
     )
 

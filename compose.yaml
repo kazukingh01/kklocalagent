@@ -404,14 +404,19 @@ services:
       # below. Prevents an infinite retry loop on a tool that always
       # fails. Ignored when AGENT_TOOLS_ENABLED=false.
       AGENT_TOOL_RECURSION_LIMIT: "${AGENT_TOOL_RECURSION_LIMIT:-6}"
-      # gemma4-style "thinking" (ollama `think`, via ChatOllama `reasoning`).
-      # Default ON — reasoning tends to improve answer quality. CAVEAT: it
-      # adds latency and has been observed to suppress tool calls on gemma4
-      # 12B (the model reasons + replies with text instead of calling e.g.
-      # stop_audio). If tool-calling gets flaky, set AGENT_REASONING=off in
-      # `.env`. Values: true (default) / on → reasoning on; off/false → off;
-      # default/model → leave it to the model. Read once at agent startup.
-      AGENT_REASONING: "${AGENT_REASONING:-true}"
+      # gemma4-style "thinking" MODE selector (0/1/2). See .env.example for
+      # the full writeup. 0 = off; 1 = native ollama `think=true` (works on
+      # tags like gemma4:e4b; an imported GGUF without native think returns
+      # HTTP 400); 2 = prompt-token: prepend AGENT_THINK_TOKEN (<|think|>) to
+      # the system prompt and send NO native think — for GGUFs such as
+      # hf.co/unsloth/gemma-4-12b-it-GGUF that reject native think. Modes 1 & 2
+      # add latency and can suppress tool calls; use 0 if that regresses.
+      # Back-compat: true/on → 1, off/false → 0. Read once at agent startup.
+      AGENT_REASONING: "${AGENT_REASONING:-1}"
+      # Token that switches gemma4 into thinking when placed at the start of
+      # the system prompt (mode 2 only). Override only if your model spells
+      # the think-control token differently.
+      AGENT_THINK_TOKEN: "${AGENT_THINK_TOKEN:-<|think|>}"
       # Tool-use behavior policy — *separate* from AGENT_SYSTEM_PROMPT
       # (which is persona / speaking style). Appended after the persona
       # only when AGENT_TOOLS_ENABLED=true. Controls how the LLM

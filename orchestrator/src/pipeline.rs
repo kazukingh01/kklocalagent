@@ -654,6 +654,12 @@ async fn llm_chat_streaming(
     // before any sentence break.
     let mut first_chunk_logged = false;
     let mut first_sentence_logged = false;
+    // Whether we're currently inside a `<...>` span. Persists across deltas /
+    // chunks / ndjson lines because such a span (e.g. gemma4's <|think|>
+    // reasoning markup when the agent runs AGENT_REASONING=2) can straddle
+    // them. Everything between `<` and the next `>` is dropped before it ever
+    // reaches the sentence buffer, so it is never synthesized / spoken.
+    let mut in_angle = false;
 
     'outer: loop {
         let chunk = resp
@@ -704,35 +710,54 @@ async fn llm_chat_streaming(
                 .and_then(|c| c.as_str())
                 .unwrap_or("");
             if !delta.is_empty() {
-                sentence_buf.push_str(delta);
-                full_reply.push_str(delta);
+                // Drop <...>-enclosed spans (thinking markup / stray tags)
+                // before they hit TTS. Stateful via `in_angle` so a span that
+                // crosses delta boundaries is still fully removed.
+                let mut cleaned = String::with_capacity(delta.len());
+                for ch in delta.chars() {
+                    if in_angle {
+                        if ch == '>' {
+                            in_angle = false;
+                        }
+                    } else if ch == '<' {
+                        in_angle = true;
+                    } else {
+                        cleaned.push(ch);
+                    }
+                }
+                // If the whole delta was inside a <...> span, cleaned is empty
+                // and we just fall through to the `done` check below.
+                if !cleaned.is_empty() {
+                    sentence_buf.push_str(&cleaned);
+                    full_reply.push_str(&cleaned);
 
-                // Drain every completed sentence from the buffer.
-                while let Some(end) = find_sentence_end(&sentence_buf) {
-                    let remainder = sentence_buf.split_off(end);
-                    let sentence = std::mem::replace(&mut sentence_buf, remainder)
-                        .trim()
-                        .to_string();
-                    if sentence.is_empty() {
-                        continue;
-                    }
-                    if !wake.pipeline_still_active() {
-                        // Drop response → connection closes →
-                        // ollama stops generating. No further
-                        // sentences emitted.
-                        return Ok(full_reply);
-                    }
-                    if !first_sentence_logged {
-                        info!(
-                            target: "orch::pipeline",
-                            ttfs_ms = llm_started.elapsed().as_millis(),
-                            "LLM first sentence emitted"
-                        );
-                        first_sentence_logged = true;
-                    }
-                    if sentence_tx.send(sentence).await.is_err() {
-                        // Consumer gone — abandon stream.
-                        return Ok(full_reply);
+                    // Drain every completed sentence from the buffer.
+                    while let Some(end) = find_sentence_end(&sentence_buf) {
+                        let remainder = sentence_buf.split_off(end);
+                        let sentence = std::mem::replace(&mut sentence_buf, remainder)
+                            .trim()
+                            .to_string();
+                        if sentence.is_empty() {
+                            continue;
+                        }
+                        if !wake.pipeline_still_active() {
+                            // Drop response → connection closes →
+                            // ollama stops generating. No further
+                            // sentences emitted.
+                            return Ok(full_reply);
+                        }
+                        if !first_sentence_logged {
+                            info!(
+                                target: "orch::pipeline",
+                                ttfs_ms = llm_started.elapsed().as_millis(),
+                                "LLM first sentence emitted"
+                            );
+                            first_sentence_logged = true;
+                        }
+                        if sentence_tx.send(sentence).await.is_err() {
+                            // Consumer gone — abandon stream.
+                            return Ok(full_reply);
+                        }
                     }
                 }
             }
