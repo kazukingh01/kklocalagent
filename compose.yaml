@@ -340,7 +340,22 @@ services:
       # in config.rs).
       WW_MODELS: "${WW_MODELS:-my_phrase.onnx}"
       WW_THRESHOLD: "${WW_THRESHOLD:-0.5}"
-      WW_COOLDOWN_SEC: "2.0"
+      # Re-fire suppression AND the per-utterance de-dup gate used by the
+      # confirmation logic below. Overridable so it can be tuned alongside
+      # WW_CONFIRM_*. Keep it < WW_CONFIRM_WINDOW_MS (see below).
+      WW_COOLDOWN_SEC: "${WW_COOLDOWN_SEC:-2.0}"
+      # Anti-false-fire confirmation gate. The wwd forwards a wake to the
+      # orchestrator (which stops LLM / starts ASR) only after WW_CONFIRM_COUNT
+      # detections land within WW_CONFIRM_WINDOW_MS. Default 2-within-3000ms:
+      # the operator must trigger the wake word TWICE in 3 s, which kills the
+      # stray single false fires. Set WW_CONFIRM_COUNT=1 to restore the old
+      # fire-on-first behaviour. REQUIREMENT: WW_CONFIRM_WINDOW_MS must be
+      # > WW_COOLDOWN_SEC×1000, else a single utterance (deduped by cooldown)
+      # can never reach count 2. With cooldown 2.0 s the 2nd utterance must
+      # land in the [2.0, 3.0] s slot; lower WW_COOLDOWN_SEC (e.g. 1.5) for a
+      # roomier window.
+      WW_CONFIRM_COUNT: "${WW_CONFIRM_COUNT:-2}"
+      WW_CONFIRM_WINDOW_MS: "${WW_CONFIRM_WINDOW_MS:-3000}"
       # Diagnostic: when > 0, log the peak score seen in each window
       # so the operator can tune WW_THRESHOLD. Off (0) by default.
       # Set to e.g. 5.0 in .env to see "what scores my voice is

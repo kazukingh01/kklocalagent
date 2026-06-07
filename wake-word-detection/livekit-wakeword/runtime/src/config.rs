@@ -41,6 +41,12 @@ pub struct Config {
     pub embedding_onnx_path: PathBuf,
     pub threshold: f32,
     pub cooldown: Duration,
+    /// How many threshold crossings (each de-duplicated by `cooldown`) must
+    /// land within `confirm_window` before a Detection is forwarded to the
+    /// sink. 1 = forward immediately (legacy). >=2 suppresses false fires by
+    /// requiring the wake word within a short span (e.g. say it twice).
+    pub confirm_count: u32,
+    pub confirm_window: Duration,
     pub predict_window_ms: u32,
     pub predict_interval_ms: u32,
     pub listen_addr: SocketAddr,
@@ -128,6 +134,18 @@ impl Config {
 
         let threshold = parse_env_f32("WW_THRESHOLD", 0.5)?;
         let cooldown = Duration::from_secs_f32(parse_env_f32("WW_COOLDOWN_SEC", 2.0)?);
+        // Confirmation gate (anti-false-fire). confirm_count=1 → forward every
+        // detection immediately. confirm_count>=2 → require that many within
+        // confirm_window. NOTE the interaction with cooldown: a single
+        // utterance scores high for up to ~1.5 s, and `cooldown` is what stops
+        // it from counting twice, so confirm_window MUST be > cooldown for a
+        // count>=2 to ever be reachable by two *separate* utterances.
+        let confirm_count = parse_env_u32("WW_CONFIRM_COUNT", 1)?;
+        if confirm_count == 0 {
+            return Err(anyhow!("WW_CONFIRM_COUNT must be >= 1"));
+        }
+        let confirm_window =
+            Duration::from_millis(parse_env_u32("WW_CONFIRM_WINDOW_MS", 3000)? as u64);
         let predict_window_ms = parse_env_u32("WW_PREDICT_WINDOW_MS", 2000)?;
         let predict_interval_ms = parse_env_u32("WW_PREDICT_INTERVAL_MS", 100)?;
         if predict_interval_ms == 0 {
@@ -166,6 +184,8 @@ impl Config {
             embedding_onnx_path,
             threshold,
             cooldown,
+            confirm_count,
+            confirm_window,
             predict_window_ms,
             predict_interval_ms,
             listen_addr,

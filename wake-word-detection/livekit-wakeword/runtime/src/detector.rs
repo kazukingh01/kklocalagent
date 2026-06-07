@@ -67,6 +67,8 @@ pub async fn run(
         model_paths = ?cfg.model_paths,
         threshold = cfg.threshold,
         cooldown_ms = cfg.cooldown.as_millis() as u64,
+        confirm_count = cfg.confirm_count,
+        confirm_window_ms = cfg.confirm_window.as_millis() as u64,
         window_ms = cfg.predict_window_ms,
         interval_ms = cfg.predict_interval_ms,
         "model loaded"
@@ -175,6 +177,10 @@ async fn predict_loop(
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let mut last_fire: Option<Instant> = None;
+    // Timestamps of recent cooldown-deduplicated detections, kept pruned to
+    // `confirm_window`. We forward a Detection only once this reaches
+    // `confirm_count` (see the fire branch below).
+    let mut fire_times: VecDeque<Instant> = VecDeque::new();
     let mut peak_score: f32 = 0.0;
     let mut peak_model: String = String::new();
     let mut last_peak_log = Instant::now();
@@ -277,16 +283,48 @@ async fn predict_loop(
         if let Some((name, &score)) = best {
             if !in_cooldown && score >= cfg.threshold {
                 last_fire = Some(now);
-                let det = Detection {
-                    model: name.clone(),
-                    score,
-                    ts: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_secs_f64())
-                        .unwrap_or(0.0),
-                };
-                if tx.send(det).await.is_err() {
-                    return Ok(());
+                // Record this detection, prune to the confirm window, and only
+                // forward downstream once `confirm_count` of them are present.
+                // A false positive rarely repeats within a few seconds, so
+                // e.g. 2-within-3s suppresses spurious fires while a deliberate
+                // double trigger still gets through. confirm_count=1 forwards
+                // immediately (legacy behaviour).
+                fire_times.push_back(now);
+                while fire_times
+                    .front()
+                    .map(|t| now.duration_since(*t) > cfg.confirm_window)
+                    .unwrap_or(false)
+                {
+                    fire_times.pop_front();
+                }
+                if fire_times.len() as u32 >= cfg.confirm_count {
+                    fire_times.clear();
+                    let det = Detection {
+                        model: name.clone(),
+                        score,
+                        ts: SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs_f64())
+                            .unwrap_or(0.0),
+                    };
+                    info!(
+                        model = %name,
+                        score,
+                        confirm_count = cfg.confirm_count,
+                        "wake confirmed -> sink"
+                    );
+                    if tx.send(det).await.is_err() {
+                        return Ok(());
+                    }
+                } else {
+                    debug!(
+                        model = %name,
+                        score,
+                        have = fire_times.len(),
+                        need = cfg.confirm_count,
+                        window_ms = cfg.confirm_window.as_millis() as u64,
+                        "wake candidate (awaiting confirmation)"
+                    );
                 }
             }
 
@@ -365,5 +403,61 @@ mod tests {
         let last = now - Duration::from_millis(500);
         assert!(now.duration_since(last) < Duration::from_secs(2));
         assert!(!(now.duration_since(last) < Duration::from_millis(100)));
+    }
+
+    /// Mirrors the predict-loop fire branch: push a (cooldown-deduped)
+    /// detection, prune to `window`, and report whether `confirm_count`
+    /// are now present (clearing on confirm).
+    fn confirm_step(
+        times: &mut VecDeque<Instant>,
+        now: Instant,
+        window: Duration,
+        confirm_count: u32,
+    ) -> bool {
+        times.push_back(now);
+        while times
+            .front()
+            .map(|t| now.duration_since(*t) > window)
+            .unwrap_or(false)
+        {
+            times.pop_front();
+        }
+        if times.len() as u32 >= confirm_count {
+            times.clear();
+            true
+        } else {
+            false
+        }
+    }
+
+    #[test]
+    fn confirm_count_one_forwards_immediately() {
+        let mut times = VecDeque::new();
+        let t0 = Instant::now();
+        // Legacy behaviour: every detection confirms on its own.
+        assert!(confirm_step(&mut times, t0, Duration::from_millis(3000), 1));
+        assert!(confirm_step(
+            &mut times,
+            t0 + Duration::from_millis(10_000),
+            Duration::from_millis(3000),
+            1
+        ));
+    }
+
+    #[test]
+    fn confirm_two_within_window_then_resets() {
+        let win = Duration::from_millis(3000);
+        let mut times = VecDeque::new();
+        let t0 = Instant::now();
+        // First of a pair: not enough yet.
+        assert!(!confirm_step(&mut times, t0, win, 2));
+        // Second within 3 s: confirms.
+        assert!(confirm_step(&mut times, t0 + Duration::from_millis(2000), win, 2));
+        // After a confirm the deque is cleared, so a lone detection later
+        // does not immediately re-confirm.
+        assert!(!confirm_step(&mut times, t0 + Duration::from_millis(5000), win, 2));
+        // A follow-up that lands AFTER the window from the lone one only
+        // leaves one in the window → still no confirm.
+        assert!(!confirm_step(&mut times, t0 + Duration::from_millis(9000), win, 2));
     }
 }
