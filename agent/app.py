@@ -69,7 +69,7 @@ from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
-from tools import TOOL_ACK_PHRASES, all_tools
+from tools import TOOL_ACK_PHRASES, all_tools, set_reset_memory_hook
 
 log = logging.getLogger("agent")
 
@@ -105,7 +105,7 @@ MAX_HISTORY_TOKENS = int(os.environ.get("AGENT_MAX_HISTORY_TOKENS", "4096"))
 # deterministic — re-invoking the model just to paraphrase "done" only adds a
 # whole model-call of latency. A failed one falls back to the LLM so it can
 # explain. See build_react_graph's terminal-tool routing.
-TERMINAL_TOOLS = {"stop_audio"}
+TERMINAL_TOOLS = {"stop_audio", "reset_memory"}
 # Log every LLM turn's raw output (tool_calls / content / additional_kwargs incl.
 # any reasoning) at INFO so tool-calling can be debugged — e.g. did the model
 # actually emit `stop_audio`, or just reason+text? Set AGENT_LOG_LLM_RAW=false to
@@ -466,6 +466,19 @@ class SessionManager:
                     now - self.last_active, old, self.current_session,
                 )
             self.last_active = now
+            return self.current_session
+
+    async def reset(self) -> str:
+        """Force a fresh session id NOW (bypassing the idle gap), so the next
+        turn starts with empty conversation memory in the checkpointer (fresh
+        `thread_id`). The current turn keeps running on its already-claimed id,
+        so the "reset" request itself stays on the old, now-abandoned thread.
+        Wired to the `reset_memory` tool via set_reset_memory_hook."""
+        async with self.lock:
+            old = self.current_session
+            self.current_session = uuid.uuid4().hex
+            self.last_active = time.monotonic()
+            log.info("session reset (manual): %s -> %s", old, self.current_session)
             return self.current_session
 
 
@@ -1010,6 +1023,9 @@ async def amain() -> None:
 
     graph = build_react_graph(llm, saver) if TOOLS_ENABLED else build_legacy_graph(llm, saver)
     sessions = SessionManager(SESSION_IDLE_SEC)
+    # Let the reset_memory tool clear conversation memory by rotating the
+    # session id (next turn → fresh thread_id → empty history).
+    set_reset_memory_hook(sessions.reset)
 
     app = web.Application()
     app["graph"] = graph

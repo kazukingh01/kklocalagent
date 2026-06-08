@@ -1336,6 +1336,43 @@ async def _safe_invoke(name: str, coro) -> str:
         return f"[error] {type(e).__name__}: {e}"
 
 
+# --- conversation-memory reset -----------------------------------------
+# Handle for `reset_memory` to clear the LangGraph conversation history.
+# Tools are standalone functions with no reference to app.py's
+# SessionManager, so app.py registers a callback here at startup
+# (set_reset_memory_hook(sessions.reset)). The callback rotates the session
+# id → the NEXT turn runs on a fresh thread_id = empty memory. The current
+# turn (the "reset" request itself) stays on the old, now-abandoned thread.
+_RESET_MEMORY_HOOK = None
+
+
+def set_reset_memory_hook(fn) -> None:
+    """Register the async () -> str callback that clears conversation memory.
+    app.py wires this to SessionManager.reset."""
+    global _RESET_MEMORY_HOOK
+    _RESET_MEMORY_HOOK = fn
+
+
+async def _reset_memory_impl() -> str:
+    if _RESET_MEMORY_HOOK is None:
+        # Tools enabled but app.py never wired the hook — surface, don't lie.
+        raise RuntimeError("reset hook not registered")
+    await _RESET_MEMORY_HOOK()
+    return "会話の記憶をリセットした"
+
+
+@tool
+async def reset_memory() -> str:
+    """Clear the conversation memory / context and start fresh.
+
+    Takes no arguments. Call this when the user asks to forget the
+    conversation or start over — for example 「記憶をリセットして」「履歴を
+    消して」「忘れて」「最初から」「新しい会話にして」. Afterwards you no
+    longer remember anything said earlier in this conversation.
+    """
+    return await _safe_invoke("reset_memory", _reset_memory_impl())
+
+
 # --- tool 登録 ----------------------------------------------------------
 
 def all_tools() -> list:
@@ -1353,6 +1390,7 @@ def all_tools() -> list:
         start_timer,
         check_timers,
         cancel_timer,
+        reset_memory,
     ]
 
 
@@ -1386,6 +1424,9 @@ TOOL_ACK_PHRASES: dict[str, str | None] = {
     "start_timer": None,
     "check_timers": None,
     "cancel_timer": None,
+    # reset_memory is terminal (no 2nd LLM call) — this fixed line IS the
+    # spoken confirmation. Overridable like the others.
+    "reset_memory": os.environ.get("AGENT_TOOL_ACK_RESET_MEMORY", "記憶をリセットしたよ。"),
 }
 
 
