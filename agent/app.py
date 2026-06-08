@@ -288,18 +288,18 @@ _FEWSHOT_DEFAULT: list[dict] = [
 
     {"role": "user", "content": "今日の天気は？"},
     {"role": "assistant", "tool_calls": [{"name": "web_search", "args": {"query": "今日の天気"}}]},
-    {"role": "tool", "name": "web_search", "content": "東京は晴れ、最高22度の見込み。"},
-    {"role": "assistant", "content": "東京は晴れで、最高22度くらいみたいだよ。"},
+    {"role": "tool", "name": "web_search", "content": "AAは晴れ、最高BB度の見込み。"},
+    {"role": "assistant", "content": "AAは晴れで、最高BB度くらいみたいだよ。"},
 
     {"role": "user", "content": "今日って何日だっけ？"},
     {"role": "assistant", "tool_calls": [{"name": "run_shell", "args": {"command": "date"}}]},
-    {"role": "tool", "name": "run_shell", "content": "Sat Jun  7 11:30:00 JST 2026"},
-    {"role": "assistant", "content": "今日は6月7日だよ。"},
+    {"role": "tool", "name": "run_shell", "content": "AA BB  X HH:MM:SS JST YYYY"},
+    {"role": "assistant", "content": "今日X月X日だよ。"},
 
     {"role": "user", "content": "今何時？"},
     {"role": "assistant", "tool_calls": [{"name": "run_shell", "args": {"command": "date"}}]},
-    {"role": "tool", "name": "run_shell", "content": "Sat Jun  7 11:30:00 JST 2026"},
-    {"role": "assistant", "content": "時刻は11時30分だよ。"},
+    {"role": "tool", "name": "run_shell", "content": "AA BB  X HH:MM:SS JST YYYY"},
+    {"role": "assistant", "content": "時刻はHH時MM分だよ。"},
 
     {"role": "user", "content": "news フォルダの中に何がある？"},
     {"role": "assistant", "tool_calls": [{"name": "run_shell", "args": {"command": "ls /workspace/share/news"}}]},
@@ -309,16 +309,16 @@ _FEWSHOT_DEFAULT: list[dict] = [
     {"role": "user", "content": "shareのメモ読んで"},
     {"role": "assistant", "tool_calls": [{"name": "run_shell", "args": {"command": "ls /workspace/share"}}]},
     {"role": "tool", "name": "run_shell", "content": "memo.txt\nnews/"},
-    {"role": "assistant", "tool_calls": [{"name": "read_file", "args": {"path": "/workspace/share/memo.txt"}}]},
-    {"role": "tool", "name": "read_file", "content": "牛乳を買う\n電池を買う"},
-    {"role": "assistant", "content": "メモには、牛乳と電池を買うって書いてあるよ。"},
+    {"role": "assistant", "tool_calls": [{"name": "read_file", "args": {"path": "/workspace/share/xxxxxx.txt"}}]},
+    {"role": "tool", "name": "read_file", "content": "XXXXXXXXXXXXXXXXXX"},
+    {"role": "assistant", "content": "メモには、XXXXXXXXXXXXXXXXXXって書いてあるよ。"},
 
-    {"role": "user", "content": "〇〇の音声流して"},
-    {"role": "assistant", "tool_calls": [{"name": "play_audio_file", "args": {"paths": ["/workspace/share/news/20260607_morning.wav"]}}]},
+    {"role": "user", "content": "〇〇の音声再生して"},
+    {"role": "assistant", "tool_calls": [{"name": "play_audio_file", "args": {"paths": ["/workspace/share/news/xxxxxxxxxxxx.wav"]}}]},
     {"role": "tool", "name": "play_audio_file", "content": "再生を開始した"},
     {"role": "assistant", "content": "音声を流すね。"},
 
-    {"role": "user", "content": "〇〇の音声全部流して"},
+    {"role": "user", "content": "〇〇の音声全部再生して"},
     {"role": "assistant", "tool_calls": [{"name": "play_audio_file", "args": {"paths": ["/workspace/share/news/*.wav"]}}]},
     {"role": "tool", "name": "play_audio_file", "content": "再生を開始した"},
     {"role": "assistant", "content": "音声を流すね。"},
@@ -326,7 +326,12 @@ _FEWSHOT_DEFAULT: list[dict] = [
     {"role": "user", "content": "システムチェックして"},
     {"role": "assistant", "tool_calls": [{"name": "system_health", "args": {}}]},
     {"role": "tool", "name": "system_health", "content": "agent OK / llm OK / tts OK / audio-io 応答なし"},
-    {"role": "assistant", "content": "だいたい元気だけど、audio-io が応答してないみたい。"},
+    {"role": "assistant", "content": "audio-io が応答してないみたい。それ以外は正常だよ"},
+
+    {"role": "user", "content": "記憶リセットして"},
+    {"role": "assistant", "tool_calls": [{"name": "reset_memory", "args": {}}]},
+    {"role": "tool", "name": "reset_memory", "content": "会話の記憶をリセットした"},
+    {"role": "assistant", "content": "記憶をリセットしたよ。"},
 ]
 
 
