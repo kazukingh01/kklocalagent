@@ -700,27 +700,37 @@ def build_react_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
     llm_with_tools = llm.bind_tools(tools)
 
     async def agent_node(state: MessagesState):
-        messages = _trim_history(list(state["messages"]))
-        # Fixed prefix: system prompt, then the tool-use few-shot, then the live
-        # (trimmed) history. Few-shot sits BEFORE history and is not persisted,
-        # so the cache prefix [system, *few-shot] stays stable across turns.
-        # Append the background-refreshed share knowledge block ("" when off).
-        # Goes at the END of the system content so THINK_PREFIX stays first.
+        history = _trim_history(list(state["messages"]))
+        # Insert the few-shot immediately BEFORE the most-recent user message,
+        # re-inserted every turn — keeps the examples adjacent to the current
+        # request (better recency for a weak model) instead of buried at the top.
+        # Trade-off vs a fixed top prefix: the block moves each turn, so the
+        # cross-turn prompt-cache prefix shrinks to [system(+share)] and the
+        # few-shot is re-prefilled per turn. Within one turn (agent→tool→agent)
+        # the insertion point is stable, so the in-turn cache still holds.
+        if FEWSHOT_MESSAGES:
+            last_user = next(
+                (i for i in range(len(history) - 1, -1, -1)
+                 if isinstance(history[i], HumanMessage)),
+                None,
+            )
+            if last_user is None:
+                body = [*FEWSHOT_MESSAGES, *history]
+            else:
+                body = [*history[:last_user], *FEWSHOT_MESSAGES, *history[last_user:]]
+        else:
+            body = list(history)
+        # System prompt + background-refreshed share knowledge block ("" when
+        # off). THINK_PREFIX stays at the very front (inside system_text).
         sys_content = system_text + SHARE_PRIMER
-        prefix: list = []
-        if sys_content:
-            prefix.append(SystemMessage(content=sys_content))
-        prefix.extend(FEWSHOT_MESSAGES)
-        messages = [*prefix, *messages]
+        messages = ([SystemMessage(content=sys_content)] if sys_content else []) + body
         if LOG_LLM_RAW:
-            # What the model RECEIVES this step. The static prefix (system +
-            # few-shot) is collapsed to a count; the live turn is shown in full
-            # so the tool RESULT fed back after a tool call is visible (this is
-            # the 2nd agent_node call of a turn).
+            # Show the live turn (system + few-shot omitted); the tool RESULT fed
+            # back after a tool call is visible here on the 2nd agent_node call.
             log.info(
-                "llm input: [system + %d few-shot] + %s",
+                "llm input: [system + %d few-shot before last user] + %s",
                 len(FEWSHOT_MESSAGES),
-                _fmt_msgs_for_log(messages[len(prefix):]),
+                _fmt_msgs_for_log(history),
             )
         response = await llm_with_tools.ainvoke(messages)
         if LOG_LLM_RAW:
@@ -819,9 +829,11 @@ async def warm_system_prefix() -> None:
     messages = []
     if system_text:
         messages.append(SystemMessage(content=system_text))
-    # Same few-shot prefix the react agent_node injects, so the warmed cache
-    # prefix [system, *few-shot] matches live turns exactly. Empty unless
-    # AGENT_TOOL_FEWSHOT is on (and tools enabled).
+    # few-shot goes right before the (only) user message, mirroring how the
+    # react agent_node now inserts it before the most-recent user message. This
+    # primes the [system, *few-shot] prefix for the FIRST real turn (history =
+    # [user]); later turns re-insert the few-shot deeper, so they re-prefill it.
+    # Empty unless AGENT_TOOL_FEWSHOT is on (and tools enabled).
     messages.extend(FEWSHOT_MESSAGES)
     messages.append(HumanMessage(content="ウォームアップ"))
     # Dedicated capped client: a couple of tokens fill the prefix KV and warm
