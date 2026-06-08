@@ -429,6 +429,125 @@ def _fmt_msgs_for_log(messages: list) -> str:
     return " | ".join(out)
 
 
+# --- Share-folder knowledge primer --------------------------------------
+# Inject a compact map of the mounted share dir into the system prompt so the
+# agent knows what's available without ls-ing every turn. Format: a tree of
+# DIRECTORIES only; each dir is summarised by an extension histogram of its
+# DIRECT files ("wav×42, txt×3"). This is *knowledge*, so it lives in the
+# system prompt — not in the few-shot (which teaches tool-call shape, not
+# facts). Rebuilt in the background every REFRESH_SEC so newly added files show
+# up without a restart; empty/disabled → no block, no behaviour change.
+#
+# Env family `AGENT_CONTEXT_*` = dynamic blocks injected into the system
+# prompt. `AGENT_CONTEXT_SHARE` is the first; future siblings would each get
+# their own toggle + builder + section (e.g. `AGENT_CONTEXT_DATETIME` to inject
+# today's date/time). The Python identifiers below stay share-specific.
+SHARE_PRIMER_ENABLED = os.environ.get("AGENT_CONTEXT_SHARE", "off").strip().lower() in (
+    "on", "true", "1", "yes"
+)
+SHARE_PRIMER_DIR = os.environ.get("AGENT_CONTEXT_SHARE_DIR", "/workspace/share")
+SHARE_PRIMER_REFRESH_SEC = float(os.environ.get("AGENT_CONTEXT_SHARE_REFRESH_SEC", "300"))
+SHARE_PRIMER_MAX_DIRS = int(os.environ.get("AGENT_CONTEXT_SHARE_MAX_DIRS", "20"))
+
+
+def _build_share_primer() -> str:
+    """Render the share dir as a dirs-only tree, each dir summarised by an
+    extension×count histogram of its direct files. When there are more than
+    MAX_DIRS directories, keep the MAX_DIRS most-recently-modified ones (by
+    dir mtime) plus their ancestors (so the tree stays connected) and omit the
+    rest. "" when disabled or missing. Pure filesystem walk — no LLM."""
+    if not SHARE_PRIMER_ENABLED:
+        return ""
+    root = os.path.abspath(SHARE_PRIMER_DIR)
+    if not os.path.isdir(root):
+        return ""
+    # Walk once, collecting every dir in tree pre-order (siblings sorted) with
+    # its own mtime + an extension histogram of its DIRECT files.
+    entries: list[tuple[str, int, float, str]] = []  # (rel, depth, mtime, summary)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        rel = os.path.relpath(dirpath, root)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        try:
+            mtime = os.stat(dirpath).st_mtime
+        except OSError:
+            mtime = 0.0
+        counts: dict[str, int] = {}
+        for f in filenames:
+            ext = os.path.splitext(f)[1].lower().lstrip(".") or "noext"
+            counts[ext] = counts.get(ext, 0) + 1
+        if counts:
+            items = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+            summary = ", ".join(f"{e}×{c}" for e, c in items[:8])
+            if len(items) > 8:
+                summary += f", +{len(items) - 8} more"
+        else:
+            summary = "—"
+        entries.append((rel, depth, mtime, summary))
+    if not entries:
+        return ""
+    # Rank only "content" dirs — those with no sub-directory of their own.
+    # Structural ancestors (root + intermediate dirs) are always shown for free
+    # and never consume the cap; otherwise a parent's mtime (bumped whenever a
+    # child is added) would crowd out the very leaves we want. So the cap = how
+    # many of the newest *leaf* dirs to keep.
+    rels = {e[0] for e in entries}
+
+    def _has_subdir(rel: str) -> bool:
+        if rel == ".":
+            return any(o != "." for o in rels)
+        prefix = rel + os.sep
+        return any(o != rel and o.startswith(prefix) for o in rels)
+
+    leaves = [e for e in entries if not _has_subdir(e[0])]
+    truncated = len(leaves) > SHARE_PRIMER_MAX_DIRS
+    if truncated:
+        newest = sorted(leaves, key=lambda e: e[2], reverse=True)[:SHARE_PRIMER_MAX_DIRS]
+        keep = {e[0] for e in newest}
+        for rel in list(keep):  # add ancestors so the tree stays connected
+            parts = rel.split(os.sep)
+            for i in range(1, len(parts)):
+                keep.add(os.sep.join(parts[:i]))
+        keep.add(".")
+        entries = [e for e in entries if e[0] in keep]
+    lines: list[str] = []
+    for rel, depth, _mtime, summary in entries:
+        name = (os.path.basename(root) or "share") if rel == "." else os.path.basename(rel)
+        lines.append(f"{'  ' * depth}{name}/  {summary}")
+    if truncated:
+        lines.append(
+            f"… (newest {SHARE_PRIMER_MAX_DIRS} of {len(leaves)} content dirs by mtime; older omitted)"
+        )
+    body = "\n".join(lines)
+    return (
+        f"\n\n## 共有フォルダ ({root}) の構成"
+        "（ディレクトリのみ。各 dir は直下ファイルを「拡張子×件数」で要約）\n"
+        f"{body}\n"
+        "これは現在の中身の参考。実際に再生/読み込みする前に、必要なら "
+        "ls / read_file で正確なファイル名・パスを確認すること。"
+    )
+
+
+SHARE_PRIMER = _build_share_primer()
+
+
+async def _refresh_share_primer_loop() -> None:
+    """Rebuild SHARE_PRIMER every REFRESH_SEC so newly added files appear in the
+    system prompt without a restart. Best-effort; the walk runs off-thread so it
+    never blocks the event loop. A change busts the prompt-cache prefix once."""
+    global SHARE_PRIMER
+    while True:
+        await asyncio.sleep(SHARE_PRIMER_REFRESH_SEC)
+        try:
+            new = await asyncio.to_thread(_build_share_primer)
+        except Exception as e:  # noqa: BLE001
+            log.warning("share primer refresh failed: %s", e)
+            continue
+        if new != SHARE_PRIMER:
+            SHARE_PRIMER = new
+            log.info("share primer refreshed (%d chars)", len(new))
+
+
 class SessionManager:
     """Owns the *current* session id and rotates it after a configurable
     idle gap.
@@ -585,9 +704,12 @@ def build_react_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
         # Fixed prefix: system prompt, then the tool-use few-shot, then the live
         # (trimmed) history. Few-shot sits BEFORE history and is not persisted,
         # so the cache prefix [system, *few-shot] stays stable across turns.
+        # Append the background-refreshed share knowledge block ("" when off).
+        # Goes at the END of the system content so THINK_PREFIX stays first.
+        sys_content = system_text + SHARE_PRIMER
         prefix: list = []
-        if system_text:
-            prefix.append(SystemMessage(content=system_text))
+        if sys_content:
+            prefix.append(SystemMessage(content=sys_content))
         prefix.extend(FEWSHOT_MESSAGES)
         messages = [*prefix, *messages]
         if LOG_LLM_RAW:
@@ -691,7 +813,9 @@ async def warm_system_prefix() -> None:
         system_text = SYSTEM_PROMPT
     # Match the real graph's system prompt exactly (incl. mode-2 <|think|>
     # prefix) so the warmed prompt-cache prefix lines up with live turns.
-    system_text = THINK_PREFIX + system_text
+    # Match the real graph's system content exactly (THINK_PREFIX first, share
+    # primer last) so the warmed prompt-cache prefix lines up with live turns.
+    system_text = THINK_PREFIX + system_text + SHARE_PRIMER
     messages = []
     if system_text:
         messages.append(SystemMessage(content=system_text))
@@ -1049,11 +1173,25 @@ async def amain() -> None:
     # so the first real turn doesn't re-prefill it. Best-effort; serving has
     # already started, and the wake-word flow means no real turn lands first.
     warmup_task = asyncio.create_task(warm_system_prefix())
+    # Keep the share knowledge block fresh (initial build already ran at import;
+    # this only handles ongoing changes). Skipped entirely when disabled.
+    primer_task = (
+        asyncio.create_task(_refresh_share_primer_loop())
+        if SHARE_PRIMER_ENABLED
+        else None
+    )
+    if SHARE_PRIMER_ENABLED:
+        log.info(
+            "share primer enabled: dir=%s refresh=%.0fs (initial %d chars)",
+            SHARE_PRIMER_DIR, SHARE_PRIMER_REFRESH_SEC, len(SHARE_PRIMER),
+        )
 
     try:
         await asyncio.Event().wait()
     finally:
         warmup_task.cancel()
+        if primer_task is not None:
+            primer_task.cancel()
         await runner.cleanup()
         await conn.close()
 

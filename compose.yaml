@@ -484,6 +484,19 @@ services:
       # against any future tool that might. If you need rw, change the
       # mount line in this file directly.
       AGENT_SHARE_DIR: "${AGENT_SHARE_DIR:-./share}"
+      # Share knowledge primer: inject a compact map of /workspace/share into
+      # the system prompt so the agent knows what's available without ls-ing
+      # every turn. Format = a tree of DIRECTORIES only, each dir summarised by
+      # an extension histogram of its direct files (e.g. "news/  wav×42"). It's
+      # rebuilt in the background every REFRESH_SEC, so files dropped into the
+      # share appear within that window (one prompt-cache miss per change). Set
+      # AGENT_CONTEXT_SHARE=off to disable. DIR defaults to the mount above.
+      AGENT_CONTEXT_SHARE: "${AGENT_CONTEXT_SHARE:-on}"
+      AGENT_CONTEXT_SHARE_DIR: "${AGENT_CONTEXT_SHARE_DIR:-/workspace/share}"
+      AGENT_CONTEXT_SHARE_REFRESH_SEC: "${AGENT_CONTEXT_SHARE_REFRESH_SEC:-300}"
+      # Cap on directories shown. When exceeded, keep the N most-recently
+      # MODIFIED dirs (by mtime) + their ancestors; older dirs are omitted.
+      AGENT_CONTEXT_SHARE_MAX_DIRS: "${AGENT_CONTEXT_SHARE_MAX_DIRS:-20}"
       # web_search tool — filler ack phrase the agent emits before the
       # actual DuckDuckGo round-trip, so the voice agent doesn't go
       # silent for the ~1-2 s search latency. Set empty to disable
