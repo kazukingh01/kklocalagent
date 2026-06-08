@@ -553,6 +553,56 @@ async def _refresh_share_primer_loop() -> None:
             log.info("share primer refreshed (%d chars)", len(new))
 
 
+def _compose_system_text() -> str:
+    """The system-prompt TEXT the LLM sees, before the share-context block:
+    THINK_PREFIX (mode 2 only) + persona + (tool-use policy when tools are on).
+    Single source of truth shared by the react graph, warmup, and the startup
+    prompt preview so they can't drift."""
+    if TOOLS_ENABLED:
+        base = (SYSTEM_PROMPT + TOOL_SYSTEM_SUFFIX) if SYSTEM_PROMPT else TOOL_SYSTEM_SUFFIX.strip()
+    else:
+        base = SYSTEM_PROMPT
+    return THINK_PREFIX + base
+
+
+def _log_full_prompt_preview() -> None:
+    """At startup, log the FULL fixed prefix the LLM will receive for a turn —
+    system prompt + AGENT_CONTEXT share block + few-shot — exactly as assembled
+    given the current AGENT_REASONING / AGENT_CONTEXT_SHARE / AGENT_TOOL_FEWSHOT
+    / AGENT_TOOLS_ENABLED settings (ON/OFF reflected in the actual content). The
+    live history + current user message are appended after this at request time;
+    this dump is the static part only. Gated by AGENT_LOG_LLM_RAW."""
+    if TOOLS_ENABLED:
+        sys_content = _compose_system_text() + SHARE_PRIMER
+        fewshot = FEWSHOT_MESSAGES
+    else:
+        sys_content = _compose_system_text()
+        fewshot = []
+    parts = [
+        "================= LLM PROMPT PREVIEW (startup) =================",
+        f"[settings] tools={TOOLS_ENABLED} reasoning_mode={REASONING_MODE} "
+        f"think_prefix={THINK_PREFIX!r} context_share={SHARE_PRIMER_ENABLED} "
+        f"few_shot={'on' if fewshot else 'off'}({len(fewshot)} msgs)",
+        "----------------------- SystemMessage -------------------------",
+        sys_content if sys_content else "(empty)",
+    ]
+    if fewshot:
+        parts.append(f"----------------- few-shot ({len(fewshot)} messages) -----------------")
+        for m in fewshot:
+            if isinstance(m, ToolMessage):
+                parts.append(f"[tool:{m.name}] {m.content}")
+            elif isinstance(m, AIMessage):
+                tcs = [(tc.get("name"), tc.get("args")) for tc in (m.tool_calls or [])]
+                parts.append(f"[assistant] content={m.content!r} tool_calls={tcs}")
+            elif isinstance(m, HumanMessage):
+                parts.append(f"[user] {m.content}")
+            else:
+                parts.append(f"[{type(m).__name__}] {getattr(m, 'content', '')}")
+    parts.append("-------- (then at request time: live history + current user) --------")
+    parts.append("===============================================================")
+    log.info("LLM prompt preview:\n%s", "\n".join(parts))
+
+
 class SessionManager:
     """Owns the *current* session id and rotates it after a configurable
     idle gap.
@@ -698,10 +748,9 @@ def build_react_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
     deltas via stream_mode="messages".
     """
     tools = all_tools()
-    system_text = (SYSTEM_PROMPT + TOOL_SYSTEM_SUFFIX) if SYSTEM_PROMPT else TOOL_SYSTEM_SUFFIX.strip()
-    # Prepend <|think|> (mode 2 only; empty otherwise). Goes FIRST so it's at
-    # the very start of the system prompt, which is where gemma4 expects it.
-    system_text = THINK_PREFIX + system_text
+    # THINK_PREFIX (mode 2) + persona + tool policy. Shared with warmup and the
+    # startup prompt preview via _compose_system_text so they can't drift.
+    system_text = _compose_system_text()
     llm_with_tools = llm.bind_tools(tools)
 
     async def agent_node(state: MessagesState):
@@ -822,15 +871,10 @@ async def warm_system_prefix() -> None:
     Never fatal: on any error the first turn just pays the prefill as before.
     The wake-word flow means no real turn arrives before this finishes.
     """
-    if TOOLS_ENABLED:
-        system_text = (SYSTEM_PROMPT + TOOL_SYSTEM_SUFFIX) if SYSTEM_PROMPT else TOOL_SYSTEM_SUFFIX.strip()
-    else:
-        system_text = SYSTEM_PROMPT
-    # Match the real graph's system prompt exactly (incl. mode-2 <|think|>
-    # prefix) so the warmed prompt-cache prefix lines up with live turns.
-    # Match the real graph's system content exactly (THINK_PREFIX first, share
-    # primer last) so the warmed prompt-cache prefix lines up with live turns.
-    system_text = THINK_PREFIX + system_text + SHARE_PRIMER
+    # Match the real graph's system content exactly (shared _compose_system_text
+    # + share-context block) so the warmed prompt-cache prefix lines up with the
+    # first live turn.
+    system_text = _compose_system_text() + SHARE_PRIMER
     messages = []
     if system_text:
         messages.append(SystemMessage(content=system_text))
@@ -1137,6 +1181,10 @@ async def amain() -> None:
         OLLAMA_BASE_URL, MODEL_NAME, DB_PATH, TOOLS_ENABLED, RECURSION_LIMIT,
         REASONING_MODE, REASONING is True, THINK_PREFIX,
     )
+    # Dump the full fixed prefix (system + share context + few-shot) the LLM
+    # will receive, as assembled from the current ON/OFF settings.
+    if LOG_LLM_RAW:
+        _log_full_prompt_preview()
 
     # ChatOllama streams tokens from ollama via httpx. temperature=0
     # matches the orchestrator's previous /api/chat config (no temp
