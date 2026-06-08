@@ -155,6 +155,14 @@ pub struct TtsConfig {
     /// bump higher if you've raised hang_frames to 20+ in .env.
     /// 0 disables, only safe with upstream AEC.
     pub tail_quiet_ms: u64,
+    /// Short phrase spoken via `/speak` the moment a WakeWordDetected is
+    /// accepted, as audible "I heard you" feedback (so the operator knows the
+    /// wake fired without watching the screen). Empty disables it. NOTE: it
+    /// synthesises through tts-streamer (~0.5–1 s latency) and plays on the TTS
+    /// track, so during the post-wake listen window its own audio can reach the
+    /// mic — rely on audio-io AEC (or keep it very short) to avoid self-firing
+    /// VAD.
+    pub wake_ack_text: String,
 }
 
 /// Wake-word gating policy. Controls whether SpeechEnded events
@@ -265,6 +273,8 @@ impl Default for TtsConfig {
             timeout_ms: 60_000,
             max_inflight: 1,
             tail_quiet_ms: 400,
+            // Empty = no wake ack. Compose opts in.
+            wake_ack_text: String::new(),
         }
     }
 }

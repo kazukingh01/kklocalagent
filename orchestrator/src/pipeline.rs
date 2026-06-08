@@ -467,6 +467,18 @@ async fn tts_speak_inner(backends: &Backends, api: &str, url: &str, text: &str) 
     }
 }
 
+/// Speak the one-off wake-ack phrase (`tts.wake_ack_text`) via `/speak` — the
+/// audible "I heard you" cue emitted when a WakeWordDetected is accepted.
+/// No-op when the phrase or the TTS url is empty. Best-effort: errors are
+/// logged inside `tts_speak_inner`, never propagated.
+pub async fn tts_wake_ack(backends: &Backends) {
+    let text = backends.tts.wake_ack_text.trim();
+    if text.is_empty() || backends.tts.url.is_empty() {
+        return;
+    }
+    tts_speak_inner(backends, "wake-ack", &backends.tts.url, text).await;
+}
+
 /// POST `tts.finalize_url` to wait for tts-streamer's drain
 /// handshake with audio-io. Returns when audio-io reports its
 /// playback ring is empty (= the speaker fell silent). Caller

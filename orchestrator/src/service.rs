@@ -28,7 +28,7 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::events::EventEnvelope;
-use crate::pipeline::{self, forward_to_result_sink, tts_stop, Backends};
+use crate::pipeline::{self, forward_to_result_sink, tts_stop, tts_wake_ack, Backends};
 use crate::state::{DispatchOutcome, SpeechStartedOutcome, WakeMachine, WakeResult};
 
 #[derive(Clone)]
@@ -304,7 +304,8 @@ async fn events(
                 forward_to_result_sink(&backends_for_sink, &payload).await;
             });
 
-            match state.wake.on_wake() {
+            let wake_result = state.wake.on_wake();
+            match &wake_result {
                 WakeResult::Bypass => {
                     info!(
                         target: "orch::events",
@@ -363,8 +364,21 @@ async fn events(
                     let backends_for_stop = state.backends.clone();
                     tokio::spawn(async move {
                         tts_stop(&backends_for_stop).await;
+                        // Speak the wake ack AFTER the /stop drains so the
+                        // barge-in flush doesn't cut it off.
+                        tts_wake_ack(&backends_for_stop).await;
                     });
                 }
+            }
+            // Audible wake-ack feedback for the accepted-and-not-barge-in
+            // cases (BargeIn speaks its own ack after the TTS /stop above).
+            // No-op when tts.wake_ack_text is empty. Spawned so the events
+            // handler still returns 200 immediately.
+            if !matches!(wake_result, WakeResult::BargeIn) {
+                let backends_for_ack = state.backends.clone();
+                tokio::spawn(async move {
+                    tts_wake_ack(&backends_for_ack).await;
+                });
             }
         }
         other => {

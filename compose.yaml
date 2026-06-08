@@ -623,6 +623,13 @@ services:
       # turn whose ASR text is the tail of the assistant's reply.
       # Bump higher in .env if you've raised VAD_HANG_FRAMES.
       ORCH_TTS_TAIL_QUIET_MS: "${ORCH_TTS_TAIL_QUIET_MS:-400}"
+      # Wake-ack: a short phrase spoken via tts-streamer the instant a
+      # WakeWordDetected is accepted, so you can hear that the wake fired
+      # without watching the screen. Empty disables it. Keep it SHORT — it
+      # synthesises (~0.3-1 s) and plays on the TTS track during the post-wake
+      # listen window, so its own audio can reach the mic; rely on audio-io AEC
+      # (or a brief phrase) to avoid self-firing VAD. Set "OK" etc. as you like.
+      ORCH_WAKE_ACK_TEXT: "${ORCH_WAKE_ACK_TEXT:-はい}"
       # Pipe-separated substring blacklist for known Whisper
       # hallucinations. ASR outputs containing any of these are
       # treated as empty (no LLM, no TTS). Whisper fills ambiguous

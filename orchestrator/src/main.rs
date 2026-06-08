@@ -73,6 +73,12 @@ struct Args {
     #[arg(long, env = "ORCH_TTS_TAIL_QUIET_MS")]
     tts_tail_quiet_ms: Option<u64>,
 
+    /// Override `tts.wake_ack_text`. Short phrase spoken via tts-streamer
+    /// /speak the moment a WakeWordDetected is accepted — audible "I heard
+    /// you" feedback. Empty disables it.
+    #[arg(long, env = "ORCH_WAKE_ACK_TEXT")]
+    wake_ack_text: Option<String>,
+
     /// Override `wake.required` (true / false).
     #[arg(long, env = "ORCH_WAKE_REQUIRED")]
     wake_required: Option<bool>,
@@ -152,6 +158,9 @@ async fn main() -> Result<()> {
     }
     if let Some(v) = args.tts_tail_quiet_ms {
         config.tts.tail_quiet_ms = v;
+    }
+    if let Some(v) = args.wake_ack_text {
+        config.tts.wake_ack_text = v;
     }
     if let Some(v) = args.wake_required {
         config.wake.required = v;
