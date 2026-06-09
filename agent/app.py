@@ -586,6 +586,24 @@ def _log_full_prompt_preview() -> None:
         "----------------------- SystemMessage -------------------------",
         sys_content if sys_content else "(empty)",
     ]
+    if TOOLS_ENABLED:
+        # The actual tool DEFINITIONS (name/description/params) the model can
+        # call. These are sent natively via llm.bind_tools(...) → ollama's
+        # `tools` field, SEPARATE from the messages above — that's why they
+        # don't appear in the per-turn `llm input` log.
+        tools = all_tools()
+        parts.append(
+            f"------------- tools ({len(tools)}) → native `tools` field (bind_tools) -------------"
+        )
+        for t in tools:
+            try:
+                args = ", ".join(
+                    f"{k}:{(v or {}).get('type', '?')}" for k, v in (t.args or {}).items()
+                )
+            except Exception:  # noqa: BLE001
+                args = "?"
+            parts.append(f"• {t.name}({args})")
+            parts.append(f"    {t.description}")
     if fewshot:
         parts.append(f"----------------- few-shot ({len(fewshot)} messages) -----------------")
         for m in fewshot:
