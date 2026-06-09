@@ -163,7 +163,7 @@ services:
       # (AGENT_MAX_HISTORY_TOKENS) before each call; 16 k gives that
       # trimming comfortable headroom over the system prompt + tool
       # schemas + generation.
-      OLLAMA_CONTEXT_LENGTH: "${OLLAMA_CONTEXT_LENGTH:-16384}"
+      OLLAMA_CONTEXT_LENGTH: "${OLLAMA_CONTEXT_LENGTH:-4096}"
       # Force the quantised matrix-multiplication CUDA kernel (MMQ)
       # instead of the cuBLAS-on-dequantised path. For Q4_K_M models
       # on Ada (RTX 4090 / 4090 Laptop, compute 8.9) MMQ is reliably
