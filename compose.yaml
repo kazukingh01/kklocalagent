@@ -177,6 +177,12 @@ services:
       # Don't let a stray /api/show or warm-pull hold a second model
       # resident: voice agent only needs the one configured weight.
       OLLAMA_MAX_LOADED_MODELS: "1"
+      # Log verbosity (see .env.example). 2 = trace: logs each streamed
+      # chunk PRE-parse as "builtin parser input" — the model's verbatim
+      # output (tool_call blocks / thinking tags) before ollama's parser
+      # strips them. Only fires on models with a builtin parser
+      # (gemma4-architecture GGUFs get parser=gemma4 at pull time).
+      OLLAMA_DEBUG: "${OLLAMA_DEBUG:-0}"
       # Forwarded to huggingface-cli inside init.sh — only consulted
       # when LLM_MODEL ends in `-mtp` (target + drafter safetensors
       # for the MTP build path are gated Gemma weights). Plain ollama
