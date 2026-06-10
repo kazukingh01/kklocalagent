@@ -52,6 +52,13 @@ pub struct AppState {
 pub struct PlaybackTrack {
     pub sender: mpsc::Sender<PlaybackMessage>,
     pub flush: Arc<FlushSignals>,
+    /// Notified by `/spk/stop?track=N` to also *close* this track's active
+    /// `/spk` WS, not just flush the ring. Without it, a client streaming
+    /// continuously (e.g. the agent's fire-and-forget file playback) would
+    /// simply refill the ring after a flush and keep playing. `handle_spk`
+    /// selects on this and closes the socket; `notify_waiters()` only wakes
+    /// the currently-connected sender(s), so future connections are unaffected.
+    pub close: Arc<tokio::sync::Notify>,
 }
 
 pub struct FlushSignals {

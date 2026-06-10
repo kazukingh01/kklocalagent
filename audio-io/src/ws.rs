@@ -96,10 +96,10 @@ async fn handle_spk(mut socket: WebSocket, state: AppState, track_id: usize) {
     // not anything related to /spk. Suppress that case so the log
     // line is unambiguously "this session's PCM throughput vs hw clock".
     let mut pcm_frames_received: u64 = 0;
-    let spk_tx = {
+    let (spk_tx, close) = {
         let guard = state.spk_tracks.lock().await;
         match guard.get(track_id) {
-            Some(t) => t.sender.clone(),
+            Some(t) => (t.sender.clone(), t.close.clone()),
             None => {
                 warn!(
                     track_id,
@@ -137,7 +137,28 @@ async fn handle_spk(mut socket: WebSocket, state: AppState, track_id: usize) {
         })
     };
 
-    while let Some(msg) = socket.recv().await {
+    // Break the recv loop on either a client message or a /spk/stop close
+    // signal for this track. The `Notified` future is created once and pinned
+    // so it stays registered across iterations (no lost wakeup); `biased`
+    // checks the close first so a stop is acted on promptly.
+    let close_notified = close.notified();
+    tokio::pin!(close_notified);
+    loop {
+        let msg = tokio::select! {
+            biased;
+            _ = &mut close_notified => {
+                info!(track_id, "spk ws: closed by /spk/stop");
+                let _ = socket
+                    .send(Message::Close(Some(CloseFrame {
+                        code: close_code::NORMAL,
+                        reason: Cow::Borrowed("stopped by /spk/stop"),
+                    })))
+                    .await;
+                break;
+            }
+            recv = socket.recv() => recv,
+        };
+        let Some(msg) = msg else { break };
         match msg {
             Ok(Message::Binary(data)) => {
                 if data.len() % 2 != 0 {

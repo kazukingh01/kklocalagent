@@ -47,7 +47,10 @@ pub struct RuntimeConfig {
     /// outputs at the OS layer, so independent senders never interfere.
     /// `/spk` (no query) defaults to track 0 for backwards compatibility
     /// with the existing TTS-streamer client; new callers (e.g. an agent
-    /// playing pre-rendered audio files) pass `?track=1`.
+    /// playing pre-rendered audio files) pass `?track=1`, and the agent's
+    /// timer alarm fires on `?track=2`. The default of 3 covers all three;
+    /// a value below the highest track any client requests makes audio-io
+    /// close that `?track=N` WS immediately (the alarm just won't sound).
     pub playback_tracks: u32,
 }
 
@@ -125,7 +128,12 @@ impl Default for RuntimeConfig {
             autostart: true,
             playback_buffer_ms: 200,
             mic_broadcast_frames: 64,
-            playback_tracks: 2,
+            // 3 = the stack's three logical playback channels: TTS (track 0),
+            // play_audio_file (track 1) and the timer alarm (track 2). The
+            // timer feature streams its beep to track 2, so a default of 2
+            // would silently drop every alarm (audio-io closes the ?track=2 WS
+            // immediately). Bump in lock-step if more channels are added.
+            playback_tracks: 3,
         }
     }
 }

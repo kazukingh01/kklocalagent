@@ -44,7 +44,7 @@ pub async fn run(cfg: Config, mut rx: mpsc::Receiver<Detection>) -> Result<()> {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.is_success() {
-                        info!(model = %det.model, score = det.score, "fired event");
+                        info!(model = %det.model, "fired event");
                     } else {
                         let body = resp.text().await.unwrap_or_default();
                         // chars().take() instead of byte slicing — the

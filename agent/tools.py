@@ -32,12 +32,14 @@ import audioop  # 3.11 で deprecated、3.13 で stdlib から削除。3.11 pin 
 import difflib
 import json
 import logging
+import math
 import os
+import struct
 import sys
 import time
 import wave
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 from langchain_core.tools import tool
@@ -73,9 +75,9 @@ _AUDIO_IO_WIRE_CHANNELS: int = int(os.environ.get("AGENT_AUDIO_IO_WIRE_CHANNELS"
 # `tomono`、レート変換は `ratecv`)。LLM が「48kHz の WAV ですが？」と
 # 言い訳せず再生できるようにするための保険。
 _AUDIO_SAMPLE_WIDTH = 2  # s16le 固定 (= 16-bit PCM)
-# 単一再生の壁時計上限 (秒)。1 時間の WAV をうっかり渡されると tool が
-# その間 block するので DoS 対策。
-_AUDIO_PLAY_MAX_S: float = float(os.environ.get("AGENT_AUDIO_PLAY_MAX_S", "300"))
+# 合計再生時間の上限は撤廃。ファイルは 1 本ずつ逐次デコードしてストリーミングする
+# (`_stream_files_to_spk`) のでメモリは常に ~1 本ぶんに収まり、長すぎる場合は
+# stop_audio / wake-word で止められる (旧 DoS 上限の代替)。
 
 
 def _derive_stop_url(spk_url: str) -> str:
@@ -206,32 +208,16 @@ def _build_run_shell_description() -> str:
     """
     if _SHELL_ALLOWLIST:
         listed = ", ".join(sorted(_SHELL_ALLOWLIST))
-        avail = f"Only these command names are allowed: **{listed}**"
+        avail = f"Allowed commands: {listed} — nothing else."
     else:
-        avail = (
-            "No commands are currently allowed "
-            "(AGENT_SHELL_ALLOWLIST is empty)"
-        )
-    cwd_hint = (
-        f"Current working directory is `{_FILE_ROOT}` "
-        "(same as the read_file root). Relative paths target files "
-        "inside that directory (e.g. `ls`, `cat memo.txt`). "
-        "Pass an absolute path to look elsewhere (e.g. `ls /etc`)."
-        if _FILE_ROOT
-        else "Current working directory is the agent container's "
-        "`/app`. Pass absolute paths to reach files outside it "
-        "(e.g. `ls /etc`)."
-    )
+        avail = "No commands are currently allowed (the allowlist is empty)."
+    cwd = f"`{_FILE_ROOT}` (the shared directory)" if _FILE_ROOT else "`/app`"
     return (
-        "Run one Linux shell command and return its stdout.\n\n"
-        f"{avail}. Anything else returns a [denied] error.\n"
-        "Pipes (`|`), redirects (`>`), and command chaining "
-        "(`;`, `&&`) are structurally impossible "
-        "(`shell=True` is not used).\n\n"
-        f"{cwd_hint}\n\n"
-        "`command` takes the executable name and its arguments "
-        "separated by spaces (e.g. `\"date\"`, `\"ls\"`). Each call "
-        "is capped at 5 seconds and stdout is truncated past 3KB."
+        "Run one Linux shell command and return its output. "
+        "Use it for the current date/time (`date`) or to list files (`ls`).\n"
+        f"{avail} No pipes, redirects, or `;`/`&&` chaining.\n"
+        f"`command` = executable + arguments (e.g. \"date\", \"ls news\"). "
+        f"Working directory: {cwd}."
     )
 
 
@@ -307,17 +293,12 @@ async def _web_search_impl(query: str) -> str:
 
 @tool
 async def web_search(query: str) -> str:
-    """Search the web and return up to 5 result summaries.
+    """Search the web and return up to 5 results (title / snippet / URL).
 
-    Call this for current news, product info, weather, or anything
-    you can't answer from your own knowledge. `query` is a natural-
-    language search string (e.g. `"weather in Tokyo today"`,
-    `"Rust async runtime comparison"`).
-
-    Results come back as `N. title / snippet / URL` per entry, up to
-    5 entries, with the whole payload capped at ~1500 characters.
-    Fetching full page bodies or following links is out of scope —
-    distil the snippets into a short natural-language answer.
+    Call this for news, weather, prices — anything current you can't
+    know yourself. `query` is a natural-language search string (e.g.
+    "東京 今日の天気"). You can't fetch full pages; answer from the
+    snippets in your own words.
     """
     return await _safe_invoke("web_search", _web_search_impl(query))
 
@@ -326,9 +307,8 @@ def _read_and_convert_wav(p: Path) -> tuple[bytes, float, int, int]:
     """単一 WAV を読んで wire format (rate/channels) に揃えた PCM を返す。
 
     返り値は `(pcm, duration_s, src_rate, src_ch)`。圧縮 / 非 s16le は raise。
-    duration の上限チェックはここではせず、呼び出し側が合計で判定する
-    (複数ファイルの合算で `_AUDIO_PLAY_MAX_S` を超えたら弾くため)。
-    sync I/O + CPU 仕事なので呼び出し側で `asyncio.to_thread` に乗せる。
+    sync I/O + CPU 仕事なので呼び出し側で `asyncio.to_thread` に乗せる
+    (`_stream_files_to_spk` が 1 本ずつ呼んで逐次ストリーミングする)。
     """
     with wave.open(str(p), "rb") as wav:
         comp = wav.getcomptype()
@@ -414,16 +394,167 @@ def _resolve_audio_path(path: str) -> Path:
     return p
 
 
-async def _play_audio_file_impl(paths: list[str] | str) -> str:
-    """play_audio_file 本体。1 本の audio-io /spk (?track=N) WS に、渡された
-    全 WAV の PCM を順に realtime ペーシングで流し込み、最後に一度だけ
-    `{"type":"eos"}` で drain handshake して終わる (ギャップレス連続再生)。
+def _is_audio_glob(path: str) -> bool:
+    """True if `path` looks like a glob pattern (vs a single file path)."""
+    return any(c in path for c in ("*", "?", "["))
 
-    全例外は `_safe_invoke` で string 化される。barge-in は orchestrator が
-    /api/chat の HTTP を切ることで `asyncio.CancelledError` を伝播させて
-    アボートする — その時点で `async with` の context manager が WS を閉じ、
-    audio-io 側もリングが drain → close を見て後始末する。これは連続再生の
-    途中でも効くので、複数ファイルでも 1 回の wake-word で全停止できる。
+
+def _expand_audio_glob(pattern: str) -> list[Path]:
+    """Expand a glob (e.g. `*.wav`, `news/2026*.wav`, `**/*.wav`) to matching
+    WAV files under `_FILE_ROOT`, sorted by name.
+
+    Confined to the root: an absolute pattern must be inside it, `..` is
+    rejected, and every match is re-checked with `relative_to(root)` (defence
+    in depth). Non-`.wav` matches are skipped — the tool only plays WAV — so a
+    bare `*` plays just the audio files. Raises if nothing matches so the LLM
+    gets a clear error instead of silent no-op."""
+    if not _FILE_ROOT:
+        raise ValueError(
+            f"cannot expand audio glob {pattern!r}: AGENT_FILE_ROOT is not set"
+        )
+    root = Path(_FILE_ROOT).resolve()
+    pat = Path(pattern)
+    if pat.is_absolute():
+        try:
+            rel = pat.relative_to(root)
+        except ValueError as e:
+            raise ValueError(
+                f"glob {pattern!r} is outside the share root {root}"
+            ) from e
+    else:
+        rel = pat
+    if ".." in rel.parts:
+        raise ValueError(f"glob must not contain '..': {pattern!r}")
+    matches: list[Path] = []
+    for p in sorted(root.glob(str(rel))):
+        if not p.is_file() or p.suffix.lower() != ".wav":
+            continue
+        rp = p.resolve()
+        try:
+            rp.relative_to(root)
+        except ValueError:
+            continue
+        matches.append(rp)
+    if not matches:
+        raise FileNotFoundError(
+            f"no .wav files match glob {pattern!r} under the share root"
+        )
+    return matches
+
+
+# Detached playback tasks (fire-and-forget). Hold strong refs so the event
+# loop doesn't GC a running task mid-stream; the done-callback drops them.
+_PLAYBACK_TASKS: set = set()
+
+
+async def _stream_files_to_spk(
+    session: aiohttp.ClientSession,
+    ws: aiohttp.ClientWebSocketResponse,
+    paths: list[Path],
+    first_pcm: bytes,
+    bytes_per_frame: int,
+    label: str,
+) -> None:
+    """Background half of play_audio_file: realtime-stream each file's PCM over
+    an ALREADY-CONNECTED `ws`, gaplessly, then EOS/drain, and always close
+    ws + session.
+
+    Files are decoded ONE AT A TIME, prefetching file i+1 while file i streams
+    (file 0 was decoded in the foreground). So playback starts immediately, only
+    ~one file of PCM is ever in memory, and there is NO total-duration cap — a
+    big "play all" just streams for as long as it takes (stop it with stop_audio
+    or wake-word). A file that fails to decode mid-run is logged and skipped.
+
+    Connect failures were already surfaced to the LLM in the foreground; this
+    detached task only does the realtime work, so play_audio_file stays
+    non-blocking. Stops early when `/spk/stop?track=N` closes the ws."""
+    next_task = None
+    try:
+        start = time.monotonic()
+        frame_idx = 0
+        pcm = first_pcm
+        for i in range(len(paths)):
+            # Decode the NEXT file while this one streams, so its PCM is ready
+            # the instant the current file ends (gapless). Decode << realtime, so
+            # it finishes during the per-frame sleeps below.
+            next_task = (
+                asyncio.create_task(
+                    asyncio.to_thread(_read_and_convert_wav, paths[i + 1])
+                )
+                if i + 1 < len(paths)
+                else None
+            )
+            offset = 0
+            while offset < len(pcm):
+                chunk = pcm[offset : offset + bytes_per_frame]
+                offset += len(chunk)
+                # 末尾の半端な chunk だけパディング (audio-io は奇数バイト拒否)。
+                if len(chunk) % 2 != 0:
+                    chunk = chunk + b"\x00"
+                await ws.send_bytes(chunk)
+                frame_idx += 1
+                # 実時間ペーシング (連結全体で連続。ファイル境界も跨いで一定)。
+                target = start + frame_idx * _AUDIO_PLAY_FRAME_MS / 1000.0
+                sleep_for = target - time.monotonic()
+                if sleep_for > 0:
+                    await asyncio.sleep(sleep_for)
+            if next_task is not None:
+                try:
+                    pcm, _dur, _rate, _ch = await next_task
+                except Exception as e:  # noqa: BLE001
+                    log.warning(
+                        "play_audio_file: skipping %s (%s: %s)",
+                        paths[i + 1].name, type(e).__name__, e,
+                    )
+                    pcm = b""  # skipped file contributes no audio
+        # Drain handshake: eos を送ってから "drained" が戻るまで待つ。
+        await ws.send_str(json.dumps({"type": "eos"}))
+        try:
+            msg = await asyncio.wait_for(
+                ws.receive(), timeout=_AUDIO_DRAIN_TIMEOUT_S
+            )
+            if msg.type != aiohttp.WSMsgType.TEXT:
+                log.warning(
+                    "play_audio_file: drain reply was %s, not TEXT", msg.type
+                )
+        except asyncio.TimeoutError:
+            log.warning(
+                "play_audio_file: drain handshake timed out after %.0fs",
+                _AUDIO_DRAIN_TIMEOUT_S,
+            )
+        log.info("play_audio_file: finished playback (%s)", label)
+    except asyncio.CancelledError:
+        log.info("play_audio_file: playback cancelled (%s)", label)
+        raise
+    except Exception as e:  # noqa: BLE001
+        # WS closed by /spk/stop mid-stream, connection dropped, etc. Once
+        # streaming has started these are normal "playback ended" conditions
+        # (setup failures were already caught at connect time), so just log.
+        log.info(
+            "play_audio_file: playback ended early (%s): %s", type(e).__name__, e
+        )
+    finally:
+        # Disown any in-flight prefetch decode (e.g. stopped mid-sequence: the
+        # ws was closed by /spk/stop, so the remaining files won't play) and
+        # always release the foreground-opened ws + session.
+        if next_task is not None and not next_task.done():
+            next_task.cancel()
+        try:
+            await ws.close()
+        finally:
+            await session.close()
+
+
+async def _play_audio_file_impl(paths: list[str] | str) -> str:
+    """play_audio_file 本体。全 WAV を検証・デコードし、audio-io /spk (?track=N)
+    WS を **前景で接続** してから、realtime 送信＋drain を **背景タスク** に投げて
+    即 return する (非ブロック・ギャップレス連続再生)。
+
+    接続失敗 (audio-io 未到達 / track 不正) はこの前景で raise され `_safe_invoke`
+    が string 化して LLM に返す (= 再生できなかったと気付ける)。再生開始後の停止は
+    `stop_audio` ツール / 任意プロセスの `POST /spk/stop?track=N` / wake-word
+    barge-in のいずれでも効く (audio-io が ring flush ＋ その track の WS close →
+    背景タスクの送信が例外で終了)。背景タスクは終了時に ws+session を必ず閉じる。
     """
     if not _AUDIO_IO_SPK_URL:
         raise RuntimeError(
@@ -436,90 +567,62 @@ async def _play_audio_file_impl(paths: list[str] | str) -> str:
     if not paths:
         raise ValueError("no audio file given; pass at least one WAV path")
 
-    # 1 件でも見つからない / 不正なら、再生を一切始める前に弾く。
-    # 連続再生は単一 drain なので、途中で中断するより全件検証してから
-    # 流し始める方が「半分だけ鳴った」状態を避けられる。
-    resolved = [_resolve_audio_path(path) for path in paths]
+    # 各 entry をファイル or glob として解決する。glob (`*.wav` 等) は root 配下の
+    # 一致 .wav を名前順で展開。1 件でも見つからない / 不正なら、再生を一切始める
+    # 前に弾く (連続再生は単一 drain なので、途中中断より全件検証が安全)。
+    resolved: list[Path] = []
+    for path in paths:
+        if _is_audio_glob(path):
+            resolved.extend(_expand_audio_glob(path))
+        else:
+            resolved.append(_resolve_audio_path(path))
 
-    # 全ファイルを読んで wire format に揃え、合計 duration で上限を判定する。
-    # WAV パース + リサンプルは sync I/O + CPU 仕事なのでまとめて thread に
-    # オフロード。返すのは連結用の (name, pcm) と、ログ用の変換メモ。
-    def _read_all() -> tuple[list[tuple[str, bytes]], float, list[str]]:
-        clips: list[tuple[str, bytes]] = []
-        total_s = 0.0
-        notes: list[str] = []
-        for p in resolved:
-            pcm, dur, src_rate, src_ch = _read_and_convert_wav(p)
-            total_s += dur
-            if total_s > _AUDIO_PLAY_MAX_S:
-                raise ValueError(
-                    f"total duration {total_s:.1f}s exceeds limit "
-                    f"{_AUDIO_PLAY_MAX_S:.0f}s"
-                )
-            clips.append((p.name, pcm))
-            if (src_rate, src_ch) != (_AUDIO_IO_WIRE_RATE, _AUDIO_IO_WIRE_CHANNELS):
-                notes.append(f"{p.name} {src_rate}Hz/{src_ch}ch→wire")
-        return clips, total_s, notes
-
-    clips, duration_s, notes = await asyncio.to_thread(_read_all)
-    # 連結すると frame 境界が clip 境界をまたぐが、各 clip は wire format で
-    # サンプル境界が揃っているので連結 PCM もそのまま streaming できる
-    # (= ギャップレス)。
-    pcm = b"".join(clip_pcm for _, clip_pcm in clips)
     bytes_per_sample = _AUDIO_SAMPLE_WIDTH * _AUDIO_IO_WIRE_CHANNELS
     samples_per_frame = _AUDIO_IO_WIRE_RATE * _AUDIO_PLAY_FRAME_MS // 1000
     bytes_per_frame = samples_per_frame * bytes_per_sample
+    names = ", ".join(p.name for p in resolved)
 
-    names = ", ".join(name for name, _ in clips)
-    convert_note = f" [converted: {'; '.join(notes)}]" if notes else ""
+    # Decode only the FIRST file up front (in a thread): gives an immediate chunk
+    # to stream and surfaces a gross decode error (corrupt / non-PCM WAV) to the
+    # LLM before we claim playback started. Files 2..N are decoded just-in-time
+    # inside the streamer (prefetched one ahead), so playback starts fast, memory
+    # stays at ~one file, and there is no total-duration cap.
+    first_pcm, _first_dur, _first_rate, _first_ch = await asyncio.to_thread(
+        _read_and_convert_wav, resolved[0]
+    )
+    label = f"{len(resolved)} file(s) [{names}]"
     log.info(
-        "play_audio_file: %d file(s) (%.1fs total, %dHz/%dch wire) [%s]%s → %s",
-        len(clips), duration_s, _AUDIO_IO_WIRE_RATE, _AUDIO_IO_WIRE_CHANNELS,
-        names, convert_note, _AUDIO_IO_SPK_URL,
+        "play_audio_file: %d file(s) [%s] → %s (streamed one at a time)",
+        len(resolved), names, _AUDIO_IO_SPK_URL,
     )
 
-    # ws_connect の sock_connect で接続フェーズを短く (audio-io が居なければ
-    # ここで即落ちて [error] にする)。全体 timeout は意図的に None — 長尺
-    # 再生中ずっと send/recv するので。
-    client_timeout = aiohttp.ClientTimeout(total=None, sock_connect=10.0)
-    async with aiohttp.ClientSession(timeout=client_timeout) as session:
-        async with session.ws_connect(_AUDIO_IO_SPK_URL) as ws:
-            start = time.monotonic()
-            frame_idx = 0
-            offset = 0
-            while offset < len(pcm):
-                chunk = pcm[offset : offset + bytes_per_frame]
-                offset += len(chunk)
-                # audio-io は奇数バイトの WS frame を拒否する (s16le なので
-                # 通常は偶数だが、末尾の半端な chunk が来た場合だけパディング)。
-                if len(chunk) % 2 != 0:
-                    chunk = chunk + b"\x00"
-                await ws.send_bytes(chunk)
-                frame_idx += 1
-                # 実時間ペーシング。各 frame は frame_idx * FRAME_MS のタイミングで
-                # 送出する。audio-io 側の ring (deafult 10s) を溢れさせない目的。
-                target = start + frame_idx * _AUDIO_PLAY_FRAME_MS / 1000.0
-                sleep_for = target - time.monotonic()
-                if sleep_for > 0:
-                    await asyncio.sleep(sleep_for)
-            # Drain handshake: eos を送ってから "drained" が戻るまで待つ。
-            # これで audio-io の cpal リングが本当に空になったことが保証される。
-            await ws.send_str(json.dumps({"type": "eos"}))
-            try:
-                msg = await asyncio.wait_for(
-                    ws.receive(), timeout=_AUDIO_DRAIN_TIMEOUT_S
-                )
-                if msg.type != aiohttp.WSMsgType.TEXT:
-                    log.warning(
-                        "play_audio_file: drain reply was %s, not TEXT",
-                        msg.type,
-                    )
-            except asyncio.TimeoutError:
-                log.warning(
-                    "play_audio_file: drain handshake timed out after %.0fs",
-                    _AUDIO_DRAIN_TIMEOUT_S,
-                )
-    return f"played {duration_s:.1f}s from {len(clips)} file(s): {names}"
+    # Connect to audio-io in the FOREGROUND so a connection failure (audio-io
+    # down, wrong host, bad track) raises here and is surfaced to the LLM via
+    # _safe_invoke — instead of being silently swallowed by the detached task.
+    # Only the realtime streaming is backgrounded, so playback stays non-blocking.
+    session = aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=None, sock_connect=10.0)
+    )
+    try:
+        ws = await session.ws_connect(_AUDIO_IO_SPK_URL)
+    except Exception as e:  # noqa: BLE001
+        await session.close()
+        raise RuntimeError(
+            f"could not connect to audio output at {_AUDIO_IO_SPK_URL} "
+            f"({type(e).__name__}: {e}) — audio was NOT played"
+        ) from e
+    # Hand the live connection + the resolved file list to the detached streamer;
+    # it decodes the rest one-at-a-time and closes ws+session when done.
+    task = asyncio.create_task(
+        _stream_files_to_spk(session, ws, resolved, first_pcm, bytes_per_frame, label)
+    )
+    _PLAYBACK_TASKS.add(task)
+    task.add_done_callback(_PLAYBACK_TASKS.discard)
+    return (
+        f"started playing {len(resolved)} file(s) in the background; you're free "
+        f"now. They play gapless in order and stop at the end, or immediately "
+        f"when stop_audio is called."
+    )
 
 
 def _build_play_audio_description() -> str:
@@ -528,42 +631,26 @@ def _build_play_audio_description() -> str:
     user に伝えるよう誘導する。"""
     if not _AUDIO_IO_SPK_URL:
         return (
-            "Play one or more WAV audio files via the speaker.\n\n"
-            "**CURRENTLY UNAVAILABLE** — the AGENT_AUDIO_IO_SPK_URL env "
-            "is not set, so this feature is disabled in this environment. "
-            "Do NOT call this tool; instead, tell the user in one sentence "
-            "that audio playback is not configured here so they know the "
-            "limit is on the setup, not on their request."
+            "Play WAV audio file(s) on the speaker.\n"
+            "**UNAVAILABLE** — audio output is not configured here. Do NOT "
+            "call this; tell the user audio playback isn't set up."
         )
     path_hint = (
-        f"`paths` is a list of WAV file paths, each inside the share root "
-        f"`{_FILE_ROOT}`. Give them relative to that root (e.g. "
-        f"`share/foo.wav`) or as an absolute path within it (e.g. "
-        f"`/workspace/share/foo.wav`). Paths outside the root (including "
-        f"via `..` or symlinks) are rejected."
+        f"`paths`: WAV paths under `{_FILE_ROOT}` — relative to that root or "
+        f"absolute inside it. An entry may be a glob (`*.wav`, "
+        f"`news/2026*.wav`) matching every .wav under the root."
         if _FILE_ROOT
-        else "`paths` is a list of WAV file paths (AGENT_FILE_ROOT is unset, "
-        "so playback is effectively disabled)."
+        else "`paths`: WAV file paths (AGENT_FILE_ROOT is unset, so playback "
+        "is effectively disabled)."
     )
     return (
-        "Play one or more WAV audio files via the speaker.\n\n"
-        f"{path_hint} Pass several paths to play them back-to-back, "
-        "gapless, in the given order within a single call. Each file must "
-        "be uncompressed 16-bit PCM (s16le). Sample rate and channel count "
-        f"are auto-converted to {_AUDIO_IO_WIRE_RATE}Hz / "
-        f"{_AUDIO_IO_WIRE_CHANNELS} channel(s) (audio-io's wire format) if "
-        "they differ, so 44.1kHz stereo and 48kHz mono and similar are all "
-        "accepted. Compressed WAVs and >2-channel surround formats are "
-        "rejected. All paths are validated before playback starts, so if "
-        "any file is missing nothing plays; the error message lists similar "
-        "filenames in the same directory — pick one and retry rather than "
-        "asking the user.\n\n"
-        "Call this when the user asks to play specific audio file(s) — "
-        "for example a pre-rendered news summary or notification produced "
-        "by another agent. The tool blocks until playback completes; if "
-        "the user interrupts via wake-word, playback aborts cleanly. "
-        f"Total duration across all files is capped at {_AUDIO_PLAY_MAX_S:.0f} "
-        "seconds."
+        "Play WAV audio file(s) on the speaker. Call when the user asks to "
+        "play an audio file.\n"
+        f"{path_hint} Multiple paths play back-to-back in order. Sample rate "
+        "and channels are auto-converted; only uncompressed 16-bit PCM WAV.\n"
+        "Plays in the background — this returns immediately, and a missing "
+        "file means nothing plays (the error suggests similar filenames; "
+        "retry with one). Stop with stop_audio."
     )
 
 
@@ -604,22 +691,15 @@ def _build_stop_audio_description() -> str:
     """stop_audio の description を起動時 env に応じて動的生成する。"""
     if not _AUDIO_IO_STOP_URL:
         return (
-            "Stop audio file playback on the speaker.\n\n"
-            "**CURRENTLY UNAVAILABLE** — the AGENT_AUDIO_IO_SPK_URL env "
-            "is not set, so audio playback (and thus stopping it) is "
-            "disabled in this environment. Do NOT call this tool; tell the "
-            "user in one sentence that audio is not configured here."
+            "Stop audio file playback.\n"
+            "**UNAVAILABLE** — audio output is not configured here. Do NOT "
+            "call this; tell the user audio isn't set up."
         )
     return (
-        "Stop audio file playback immediately.\n\n"
-        "Flushes the audio-io playback track that play_audio_file uses, "
-        "cutting off whatever WAV is currently playing on the speaker. "
-        "Your own spoken replies (text-to-speech) play on a different "
-        "track and are NOT affected by this. Takes no arguments. Safe to "
-        "call even when nothing is playing — it is a harmless no-op in "
-        "that case.\n\n"
-        "Call this when the user asks to stop or silence the audio that is "
-        "playing — for example 「音声止めて」「再生やめて」「stop the audio」."
+        "Stop the audio file that is playing (started by play_audio_file). "
+        "Call when the user says e.g. 「音声止めて」「再生やめて」.\n"
+        "No arguments. Your own spoken voice is unaffected; harmless no-op "
+        "if nothing is playing."
     )
 
 
@@ -630,17 +710,531 @@ async def stop_audio() -> str:
     return await _safe_invoke("stop_audio", _stop_audio_impl())
 
 
+# --- system_health (自己診断「システムチェックして」, Phase 1) ---------------
+#
+# 各サービスの liveness を 1 ショットで並列集約し、短い日本語サマリを返す
+# self-diagnostic tool。対象 URL は compose ネットワーク内のサービス名 +
+# コンテナ内部ポート (host 公開ポートではない — agent 自身がネットワーク内に
+# いるため)。audio-io だけは Windows ネイティブ (compose 外) なので、再生 tool
+# と同じ SPK URL から host:port を借りて /health を導出する。
+#
+# terminal tool にはしない: 結果が動的 (どれが落ちているか) なので固定 ack
+# では伝わらない。非 terminal にして LLM に ToolMessage (このサマリ) を読ませ、
+# そのまま読み上げさせる。probe 中の無音は "確認するね。" の ack で埋める。
+
+# ollama (llm) の base URL。agent が chat に使うのと同じ env を流用する。
+_OLLAMA_URL: str = os.environ.get("AGENT_OLLAMA_URL", "http://llm:11434").rstrip("/")
+# 各 probe の総タイムアウト (秒)。全 probe は gather で並列に走るので自己診断
+# 全体もおおむねこの時間内に返る。落ちている対象を素早く「不調」と判定するため
+# 短め。
+_HEALTH_TIMEOUT_S: float = float(os.environ.get("AGENT_HEALTH_TIMEOUT_S", "2.5"))
+
+
+def _derive_audio_io_health_url(spk_url: str) -> str:
+    """/spk WS URL から audio-io の /health HTTP URL を導出する。
+
+    `ws://host:7010/spk?track=1` → `http://host:7010/health`。audio-io は
+    Windows ネイティブ (compose 外) で、agent が知っている唯一の到達情報が
+    SPK URL なので、そこから scheme (ws→http) と host:port だけ借り、path は
+    /health に差し替え、track クエリは捨てる。SPK URL 未設定なら空文字を返し、
+    audio-io は probe 対象から外れる。
+    """
+    if not spk_url:
+        return ""
+    parts = urlsplit(spk_url)
+    scheme = {"ws": "http", "wss": "https"}.get(parts.scheme, parts.scheme)
+    return urlunsplit((scheme, parts.netloc, "/health", "", ""))
+
+
+_AUDIO_IO_HEALTH_URL: str = _derive_audio_io_health_url(_AUDIO_IO_SPK_URL)
+
+
+def _default_health_targets() -> list[dict]:
+    """probe 対象のデフォルト一覧。name は音声で読み上げる前提の短い日本語。
+
+    kind:
+      "http"    … HTTP 2xx のみ healthy (liveness + 軽い readiness)。
+      "connect" … HTTP 応答が返れば (ステータス不問) healthy。POST 専用
+                  エンドポイント (whisper.cpp /inference) 用 — GET は 4xx に
+                  なるが「サーバが応答している」= 生きている証拠。
+
+    除外: voice-activity-detection は health エンドポイントを持たない。
+
+    NB: wake-word-detection の /health は「モデル loaded かつ mic WS 接続済」の
+    ときだけ 200 を返す (それ以外 503)。つまり audio-io.exe が落ちて /mic に
+    繋がらないと WWD も 503 になるので、この probe は audio-io 断も間接的に拾う。
+    """
+    targets: list[dict] = []
+    # audio-io (Windows ネイティブ)。SPK URL 未設定ならスキップ。
+    if _AUDIO_IO_HEALTH_URL:
+        targets.append({"name": "音声入出力", "url": _AUDIO_IO_HEALTH_URL, "kind": "http"})
+    # 以降は compose ネットワーク内のサービス。GET /api/tags 200 = ollama 生存
+    # (Phase 1 は liveness のみ — モデルの load 状態確認は Phase 2 に回す)。
+    targets += [
+        {"name": "言語モデル", "url": f"{_OLLAMA_URL}/api/tags", "kind": "http"},
+        {"name": "司令塔", "url": "http://orchestrator:7000/health", "kind": "http"},
+        {
+            "name": "音声認識",
+            "url": "http://automatic-speech-recognition:8080/inference",
+            "kind": "connect",
+        },
+        {"name": "音声合成", "url": "http://text-to-speech:50021/version", "kind": "http"},
+        {"name": "音声合成の送信", "url": "http://tts-streamer:7070/health", "kind": "http"},
+        {"name": "ウェイクワード", "url": "http://wake-word-detection:7030/health", "kind": "http"},
+    ]
+    return targets
+
+
+def _health_targets() -> list[dict]:
+    """probe 対象。env `AGENT_HEALTH_TARGETS` (JSON 配列) があればそれで上書き。
+
+    形式: `[{"name": "...", "url": "http://...", "kind": "http"|"connect"}, ...]`。
+    構成を変えた (サービス追加 / ポート変更) 際にコード変更なしで追従するための
+    逃げ道。パース失敗時は warning を出してデフォルトに倒す。
+    """
+    raw = os.environ.get("AGENT_HEALTH_TARGETS", "").strip()
+    if not raw:
+        return _default_health_targets()
+    try:
+        parsed = json.loads(raw)
+        targets = [
+            {
+                "name": str(t["name"]),
+                "url": str(t["url"]),
+                "kind": str(t.get("kind", "http")),
+            }
+            for t in parsed
+        ]
+        if not targets:
+            raise ValueError("empty target list")
+        return targets
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        log.warning("AGENT_HEALTH_TARGETS invalid (%s); using defaults", e)
+        return _default_health_targets()
+
+
+async def _probe_url(session: aiohttp.ClientSession, target: dict) -> dict:
+    """1 対象を 1 回 GET して `{name, ok, detail}` を返す。
+
+    例外は全て握りつぶして ok=False に変換する — 1 つ落ちている対象が
+    `asyncio.gather` 全体を倒さないため。detail は log / デバッグ用で、音声
+    サマリには name しか出さない。
+    """
+    name = target["name"]
+    url = target["url"]
+    kind = target.get("kind", "http")
+    try:
+        async with session.get(url) as resp:
+            status = resp.status
+            # "connect" は応答が返った時点で生存確認 (POST 専用 endpoint 対策)。
+            # "http" は 2xx のみ healthy (例: WWD は未接続だと 503 を返す)。
+            ok = True if kind == "connect" else (200 <= status < 300)
+            return {"name": name, "ok": ok, "detail": f"HTTP {status}"}
+    except asyncio.TimeoutError:
+        # aiohttp の ServerTimeoutError もここで捕捉される (asyncio.TimeoutError
+        # のサブクラス)。タイムアウト = 応答なし = 不調扱い。
+        return {"name": name, "ok": False, "detail": "timeout"}
+    except aiohttp.ClientError as e:
+        # 接続拒否 / 名前解決失敗 (コンテナ未起動) 等。
+        return {"name": name, "ok": False, "detail": type(e).__name__}
+    except Exception as e:  # noqa: BLE001
+        return {"name": name, "ok": False, "detail": f"{type(e).__name__}: {e}"}
+
+
+async def _system_health_impl() -> str:
+    """system_health 本体。全 probe を並列に走らせ短い日本語サマリを返す。"""
+    targets = _health_targets()
+    timeout = aiohttp.ClientTimeout(total=_HEALTH_TIMEOUT_S)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        results = await asyncio.gather(*(_probe_url(session, t) for t in targets))
+    for r in results:
+        log.info("system_health: %s ok=%s (%s)", r["name"], r["ok"], r["detail"])
+    unhealthy = [r for r in results if not r["ok"]]
+    total = len(results)
+    healthy_n = total - len(unhealthy)
+    log.info(
+        "system_health summary: %d/%d ok, down=%s",
+        healthy_n,
+        total,
+        [r["name"] for r in unhealthy],
+    )
+    if not unhealthy:
+        return f"システムは正常だよ。{total}個のサービス、全部動いてる。"
+    if healthy_n == 0:
+        # 全滅。個別に名前を並べても情報量がない (むしろ network/DNS 障害の
+        # 可能性が高い) ので、まとめて伝える。
+        return f"全部のサービスが応答してないよ。{total}個とも不調。"
+    names = "、".join(r["name"] for r in unhealthy)
+    return f"{names}が不調だよ。ほかの{healthy_n}個は正常。"
+
+
+def _build_system_health_description() -> str:
+    """system_health の description を起動時 env (probe 対象) に応じて生成する。"""
+    names = "、".join(t["name"] for t in _health_targets())
+    return (
+        "Self-diagnose the assistant's own backend services "
+        f"({names}) and return a short Japanese summary. "
+        "Call when the user asks for a system check (e.g. 「システムチェック"
+        "して」). No arguments, read-only. Speak the summary back as-is; "
+        "don't invent services it didn't mention."
+    )
+
+
+@tool(description=_build_system_health_description())
+async def system_health() -> str:
+    # description は @tool(description=...) で動的注入。詳細は
+    # `_build_system_health_description` の docstring を参照。非 terminal tool
+    # なので、返り値 (サマリ) は LLM が読み上げる。
+    return await _safe_invoke("system_health", _system_health_impl())
+
+
+# --- timer (タイマー起動 + 起動中タイマーの確認 + キャンセル) ----------------
+#
+# タイマーは agent プロセス内の asyncio バックグラウンドタスク。発火 (= sleep
+# 満了) すると audio-io の別 track (既定 track=2) にアラーム音を直送する。
+# タイマー発火は「ユーザーのターン」が無い非同期イベントなので、TTS (track 0)
+# や play_audio_file (track 1) と違い orchestrator 経由で喋れない —— track 直送
+# が agent の唯一の自律出力チャネル。track を分けてあるので、発火時に TTS や
+# ファイル再生が鳴っていても WASAPI 共有ミックスで重なって聞こえる。
+#
+# 制約: タイマーは in-memory。agent を再起動すると消える (永続化は将来課題)。
+# アラームは track=2 → audio-io 側で runtime.playback_tracks >= 3 (track 0/1/2)
+# が必要。track が無いと audio-io が WS を即 close し、アラームは鳴らず warn
+# ログだけ残る。
+
+# アラーム送出先 track。play 用 SPK URL の ?track= を差し替えて track=2 を狙う。
+# AGENT_TIMER_SPK_URL で URL ごと、AGENT_TIMER_TRACK で track 番号だけ上書き可。
+_TIMER_TRACK: int = int(os.environ.get("AGENT_TIMER_TRACK", "2"))
+
+
+def _derive_track_url(spk_url: str, track: int) -> str:
+    """spk WS URL の `?track=` を `track` に差し替えた URL を返す。
+
+    他のクエリは温存して track だけ差し替える。空 URL なら空文字 (= 機能無効)。
+    """
+    if not spk_url:
+        return ""
+    parts = urlsplit(spk_url)
+    q = parse_qs(parts.query)
+    q["track"] = [str(track)]
+    new_query = urlencode({k: v[-1] for k, v in q.items()})
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+
+
+_TIMER_SPK_URL: str = (
+    os.environ.get("AGENT_TIMER_SPK_URL", "").strip()
+    or _derive_track_url(_AUDIO_IO_SPK_URL, _TIMER_TRACK)
+)
+# タイマー長の上限 (秒)。誤認識で「3分」が「300分」等にならない保険＋暴走防止。
+_TIMER_MAX_S: float = float(os.environ.get("AGENT_TIMER_MAX_S", "86400"))  # 24h
+
+# 起動中タイマーの registry: id -> {label, fire_at(monotonic), duration_s, task}。
+# check/cancel が参照する。発火 or cancel で entry を pop する。
+_TIMERS: dict[int, dict] = {}
+# タイマー id の採番 (単調増加、再利用しない)。agent 再起動でリセット。
+_timer_seq: int = 0
+# タスクの強参照保持。registry は発火時に entry を pop するので、それだけだと
+# アラーム再生中にタスクが GC されうる。play_audio_file の _PLAYBACK_TASKS と同型。
+_TIMER_TASKS: set = set()
+# 生成アラーム PCM の memo (決定的なので 1 度作れば使い回す)。
+_ALARM_PCM_CACHE: bytes | None = None
+
+
+def _fmt_duration(sec: float) -> str:
+    """秒を「X時間Y分Z秒」の日本語表記に。ゼロの単位は省略。0 以下は「0秒」。"""
+    s = int(round(sec))
+    if s <= 0:
+        return "0秒"
+    h, rem = divmod(s, 3600)
+    m, s2 = divmod(rem, 60)
+    out = ""
+    if h:
+        out += f"{h}時間"
+    if m:
+        out += f"{m}分"
+    if s2:
+        out += f"{s2}秒"
+    return out
+
+
+def _gen_tone(freq: float, dur_s: float, rate: int, amp: float = 0.5) -> bytes:
+    """単一周波数のビープ (s16le mono) を生成。両端 5ms フェードでクリック除去。"""
+    n = int(rate * dur_s)
+    fade = max(1, int(rate * 0.005))
+    peak = amp * 32767.0
+    samples = []
+    for i in range(n):
+        if i < fade:
+            env = i / fade
+        elif i >= n - fade:
+            env = max(0.0, (n - i) / fade)
+        else:
+            env = 1.0
+        samples.append(int(peak * env * math.sin(2.0 * math.pi * freq * i / rate)))
+    return struct.pack("<%dh" % n, *samples)
+
+
+def _alarm_pcm() -> bytes:
+    """キッチンタイマー風「ピピピピ」を 3 回繰り返した s16le PCM を生成する。"""
+    rate = _AUDIO_IO_WIRE_RATE
+    beep = _gen_tone(880.0, 0.12, rate)
+    short_gap = b"\x00\x00" * int(rate * 0.08)
+    long_gap = b"\x00\x00" * int(rate * 0.40)
+    burst = beep + short_gap + beep + short_gap + beep + short_gap + beep
+    pcm = (burst + long_gap) * 3
+    # wire がステレオなら mono→stereo に複製 (既定は mono なので通常は素通り)。
+    if _AUDIO_IO_WIRE_CHANNELS == 2:
+        pcm = audioop.tostereo(pcm, _AUDIO_SAMPLE_WIDTH, 1.0, 1.0)
+    return pcm
+
+
+def _alarm_pcm_cached() -> bytes:
+    """アラーム PCM を返す。AGENT_TIMER_ALARM_WAV があればそれを wire format に
+    変換して使い、無ければ生成ビープ。結果は 1 度だけ作って memo する。"""
+    global _ALARM_PCM_CACHE
+    if _ALARM_PCM_CACHE is not None:
+        return _ALARM_PCM_CACHE
+    pcm: bytes | None = None
+    custom = os.environ.get("AGENT_TIMER_ALARM_WAV", "").strip()
+    if custom:
+        try:
+            p = _resolve_audio_path(custom)
+            pcm, _d, _r, _c = _read_and_convert_wav(p)
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "timer: custom alarm WAV %r unusable (%s: %s); using generated beep",
+                custom, type(e).__name__, e,
+            )
+            pcm = None
+    if pcm is None:
+        pcm = _alarm_pcm()
+    _ALARM_PCM_CACHE = pcm
+    return pcm
+
+
+async def _play_pcm_on_track(spk_url: str, pcm: bytes, label: str) -> None:
+    """生 PCM を指定 track の /spk へ realtime 送信し、drain して閉じる。
+
+    play_audio_file の送信ループと同型だが、対象は in-memory の単一バッファ
+    (ファイル解決 / prefetch 無し)。発火は非同期でターンが無いため、失敗は
+    raise せず warn ログのみ (呼び出し元に拾い手がいない)。track 未設定だと
+    audio-io が WS を即 close するので、その場合もここで warn に落ちる。"""
+    if not spk_url:
+        log.warning("timer alarm: no spk url configured; cannot play (%s)", label)
+        return
+    bytes_per_sample = _AUDIO_SAMPLE_WIDTH * _AUDIO_IO_WIRE_CHANNELS
+    samples_per_frame = _AUDIO_IO_WIRE_RATE * _AUDIO_PLAY_FRAME_MS // 1000
+    bytes_per_frame = samples_per_frame * bytes_per_sample
+    session = aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=None, sock_connect=10.0)
+    )
+    try:
+        ws = await session.ws_connect(spk_url)
+    except Exception as e:  # noqa: BLE001
+        await session.close()
+        log.warning(
+            "timer alarm: could not connect to %s (%s: %s) — alarm NOT played (%s)",
+            spk_url, type(e).__name__, e, label,
+        )
+        return
+    try:
+        start = time.monotonic()
+        frame_idx = 0
+        offset = 0
+        while offset < len(pcm):
+            chunk = pcm[offset : offset + bytes_per_frame]
+            offset += len(chunk)
+            if len(chunk) % 2 != 0:
+                chunk = chunk + b"\x00"
+            await ws.send_bytes(chunk)
+            frame_idx += 1
+            target = start + frame_idx * _AUDIO_PLAY_FRAME_MS / 1000.0
+            sleep_for = target - time.monotonic()
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
+        await ws.send_str(json.dumps({"type": "eos"}))
+        try:
+            await asyncio.wait_for(ws.receive(), timeout=_AUDIO_DRAIN_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            log.warning("timer alarm: drain timed out (%s)", label)
+        log.info("timer alarm: played (%s)", label)
+    except Exception as e:  # noqa: BLE001
+        log.warning(
+            "timer alarm: ended early (%s: %s) — is audio-io track configured? (%s)",
+            type(e).__name__, e, label,
+        )
+    finally:
+        try:
+            await ws.close()
+        finally:
+            await session.close()
+
+
+async def _timer_fire(timer_id: int, label: str) -> None:
+    """発火処理: registry から外し、track にアラームを流す。"""
+    _TIMERS.pop(timer_id, None)
+    tag = f" ({label})" if label else ""
+    log.info("timer #%d fired%s; playing alarm on %s", timer_id, tag, _TIMER_SPK_URL)
+    await _play_pcm_on_track(_TIMER_SPK_URL, _alarm_pcm_cached(), f"timer #{timer_id}{tag}")
+
+
+async def _timer_task(timer_id: int, seconds: float, label: str) -> None:
+    """1 本のタイマー。sleep 満了で発火、cancel されたら静かに終了。"""
+    try:
+        await asyncio.sleep(seconds)
+    except asyncio.CancelledError:
+        log.info("timer #%d cancelled before firing", timer_id)
+        return
+    await _timer_fire(timer_id, label)
+
+
+async def _start_timer_impl(seconds, label: str = "") -> str:
+    """start_timer 本体。タスクを起こして registry に登録、即 return する。"""
+    global _timer_seq
+    if not _TIMER_SPK_URL:
+        raise RuntimeError(
+            "AGENT_AUDIO_IO_SPK_URL is not set — a timer has no way to sound "
+            "its alarm, so timers are disabled"
+        )
+    try:
+        seconds = float(seconds)
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"seconds must be a number of seconds, got {seconds!r}"
+        ) from e
+    if seconds <= 0:
+        raise ValueError("timer duration must be positive (seconds > 0)")
+    if seconds > _TIMER_MAX_S:
+        raise ValueError(
+            f"timer too long ({_fmt_duration(seconds)}); max is "
+            f"{_fmt_duration(_TIMER_MAX_S)}"
+        )
+    label = (label or "").strip()
+    _timer_seq += 1
+    tid = _timer_seq
+    task = asyncio.create_task(_timer_task(tid, seconds, label))
+    _TIMER_TASKS.add(task)
+    _TIMERS[tid] = {
+        "label": label,
+        "fire_at": time.monotonic() + seconds,
+        "duration_s": seconds,
+        "task": task,
+    }
+
+    def _done(t: asyncio.Task, tid: int = tid) -> None:
+        # 強参照を解放しつつ、異常終了でも registry に残骸を残さない
+        # (正常発火 / cancel は既に pop 済みなので no-op)。
+        _TIMER_TASKS.discard(t)
+        _TIMERS.pop(tid, None)
+
+    task.add_done_callback(_done)
+    log.info(
+        "timer #%d set for %s%s",
+        tid, _fmt_duration(seconds), f" ({label})" if label else "",
+    )
+    lead = f"「{label}」の" if label else ""
+    return f"{lead}{_fmt_duration(seconds)}タイマーをかけたよ。（番号{tid}）"
+
+
+async def _check_timers_impl() -> str:
+    """check_timers 本体。起動中タイマーと残り時間を日本語サマリで返す。"""
+    if not _TIMERS:
+        return "今は動いてるタイマーは無いよ。"
+    now = time.monotonic()
+    items = sorted(_TIMERS.items(), key=lambda kv: kv[1]["fire_at"])
+    parts = []
+    for tid, e in items:
+        remaining = max(0.0, e["fire_at"] - now)
+        who = f"「{e['label']}」" if e["label"] else f"番号{tid}"
+        parts.append(f"{who}があと{_fmt_duration(remaining)}")
+    if len(parts) == 1:
+        return parts[0] + "だよ。"
+    return f"タイマーが{len(parts)}件。" + "、".join(parts) + "。"
+
+
+async def _cancel_timer_impl(which: str = "") -> str:
+    """cancel_timer 本体。番号 / ラベル部分一致 / 「全部」/ 唯一 で対象を選び cancel。"""
+    if not _TIMERS:
+        return "今は動いてるタイマーは無いよ。"
+    which = (which or "").strip()
+    if which in ("全部", "すべて", "ぜんぶ", "みんな", "all", "ALL"):
+        target_ids = list(_TIMERS.keys())
+    elif not which:
+        if len(_TIMERS) == 1:
+            target_ids = [next(iter(_TIMERS))]
+        else:
+            opts = "、".join((e["label"] or f"番号{t}") for t, e in _TIMERS.items())
+            return f"タイマーが{len(_TIMERS)}件あるよ。どれ止める？（{opts}）"
+    elif which.isdigit() and int(which) in _TIMERS:
+        target_ids = [int(which)]
+    else:
+        target_ids = [t for t, e in _TIMERS.items() if which in (e["label"] or "")]
+        if not target_ids:
+            return f"「{which}」に合うタイマーが見つからないよ。"
+    cancelled = []
+    for tid in target_ids:
+        e = _TIMERS.pop(tid, None)
+        if e:
+            e["task"].cancel()
+            cancelled.append(e["label"] or f"番号{tid}")
+    return "、".join(cancelled) + "のタイマーを止めたよ。"
+
+
+def _build_start_timer_description() -> str:
+    """start_timer の description を起動時 env (_TIMER_SPK_URL の有無) で生成。"""
+    if not _TIMER_SPK_URL:
+        return (
+            "Start a countdown timer.\n"
+            "**UNAVAILABLE** — no audio output for the alarm in this "
+            "environment. Do NOT call this; tell the user timers aren't "
+            "set up."
+        )
+    return (
+        "Start a countdown timer; an alarm sounds on the speaker when it "
+        "ends. Call when the user asks for a timer/alarm (e.g. 「3分タイマー"
+        "かけて」「10分後に教えて」).\n"
+        "`seconds`: duration in seconds — convert the spoken duration "
+        "yourself (「3分」→180, 「1時間」→3600). `label`: optional short name "
+        "(e.g. 「パスタ」). Returns immediately; confirm the duration back "
+        "to the user."
+    )
+
+
+@tool(description=_build_start_timer_description())
+async def start_timer(seconds: int, label: str = "") -> str:
+    # description は @tool(description=...) で動的注入。非 terminal: 返り値
+    # (セットした長さの確認) を LLM が読み上げてユーザーに復唱する。
+    return await _safe_invoke("start_timer", _start_timer_impl(seconds, label))
+
+
+@tool
+async def check_timers() -> str:
+    """List the running timers and the time left on each.
+
+    Call when the user asks about timers (e.g. 「タイマーあと何分?」「今タイ
+    マー動いてる?」). No arguments. Speak the result back to the user.
+    """
+    return await _safe_invoke("check_timers", _check_timers_impl())
+
+
+@tool
+async def cancel_timer(which: str = "") -> str:
+    """Cancel a running timer so its alarm won't sound.
+
+    Call when the user asks to stop/cancel a timer (e.g. 「タイマー止めて」
+    「タイマー全部キャンセル」). `which`: a label substring, a timer number,
+    or 「全部」 for all; omit it when only one timer is running.
+    """
+    return await _safe_invoke("cancel_timer", _cancel_timer_impl(which))
+
+
 @tool
 async def read_file(path: str) -> str:
-    """Read a file and return its contents verbatim.
+    """Read a text file and return its contents.
 
-    `path` is interpreted relative to `AGENT_FILE_ROOT` (the shared
-    directory), e.g. `"memo.txt"`, `"docs/recipe.md"`. Absolute paths
-    and paths containing `..` are rejected.
-
-    Use this when the user asks to read a memo or a specific file —
-    fetch the contents here, then summarise or read it back to them.
-    Files larger than 50 KB are truncated at the tail.
+    Call when the user asks to read a memo or file — then summarise or
+    read it aloud. `path` is relative to the shared directory (e.g.
+    "memo.txt", "docs/recipe.md"); paths outside it are rejected.
     """
     return await _safe_invoke("read_file", _read_file_impl(path))
 
@@ -671,6 +1265,41 @@ async def _safe_invoke(name: str, coro) -> str:
         return f"[error] {type(e).__name__}: {e}"
 
 
+# --- conversation-memory reset -----------------------------------------
+# Handle for `reset_memory` to clear the LangGraph conversation history.
+# Tools are standalone functions with no reference to app.py's
+# SessionManager, so app.py registers a callback here at startup
+# (set_reset_memory_hook(sessions.reset)). The callback rotates the session
+# id → the NEXT turn runs on a fresh thread_id = empty memory. The current
+# turn (the "reset" request itself) stays on the old, now-abandoned thread.
+_RESET_MEMORY_HOOK = None
+
+
+def set_reset_memory_hook(fn) -> None:
+    """Register the async () -> str callback that clears conversation memory.
+    app.py wires this to SessionManager.reset."""
+    global _RESET_MEMORY_HOOK
+    _RESET_MEMORY_HOOK = fn
+
+
+async def _reset_memory_impl() -> str:
+    if _RESET_MEMORY_HOOK is None:
+        # Tools enabled but app.py never wired the hook — surface, don't lie.
+        raise RuntimeError("reset hook not registered")
+    await _RESET_MEMORY_HOOK()
+    return "会話の記憶をリセットした"
+
+
+@tool
+async def reset_memory() -> str:
+    """Clear the conversation memory and start fresh.
+
+    Call when the user asks to forget the conversation or start over
+    (e.g. 「記憶リセットして」「履歴消して」「最初から」). No arguments.
+    """
+    return await _safe_invoke("reset_memory", _reset_memory_impl())
+
+
 # --- tool 登録 ----------------------------------------------------------
 
 def all_tools() -> list:
@@ -678,7 +1307,18 @@ def all_tools() -> list:
 
     issue #19 の段階的な追加に伴い後段の PR で別 tool が積まれる可能性あり。
     """
-    return [run_shell, read_file, web_search, play_audio_file, stop_audio]
+    return [
+        run_shell,
+        read_file,
+        web_search,
+        play_audio_file,
+        stop_audio,
+        system_health,
+        start_timer,
+        check_timers,
+        cancel_timer,
+        reset_memory,
+    ]
 
 
 # tool name → ack phrase。None なら ack 挿入なし。
@@ -700,8 +1340,20 @@ TOOL_ACK_PHRASES: dict[str, str | None] = {
         if _AUDIO_IO_SPK_URL
         else None
     ),
-    # stop は即応 (flush signal を投げるだけ) なので ack 不要。
-    "stop_audio": None,
+    # stop は即応かつ決定的なので、2回目の LLM 生成を省く (agent 側で stop_audio
+    # を terminal tool 扱いにして即 END)。確認文はこの固定 ack で返す。
+    "stop_audio": os.environ.get("AGENT_TOOL_ACK_STOP_AUDIO", "止めたよ。"),
+    # system_health は全サービスを並列 probe する間 (~2.5s) の無音を埋める ack。
+    # 結果は非 terminal なので、この ack の後に LLM が診断サマリを読み上げる。
+    "system_health": os.environ.get("AGENT_TOOL_ACK_SYSTEM_HEALTH", "確認するね。"),
+    # timer 系は即応 (タスク登録 / registry 参照 / cancel)。filler 不要なので
+    # None。非 terminal なので直後に LLM が結果 (確認文・残り時間) を読み上げる。
+    "start_timer": None,
+    "check_timers": None,
+    "cancel_timer": None,
+    # reset_memory is terminal (no 2nd LLM call) — this fixed line IS the
+    # spoken confirmation. Overridable like the others.
+    "reset_memory": os.environ.get("AGENT_TOOL_ACK_RESET_MEMORY", "記憶をリセットしたよ。"),
 }
 
 
@@ -722,6 +1374,10 @@ TOOL_ACK_PHRASES: dict[str, str | None] = {
 #   python tools.py play_audio_file /workspace/share/foo.wav
 #   python tools.py play_audio_file share/a.wav share/b.wav   # 連続再生
 #   python tools.py stop_audio                                 # 再生停止
+#   python tools.py system_health                              # 自己診断
+#   python tools.py start_timer seconds=10 label=test          # タイマー起動
+#   python tools.py check_timers                               # 起動中の確認
+#   python tools.py cancel_timer which=test                    # 取消
 #   python tools.py run_shell command="ls -la"
 def _cli_list(tools: list) -> None:
     print("available tools:")

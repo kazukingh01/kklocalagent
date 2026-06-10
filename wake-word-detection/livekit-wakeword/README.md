@@ -61,7 +61,9 @@ sudo docker run --rm \
 | `WW_MODELS` | `hey_livekit.onnx` (comma-separated classifier ONNX **filenames** under `WW_MODELS_DIR`) |
 | `WW_MODELS_DIR` | `/opt/models` — must contain the classifier ONNX(s) named in `WW_MODELS` plus `melspectrogram.onnx` + `embedding_model.onnx` (filenames hardcoded). |
 | `WW_THRESHOLD` | `0.5` |
-| `WW_COOLDOWN_SEC` | `2.0` |
+| `WW_COOLDOWN_SEC` | `2.0` (re-fire suppression + the per-utterance de-dup gate for the confirmation logic) |
+| `WW_CONFIRM_COUNT` | `1` (detections required within `WW_CONFIRM_WINDOW_MS` before forwarding to the sink; >=2 suppresses false fires — say the wake word twice). Reachable only if `WW_CONFIRM_WINDOW_MS` > `WW_COOLDOWN_SEC`×1000. |
+| `WW_CONFIRM_WINDOW_MS` | `3000` (window for `WW_CONFIRM_COUNT`) |
 | `WW_PREDICT_WINDOW_MS` | `2000` |
 | `WW_PREDICT_INTERVAL_MS` | `100` (predict cadence; predictor task fires on this wallclock interval) |
 | `WW_LISTEN` | `0.0.0.0:7030` |

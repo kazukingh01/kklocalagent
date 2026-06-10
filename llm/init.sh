@@ -144,14 +144,16 @@ EOF
         ;;
 esac
 
-# Warm the model into VRAM so the first /api/chat from the
-# orchestrator doesn't pay a 5–15 s cold-load tax (model load shows up
-# in `runner started ... loading model ... ggml_cuda_init` in the
-# llm logs and visibly stalls the first turn). Ollama's "load a model
-# into memory" endpoint is /api/generate with `model` set and no
-# prompt; the request blocks until the weights are mmap'd + uploaded
-# to GPU. With `OLLAMA_KEEP_ALIVE=-1` set in compose.yaml, the model
-# then sticks for the lifetime of the container.
+# Warm the model so the first /api/chat from the orchestrator pays
+# neither the cold-load tax nor the one-time first-decode cost. A
+# *no-prompt* /api/generate only LOADS the weights into VRAM — it never
+# runs a decode, so the very first inference still eats the one-off
+# CUDA-graph capture + kernel/cuBLAS init (USE_GRAPHS=1 in the runner
+# log) and visibly stalls the first turn even though the model is
+# resident. Sending a tiny prompt with `num_predict>0` forces a real
+# prefill + decode here, so those graphs/kernels are captured during
+# warmup instead. With `OLLAMA_KEEP_ALIVE=-1` set in compose.yaml the
+# model then sticks for the lifetime of the container.
 #
 # Sentinel file gates the HEALTHCHECK below. /api/show alone goes 200
 # as soon as `ollama pull` completes (model present in the local
@@ -159,10 +161,11 @@ esac
 # `depends_on: service_healthy` race the warmup. Touching this only
 # after the warmup curl succeeds keeps the orchestrator from sending
 # its first /api/chat until the model is actually hot.
-echo "[init] warming model into VRAM"
+echo "[init] warming model into VRAM (load + first decode)"
 curl -sfS -X POST http://127.0.0.1:11434/api/generate \
     -H 'Content-Type: application/json' \
-    -d "{\"model\":\"${MODEL}\"}" -o /dev/null
+    -d "{\"model\":\"${MODEL}\",\"prompt\":\"warmup\",\"stream\":false,\"options\":{\"num_predict\":8}}" \
+    -o /dev/null
 touch /tmp/llm-warm
 echo "[init] model warmed"
 

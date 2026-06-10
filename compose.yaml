@@ -154,13 +154,16 @@ services:
       # Context window. Voice multi-turn benefits from a long enough
       # window to keep a handful of turns in checkpointed history, but
       # the cost is KV cache size + per-token attention compute.
-      # 8 k @ q8 KV ≈ ~250 MiB cache (vs ~1 GiB at 32k) and trims
-      # ~5-10 % off per-token latency on a 4090 Laptop. Voice replies
-      # almost never need more than a few hundred tokens of context
-      # for the agent to keep state coherent, so 8 k is the sweet
-      # spot for this workload. Bump if you find the agent forgetting
-      # mid-conversation.
-      OLLAMA_CONTEXT_LENGTH: "${OLLAMA_CONTEXT_LENGTH:-8192}"
+      # 16 k @ q8 KV ≈ ~500 MiB cache on a 4090 Laptop. Bumped from 8 k
+      # because tool-using turns (web-search results in the agent's
+      # checkpointed history) used to fill 8 k after a few turns — the
+      # prompt then left no room to generate, the reply truncated to
+      # empty, and the agent got stuck emitting its fallback line every
+      # turn. The agent now also trims its history to a token budget
+      # (AGENT_MAX_HISTORY_TOKENS) before each call; 16 k gives that
+      # trimming comfortable headroom over the system prompt + tool
+      # schemas + generation.
+      OLLAMA_CONTEXT_LENGTH: "${OLLAMA_CONTEXT_LENGTH:-16384}"
       # Force the quantised matrix-multiplication CUDA kernel (MMQ)
       # instead of the cuBLAS-on-dequantised path. For Q4_K_M models
       # on Ada (RTX 4090 / 4090 Laptop, compute 8.9) MMQ is reliably
@@ -337,7 +340,22 @@ services:
       # in config.rs).
       WW_MODELS: "${WW_MODELS:-my_phrase.onnx}"
       WW_THRESHOLD: "${WW_THRESHOLD:-0.5}"
-      WW_COOLDOWN_SEC: "2.0"
+      # Re-fire suppression AND the per-utterance de-dup gate used by the
+      # confirmation logic below. Overridable so it can be tuned alongside
+      # WW_CONFIRM_*. Keep it < WW_CONFIRM_WINDOW_MS (see below).
+      WW_COOLDOWN_SEC: "${WW_COOLDOWN_SEC:-2.0}"
+      # Anti-false-fire confirmation gate. The wwd forwards a wake to the
+      # orchestrator (which stops LLM / starts ASR) only after WW_CONFIRM_COUNT
+      # detections land within WW_CONFIRM_WINDOW_MS. Default 2-within-3000ms:
+      # the operator must trigger the wake word TWICE in 3 s, which kills the
+      # stray single false fires. Set WW_CONFIRM_COUNT=1 to restore the old
+      # fire-on-first behaviour. REQUIREMENT: WW_CONFIRM_WINDOW_MS must be
+      # > WW_COOLDOWN_SEC×1000, else a single utterance (deduped by cooldown)
+      # can never reach count 2. With cooldown 2.0 s the 2nd utterance must
+      # land in the [2.0, 3.0] s slot; lower WW_COOLDOWN_SEC (e.g. 1.5) for a
+      # roomier window.
+      WW_CONFIRM_COUNT: "${WW_CONFIRM_COUNT:-2}"
+      WW_CONFIRM_WINDOW_MS: "${WW_CONFIRM_WINDOW_MS:-3000}"
       # Diagnostic: when > 0, log the peak score seen in each window
       # so the operator can tune WW_THRESHOLD. Off (0) by default.
       # Set to e.g. 5.0 in .env to see "what scores my voice is
@@ -389,6 +407,15 @@ services:
       # assumes one operator per process, so going idle = "the
       # operator walked away" → next turn is a fresh conversation.
       AGENT_SESSION_IDLE_SEC: "${AGENT_SESSION_IDLE_SEC:-600}"
+      # Trim accumulated chat history to this many ESTIMATED tokens before each
+      # LLM call. The system prompt + tool schemas + few-shot are sent on TOP of
+      # this budget, so keep it well under the llm service's
+      # OLLAMA_CONTEXT_LENGTH — otherwise the assembled prompt overflows the
+      # context window and ollama truncates it from the FRONT (system prompt +
+      # tool schemas), which silently breaks tool calling. The agent's estimator
+      # counts CJK at ~1 token/char, so for Japanese this is close to a real
+      # token budget. Default 4096.
+      AGENT_MAX_HISTORY_TOKENS: "${AGENT_MAX_HISTORY_TOKENS:-2048}"
       # Feature flag for tool-calling (issue #19). Default on — the
       # tool-augmented ReAct agent (LLM ↔ tool loop) is the intended
       # mode now that step 1-5 have landed. Set `AGENT_TOOLS_ENABLED=false`
@@ -401,6 +428,21 @@ services:
       # below. Prevents an infinite retry loop on a tool that always
       # fails. Ignored when AGENT_TOOLS_ENABLED=false.
       AGENT_TOOL_RECURSION_LIMIT: "${AGENT_TOOL_RECURSION_LIMIT:-6}"
+      # gemma4-style "thinking" MODE selector (0/1/2). See .env.example for
+      # the full writeup. 0 = off (sends think=false EXPLICITLY — omitting it
+      # lets a thinking-capable backend default thinking ON); 1 = native ollama
+      # `think=true` (works on tags like gemma4:e4b; an imported GGUF without
+      # native think returns HTTP 400 — the whole turn fails); 2 = prompt-token:
+      # prepend AGENT_THINK_TOKEN (<|think|>) to the system prompt + think=false
+      # — for GGUFs such as hf.co/unsloth/gemma-4-12b-it-GGUF that reject
+      # native think. Default 0: modes 1 & 2 add latency, suppress tool calls
+      # on gemma4 12B, and mode 1 breaks on imported GGUFs.
+      # Back-compat: true/on → 1, off/false → 0. Read once at agent startup.
+      AGENT_REASONING: "${AGENT_REASONING:-0}"
+      # Token that switches gemma4 into thinking when placed at the start of
+      # the system prompt (mode 2 only). Override only if your model spells
+      # the think-control token differently.
+      AGENT_THINK_TOKEN: "${AGENT_THINK_TOKEN:-<|think|>}"
       # Tool-use behavior policy — *separate* from AGENT_SYSTEM_PROMPT
       # (which is persona / speaking style). Appended after the persona
       # only when AGENT_TOOLS_ENABLED=true. Controls how the LLM
@@ -410,6 +452,19 @@ services:
       # policy in agent/app.py — override in .env only if you need
       # different guidance (e.g. domain-specific tool etiquette).
       AGENT_TOOL_SYSTEM_SUFFIX: "${AGENT_TOOL_SYSTEM_SUFFIX:-}"
+      # Tool-use few-shot: example turns — Human -> AI(tool_calls) ->
+      # Tool(result) -> AI(reply) — injected before the latest user message.
+      # Default OFF: the fake-history examples are read by gemma4 12B as
+      # conversation *facts*, not procedure — on a similar live question it
+      # copies the example's final reply verbatim (observed: 「昨日はX月X日
+      # だよ。」 leaked from the placeholder example) INSTEAD of calling the
+      # tool. Tool-call shape is already enforced natively (peg-gemma4
+      # grammar), so set this on only to A/B; the builtin examples live in
+      # agent/app.py, or override the set with a JSON file via
+      # AGENT_TOOL_FEWSHOT_FILE (path inside the container, e.g. under the
+      # mounted /workspace/share). Ignored when AGENT_TOOLS_ENABLED=false.
+      AGENT_TOOL_FEWSHOT: "${AGENT_TOOL_FEWSHOT:-off}"
+      AGENT_TOOL_FEWSHOT_FILE: "${AGENT_TOOL_FEWSHOT_FILE:-}"
       # run_shell tool — CSV of allowed command *names* (argv[0] match,
       # no prefix/regex). Empty list = run_shell is effectively disabled
       # (every command rejected). `shell=True` is never used, so pipes
@@ -440,6 +495,19 @@ services:
       # against any future tool that might. If you need rw, change the
       # mount line in this file directly.
       AGENT_SHARE_DIR: "${AGENT_SHARE_DIR:-./share}"
+      # Share knowledge primer: inject a compact map of /workspace/share into
+      # the system prompt so the agent knows what's available without ls-ing
+      # every turn. Format = a tree of DIRECTORIES only, each dir summarised by
+      # an extension histogram of its direct files (e.g. "news/  wav×42"). It's
+      # rebuilt in the background every REFRESH_SEC, so files dropped into the
+      # share appear within that window (one prompt-cache miss per change). Set
+      # AGENT_CONTEXT_SHARE=off to disable. DIR defaults to the mount above.
+      AGENT_CONTEXT_SHARE: "${AGENT_CONTEXT_SHARE:-on}"
+      AGENT_CONTEXT_SHARE_DIR: "${AGENT_CONTEXT_SHARE_DIR:-/workspace/share}"
+      AGENT_CONTEXT_SHARE_REFRESH_SEC: "${AGENT_CONTEXT_SHARE_REFRESH_SEC:-300}"
+      # Cap on directories shown. When exceeded, keep the N most-recently
+      # MODIFIED dirs (by mtime) + their ancestors; older dirs are omitted.
+      AGENT_CONTEXT_SHARE_MAX_DIRS: "${AGENT_CONTEXT_SHARE_MAX_DIRS:-20}"
       # web_search tool — filler ack phrase the agent emits before the
       # actual DuckDuckGo round-trip, so the voice agent doesn't go
       # silent for the ~1-2 s search latency. Set empty to disable
@@ -467,6 +535,32 @@ services:
       AGENT_AUDIO_PLAY_MAX_S: "${AGENT_AUDIO_PLAY_MAX_S:-300}"
       # Filler ack spoken just before playback begins. Empty disables.
       AGENT_TOOL_ACK_PLAY_AUDIO: "${AGENT_TOOL_ACK_PLAY_AUDIO:-音声を再生するね。}"
+      # system_health tool (self-diagnostic 「システムチェックして」) — filler ack
+      # spoken while the agent probes every backend's health endpoint in
+      # parallel; the dynamic result summary is then read back by the LLM.
+      # Two optional advanced overrides exist (defaults are fine for the
+      # standard stack, so they're not surfaced here): AGENT_HEALTH_TIMEOUT_S
+      # (per-probe timeout, default 2.5) and AGENT_HEALTH_TARGETS (JSON array
+      # of {name,url,kind} to replace the built-in probe list). Set either in
+      # .env if you add services or change ports.
+      AGENT_TOOL_ACK_SYSTEM_HEALTH: "${AGENT_TOOL_ACK_SYSTEM_HEALTH:-確認するね。}"
+      # timer tools (start_timer / check_timers / cancel_timer). A timer is a
+      # background task in the agent; when it fires it streams an alarm sound
+      # to audio-io on its OWN track (default track=2, derived from
+      # AGENT_AUDIO_IO_SPK_URL above by swapping ?track=). That keeps the alarm
+      # off the TTS track (0) and the play_audio_file track (1) so it mixes
+      # OVER whatever else is playing. REQUIREMENT: audio-io must run with
+      # `runtime.playback_tracks >= 3` (tracks 0/1/2) — otherwise audio-io
+      # rejects the track and the alarm silently doesn't sound. Timers are
+      # in-memory (lost on agent restart).
+      #   AGENT_TIMER_ALARM_WAV — path (under AGENT_FILE_ROOT) to a custom
+      #     alarm WAV; empty (default) generates a kitchen-timer beep.
+      #   AGENT_TIMER_MAX_S — reject timers longer than this (default 86400=24h;
+      #     guards against an ASR misread like 「3分」→「300分」).
+      #   AGENT_TIMER_TRACK / AGENT_TIMER_SPK_URL — advanced: change the alarm
+      #     track number, or override the whole alarm /spk URL.
+      AGENT_TIMER_ALARM_WAV: "${AGENT_TIMER_ALARM_WAV:-}"
+      AGENT_TIMER_MAX_S: "${AGENT_TIMER_MAX_S:-86400}"
     volumes:
       - agent-data:/data
       # Host share dir → /workspace/share (read-only). The host path is
@@ -553,6 +647,13 @@ services:
       # turn whose ASR text is the tail of the assistant's reply.
       # Bump higher in .env if you've raised VAD_HANG_FRAMES.
       ORCH_TTS_TAIL_QUIET_MS: "${ORCH_TTS_TAIL_QUIET_MS:-400}"
+      # Wake-ack: a short phrase spoken via tts-streamer the instant a
+      # WakeWordDetected is accepted, so you can hear that the wake fired
+      # without watching the screen. Empty disables it. Keep it SHORT — it
+      # synthesises (~0.3-1 s) and plays on the TTS track during the post-wake
+      # listen window, so its own audio can reach the mic; rely on audio-io AEC
+      # (or a brief phrase) to avoid self-firing VAD. Set "OK" etc. as you like.
+      ORCH_WAKE_ACK_TEXT: "${ORCH_WAKE_ACK_TEXT:-はい}"
       # Pipe-separated substring blacklist for known Whisper
       # hallucinations. ASR outputs containing any of these are
       # treated as empty (no LLM, no TTS). Whisper fills ambiguous

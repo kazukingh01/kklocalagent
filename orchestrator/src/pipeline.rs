@@ -24,7 +24,7 @@ use reqwest::multipart;
 use serde::Serialize;
 use serde_json::json;
 use tokio::sync::{mpsc, Semaphore};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{AsrConfig, LlmConfig, ResultSinkConfig, TtsConfig};
 use crate::state::WakeMachine;
@@ -467,6 +467,18 @@ async fn tts_speak_inner(backends: &Backends, api: &str, url: &str, text: &str) 
     }
 }
 
+/// Speak the one-off wake-ack phrase (`tts.wake_ack_text`) via `/speak` — the
+/// audible "I heard you" cue emitted when a WakeWordDetected is accepted.
+/// No-op when the phrase or the TTS url is empty. Best-effort: errors are
+/// logged inside `tts_speak_inner`, never propagated.
+pub async fn tts_wake_ack(backends: &Backends) {
+    let text = backends.tts.wake_ack_text.trim();
+    if text.is_empty() || backends.tts.url.is_empty() {
+        return;
+    }
+    tts_speak_inner(backends, "wake-ack", &backends.tts.url, text).await;
+}
+
 /// POST `tts.finalize_url` to wait for tts-streamer's drain
 /// handshake with audio-io. Returns when audio-io reports its
 /// playback ring is empty (= the speaker fell silent). Caller
@@ -654,6 +666,16 @@ async fn llm_chat_streaming(
     // before any sentence break.
     let mut first_chunk_logged = false;
     let mut first_sentence_logged = false;
+    // Pending `<...` span (including the `<`), buffered until its `>` arrives.
+    // A span that CLOSES within ANGLE_SPAN_MAX_CHARS is markup (e.g. gemma4's
+    // <|think|> reasoning when the agent runs AGENT_REASONING=2) and is
+    // dropped before it reaches the sentence buffer / TTS. One that grows past
+    // the cap without a `>` is NOT markup (a lone `<` in maths or an
+    // emoticon) — it is flushed back out as literal text, so an unmatched `<`
+    // can never mute the rest of the stream. Persists across deltas / chunks /
+    // ndjson lines because a span can straddle them; empty = not in a span.
+    const ANGLE_SPAN_MAX_CHARS: usize = 256;
+    let mut angle_buf = String::new();
 
     'outer: loop {
         let chunk = resp
@@ -704,35 +726,67 @@ async fn llm_chat_streaming(
                 .and_then(|c| c.as_str())
                 .unwrap_or("");
             if !delta.is_empty() {
-                sentence_buf.push_str(delta);
-                full_reply.push_str(delta);
+                // Drop <...>-enclosed spans (thinking markup / stray tags)
+                // before they hit TTS — but only once the pair is confirmed:
+                // the span is held in `angle_buf` and discarded when its `>`
+                // arrives within ANGLE_SPAN_MAX_CHARS. Past the cap it is
+                // re-emitted verbatim (an unmatched `<` is content, not
+                // markup; any further `<` inside the re-emitted text is
+                // deliberately not rescanned).
+                let mut cleaned = String::with_capacity(delta.len());
+                for ch in delta.chars() {
+                    if !angle_buf.is_empty() {
+                        angle_buf.push(ch);
+                        if ch == '>' {
+                            debug!(
+                                target: "orch::pipeline",
+                                span = %angle_buf,
+                                "dropped <...> span before TTS"
+                            );
+                            angle_buf.clear();
+                        } else if angle_buf.chars().count() > ANGLE_SPAN_MAX_CHARS {
+                            cleaned.push_str(&angle_buf);
+                            angle_buf.clear();
+                        }
+                    } else if ch == '<' {
+                        angle_buf.push(ch);
+                    } else {
+                        cleaned.push(ch);
+                    }
+                }
+                // If the whole delta was inside a <...> span, cleaned is empty
+                // and we just fall through to the `done` check below.
+                if !cleaned.is_empty() {
+                    sentence_buf.push_str(&cleaned);
+                    full_reply.push_str(&cleaned);
 
-                // Drain every completed sentence from the buffer.
-                while let Some(end) = find_sentence_end(&sentence_buf) {
-                    let remainder = sentence_buf.split_off(end);
-                    let sentence = std::mem::replace(&mut sentence_buf, remainder)
-                        .trim()
-                        .to_string();
-                    if sentence.is_empty() {
-                        continue;
-                    }
-                    if !wake.pipeline_still_active() {
-                        // Drop response → connection closes →
-                        // ollama stops generating. No further
-                        // sentences emitted.
-                        return Ok(full_reply);
-                    }
-                    if !first_sentence_logged {
-                        info!(
-                            target: "orch::pipeline",
-                            ttfs_ms = llm_started.elapsed().as_millis(),
-                            "LLM first sentence emitted"
-                        );
-                        first_sentence_logged = true;
-                    }
-                    if sentence_tx.send(sentence).await.is_err() {
-                        // Consumer gone — abandon stream.
-                        return Ok(full_reply);
+                    // Drain every completed sentence from the buffer.
+                    while let Some(end) = find_sentence_end(&sentence_buf) {
+                        let remainder = sentence_buf.split_off(end);
+                        let sentence = std::mem::replace(&mut sentence_buf, remainder)
+                            .trim()
+                            .to_string();
+                        if sentence.is_empty() {
+                            continue;
+                        }
+                        if !wake.pipeline_still_active() {
+                            // Drop response → connection closes →
+                            // ollama stops generating. No further
+                            // sentences emitted.
+                            return Ok(full_reply);
+                        }
+                        if !first_sentence_logged {
+                            info!(
+                                target: "orch::pipeline",
+                                ttfs_ms = llm_started.elapsed().as_millis(),
+                                "LLM first sentence emitted"
+                            );
+                            first_sentence_logged = true;
+                        }
+                        if sentence_tx.send(sentence).await.is_err() {
+                            // Consumer gone — abandon stream.
+                            return Ok(full_reply);
+                        }
                     }
                 }
             }
@@ -747,6 +801,13 @@ async fn llm_chat_streaming(
         }
     }
 
+    // A `<...` still pending at end-of-stream never got its `>` — it was
+    // content after all (or truncated markup); speak it rather than lose it.
+    if !angle_buf.is_empty() {
+        sentence_buf.push_str(&angle_buf);
+        full_reply.push_str(&angle_buf);
+        angle_buf.clear();
+    }
     // Flush trailing partial sentence (final chunk had no terminator).
     let tail = sentence_buf.trim().to_string();
     if !tail.is_empty() && wake.pipeline_still_active() {
@@ -1132,5 +1193,51 @@ mod tests {
         }
         assert_eq!(sentences, vec!["続きの一文"]);
         assert_eq!(reply, "続きの一文");
+    }
+
+    #[tokio::test]
+    async fn llm_chat_streaming_drops_angle_span_but_keeps_unclosed_tail() {
+        // A <...> span that closes within the cap is markup → dropped, even
+        // when it straddles two deltas. A `<` that never gets its `>` is
+        // content → flushed verbatim at end-of-stream, not swallowed.
+        let body = concat!(
+            r#"{"message":{"content":"<|th"}}"#, "\n",
+            r#"{"message":{"content":"ink|>今日は晴れ。3<5 だよ。"}}"#, "\n",
+            r#"{"done":true}"#, "\n",
+        ).as_bytes().to_vec();
+        let addr = spawn_mock_llm(body).await;
+        let backends = backends_with_llm_addr(addr);
+        let wake = loose_wake();
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        let reply = llm_chat_streaming(&backends, &wake, "test", tx).await.unwrap();
+        let mut sentences = vec![];
+        while let Some(s) = rx.recv().await {
+            sentences.push(s);
+        }
+        assert_eq!(sentences, vec!["今日は晴れ。", "3<5 だよ。"]);
+        assert_eq!(reply, "今日は晴れ。3<5 だよ。");
+    }
+
+    #[tokio::test]
+    async fn llm_chat_streaming_reemits_overlong_angle_span_verbatim() {
+        // A `<` followed by more than ANGLE_SPAN_MAX_CHARS without a `>` is
+        // not markup; the buffered text must be re-emitted, not dropped.
+        let text = format!("注意{}{}終わり。", "<", "あ".repeat(300));
+        let body = format!(
+            "{}\n{}\n",
+            serde_json::json!({"message": {"content": text}}),
+            r#"{"done":true}"#,
+        ).into_bytes();
+        let addr = spawn_mock_llm(body).await;
+        let backends = backends_with_llm_addr(addr);
+        let wake = loose_wake();
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        let reply = llm_chat_streaming(&backends, &wake, "test", tx).await.unwrap();
+        let mut sentences = vec![];
+        while let Some(s) = rx.recv().await {
+            sentences.push(s);
+        }
+        assert_eq!(reply, text);
+        assert_eq!(sentences.concat(), text);
     }
 }

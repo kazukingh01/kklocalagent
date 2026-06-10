@@ -536,10 +536,37 @@ async fn playback_producer_task(
                     // get their drain_done fired immediately because
                     // the cancel itself is the "no more audio is
                     // coming" signal that the upstream is waiting for.
+                    //
+                    // Diagnostic: count the discarded audio. When this
+                    // fires at the *start* of a new utterance (a turn-start
+                    // /spk/stop racing the new burst), the drained frames
+                    // ARE the clipped head — `approx_ms` is roughly how much
+                    // got cut. Enable with `RUST_LOG=audio_io::playback=debug`.
+                    let mut drained_frames: u32 = 0;
+                    let mut drained_bytes: usize = 0;
+                    if let PlaybackMessage::Frame(ref b) = msg {
+                        drained_frames += 1;
+                        drained_bytes += b.len();
+                    }
                     while let Ok(pending) = spk_rx.try_recv() {
-                        if let PlaybackMessage::Eos { drain_done } = pending {
-                            let _ = drain_done.send(());
+                        match pending {
+                            PlaybackMessage::Frame(b) => {
+                                drained_frames += 1;
+                                drained_bytes += b.len();
+                            }
+                            PlaybackMessage::Eos { drain_done } => {
+                                let _ = drain_done.send(());
+                            }
                         }
+                    }
+                    if drained_frames > 0 {
+                        let bytes_per_ms = (source_rate as usize * 2 / 1000).max(1);
+                        debug!(
+                            drained_frames,
+                            drained_bytes,
+                            approx_ms = drained_bytes / bytes_per_ms,
+                            "playback flush discarded queued frames (/spk/stop); at an utterance start this is the clipped head"
+                        );
                     }
                     framer.flush();
                     if let PlaybackMessage::Eos { drain_done } = msg {

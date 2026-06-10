@@ -33,12 +33,13 @@ Architecture decisions:
   after `AGENT_SESSION_IDLE_SEC` of no /api/chat traffic (assume the
   operator walked away; the next turn is a fresh conversation).
 * **Tools (issue #19)** are gated behind `AGENT_TOOLS_ENABLED`. When
-  on, the chat graph is replaced with `create_react_agent` (LLM ↔
-  tool loop). When off, the legacy single-node graph is used so
-  pre-tools behaviour is preserved bit-for-bit. The stream filter
-  drops tool-call deltas (would TTS structured data otherwise) and
-  injects a per-tool "filler ack" chunk (e.g. "ちょっと検索してみるね")
-  before slow tools so the user doesn't sit through a silent gap.
+  on, the chat graph is a hand-rolled ReAct loop (agent ↔ tools) — see
+  `build_react_graph`; a "terminal" tool like stop_audio ends the turn
+  without a second LLM call. When off, the legacy single-node graph is
+  used so pre-tools behaviour is preserved bit-for-bit. The stream
+  filter drops tool-call deltas (would TTS structured data otherwise)
+  and injects a per-tool "filler ack" chunk (e.g. "ちょっと検索してみるね")
+  when the tool is invoked so the user doesn't sit through a silent gap.
 """
 
 from __future__ import annotations
@@ -55,18 +56,20 @@ from typing import AsyncIterator
 import aiosqlite
 from aiohttp import web
 from langchain_core.messages import (
+    AIMessage,
     AIMessageChunk,
     HumanMessage,
     SystemMessage,
     ToolMessage,
+    trim_messages,
 )
 from langchain_ollama import ChatOllama
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, MessagesState, StateGraph
-from langgraph.prebuilt import create_react_agent
+from langgraph.prebuilt import ToolNode, tools_condition
 
-from tools import TOOL_ACK_PHRASES, all_tools
+from tools import TOOL_ACK_PHRASES, all_tools, set_reset_memory_hook
 
 log = logging.getLogger("agent")
 
@@ -88,6 +91,78 @@ TOOLS_ENABLED = os.environ.get("AGENT_TOOLS_ENABLED", "false").lower() in ("1", 
 # voice line rather than loop forever. issue #19 オープン項目 #6 の retry
 # リミット。
 RECURSION_LIMIT = int(os.environ.get("AGENT_TOOL_RECURSION_LIMIT", "6"))
+# Trim the accumulated chat history to this many (estimated) tokens before
+# each LLM call. Without it, a long tool-heavy conversation grows the
+# checkpointed history until it fills ollama's context window — the prompt
+# then leaves no room to generate, the reply truncates to empty, and the
+# agent gets stuck emitting its fallback line every turn (only recovering on
+# session idle-rotation / restart). Kept well under OLLAMA_CONTEXT_LENGTH
+# (default 16384) since the system prompt + tool schemas + generation room
+# are *on top* of this budget (they are not part of state["messages"]).
+MAX_HISTORY_TOKENS = int(os.environ.get("AGENT_MAX_HISTORY_TOKENS", "4096"))
+# Tools whose *successful* result ends the turn with a fixed confirmation (their
+# TOOL_ACK_PHRASES line) instead of a second LLM call. They are instant and
+# deterministic — re-invoking the model just to paraphrase "done" only adds a
+# whole model-call of latency. A failed one falls back to the LLM so it can
+# explain. See build_react_graph's terminal-tool routing.
+TERMINAL_TOOLS = {"stop_audio", "reset_memory"}
+# Log every LLM turn's raw output (tool_calls / content / additional_kwargs incl.
+# any reasoning) at INFO so tool-calling can be debugged — e.g. did the model
+# actually emit `stop_audio`, or just reason+text? Set AGENT_LOG_LLM_RAW=false to
+# quiet it once things are working.
+LOG_LLM_RAW = os.environ.get("AGENT_LOG_LLM_RAW", "true").lower() in ("1", "true", "yes")
+# AGENT_REASONING — gemma4-style "thinking" mode selector. There are TWO
+# distinct ways a model can think, and they are NOT interchangeable across
+# models, so this is a 3-way mode rather than a bool:
+#
+#   0 = off          no thinking. We send think=FALSE (explicitly — omitting
+#                    it lets a thinking-capable backend default to ON) and add
+#                    no <|think|> token. Safe on every model.
+#   1 = native       ollama's native `think=true` (ChatOllama reasoning=True).
+#                    The thinking is kept out of `content` (it lands in
+#                    additional_kwargs), so it never reaches TTS. Works only
+#                    on models that advertise native thinking to ollama
+#                    (e.g. the `gemma4:e4b` library tag). On an imported HF
+#                    GGUF that lacks it, `think=true` returns HTTP 400.
+#   2 = prompt-token gemma4's other mechanism: prepend AGENT_THINK_TOKEN
+#                    (default <|think|>) to the system prompt. We send
+#                    think=false to suppress native thinking, and the prompt
+#                    token drives the reasoning instead. For GGUFs that reject
+#                    native think (e.g. hf.co/unsloth/gemma-4-12b-it-GGUF).
+#                    NOTE: in this mode the reasoning may surface inline in
+#                    `content`; the orchestrator strips <...> spans before TTS
+#                    so it isn't spoken.
+#
+# CAVEAT (modes 1 & 2): thinking adds latency and has been observed to
+# suppress tool calls on gemma4 12B (the model reasons + replies with text
+# instead of calling e.g. stop_audio). Use 0 if tool-calling regresses.
+# Back-compat: on/true/yes → 1, off/false/no → 0. Default 0 (code AND
+# compose) — mode 1 also hard-fails (HTTP 400) on imported HF GGUFs.
+def _reasoning_mode() -> int:
+    v = os.environ.get("AGENT_REASONING", "0").strip().lower()
+    if v in ("0", "off", "false", "no", "none"):
+        return 0
+    if v == "2":
+        return 2
+    # "1" / "on" / "true" / "yes" / "default" / "model" / anything → native
+    return 1
+
+
+REASONING_MODE = _reasoning_mode()
+# ChatOllama `reasoning=`: True for native mode (1) → think=true. Modes 0 and 2
+# send think=FALSE (NOT None). This matters: None omits the `think` field, and a
+# thinking-capable backend (recent ollama / llama.cpp peg-gemma4) then falls
+# back to its DEFAULT, which is thinking ON — so AGENT_REASONING=0 would still
+# reason. think=false disables it explicitly, and is safe even on a GGUF that
+# can't think (the "does not support thinking" 400 only fires on think=TRUE —
+# i.e. when you ask it TO think; "don't think" is trivially honoured). Mode 2
+# suppresses native think and reasons via the THINK_PREFIX prompt token instead.
+REASONING = True if REASONING_MODE == 1 else False
+# Token that flips gemma4 into thinking when placed at the START of the system
+# prompt (mode 2). Overridable so a model that spells it differently can be
+# accommodated without a code change. Empty prefix in modes 0/1.
+THINK_TOKEN = os.environ.get("AGENT_THINK_TOKEN", "<|think|>")
+THINK_PREFIX = (THINK_TOKEN + "\n") if REASONING_MODE == 2 else ""
 # Recovery line spoken whenever a turn would otherwise end with no
 # spoken text — either the ReAct loop exceeded RECURSION_LIMIT, or the
 # stream finished after a failed/denied tool without the LLM producing
@@ -96,6 +171,24 @@ FALLBACK_TEXT = os.environ.get(
     "AGENT_TOOL_FALLBACK_TEXT",
     "うまくできませんでした、すみません。",
 )
+# Action tools have a binary, deterministic outcome (the audio played or it
+# didn't; the timer was set or it wasn't). gemma4 has been observed to IGNORE
+# an [error] ToolMessage and falsely confirm success — e.g. reply 「再生したよ」
+# after audio-io was unreachable and the tool returned `[error] … audio was
+# NOT played`. For these tools we do NOT trust the model to report failure:
+# when one returns [error]/[denied] the chat stream suppresses the model's
+# (untrustworthy) reply and speaks a deterministic honest line instead. The
+# system-prompt nudge below is defence-in-depth; this dict is the guarantee.
+# Info/query tools (run_shell, read_file, web_search, system_health,
+# check_timers) are intentionally excluded — there the model's interpretation
+# of the result (summarising, retrying, explaining an error) is the point.
+TOOL_FAIL_PHRASES: dict[str, str] = {
+    "play_audio_file": "ごめん、音声を再生できなかった。",
+    "stop_audio": "ごめん、音声を止められなかった。",
+    "start_timer": "ごめん、タイマーをかけられなかった。",
+    "cancel_timer": "ごめん、タイマーを止められなかった。",
+}
+ACTION_TOOLS = frozenset(TOOL_FAIL_PHRASES)
 # Suffix appended to AGENT_SYSTEM_PROMPT *only when tools are enabled* so we
 # don't tell the LLM about tools that aren't wired. The phrasing matches the
 # voice-agent persona (タメ口 / 短文 / TTS 向き). Override entirely with
@@ -106,6 +199,15 @@ FALLBACK_TEXT = os.environ.get(
 # entire tool-use prompt.
 TOOL_SYSTEM_SUFFIX = os.environ.get("AGENT_TOOL_SYSTEM_SUFFIX") or (
     " You have tools available — use them naturally when they help."
+    # --- Action requests MUST go through the tool. Lives here (not in
+    # AGENT_SYSTEM_PROMPT) so every tools-enabled deployment gets it and a
+    # tools-off deployment never mentions tools it doesn't have.
+    " For any action request (resetting memory, timers, playing/stopping"
+    " audio, telling the time, web search, file operations, etc.), you must"
+    " call the corresponding tool to actually perform it. Never report"
+    " completion or acknowledgement — saying things like 'Done' or 'I'll do"
+    " that now' — without calling the tool. Only report the result after you"
+    " have received the tool's output."
     " Tool results are private to you; the user can't see or hear them,"
     " so don't refer to them with deictic words like 'this', 'these',"
     " or 'as written there' — instead, restate the relevant content in"
@@ -145,6 +247,13 @@ TOOL_SYSTEM_SUFFIX = os.environ.get("AGENT_TOOL_SYSTEM_SUFFIX") or (
     " telling the user it failed. Don't loop more than 2-3 times on"
     " the same tool — if that doesn't work, honestly say you couldn't"
     " do it."
+    # --- Never fabricate success after a failed action. (Backed by a
+    # deterministic guard in the chat stream — see TOOL_FAIL_PHRASES — but
+    # state it here too so the model doesn't even try.)
+    " NEVER claim an action worked when its tool returned `[error]` or"
+    " `[denied]`. Do not say 「再生したよ」「セットしたよ」「止めたよ」 or"
+    " similar after a failure — if it failed, say plainly that it didn't"
+    " work."
     # --- Tiny CoT nudge. We don't have explicit thinking tokens for
     # Gemma so this is the prompt-level equivalent.
     " For requests that involve multiple steps (find a file, then play"
@@ -153,6 +262,376 @@ TOOL_SYSTEM_SUFFIX = os.environ.get("AGENT_TOOL_SYSTEM_SUFFIX") or (
     " the steps in one turn — only speak to the user once everything"
     " is done (or you've genuinely hit a wall)."
 )
+
+# --- Tool-use few-shot ------------------------------------------------------
+# gemma4 12B is weak at *deciding to call* a tool (it tends to answer in text
+# or fabricate success). The strongest fix is to show it real example turns —
+# Human → AI(tool_calls) → Tool(result) → AI(reply) — so it sees the exact
+# tool-call shape it should emit, not just an English description. These are
+# injected as a fixed prefix AFTER the system message and BEFORE the live
+# history (so the prompt-cache prefix stays stable), and are NOT persisted to
+# the checkpoint. Controlled by:
+#   AGENT_TOOL_FEWSHOT       on/off (default off — in code AND compose; the
+#                            fake-history examples were observed to be read as
+#                            conversation facts and answer-copied instead of
+#                            triggering the tool call)
+#   AGENT_TOOL_FEWSHOT_FILE  optional JSON path overriding the builtin examples
+# A turn is {"role": user|assistant|tool, "content": str,
+#            "tool_calls": [{"name","args"}]?, "name": str?}. tool_call ids are
+# auto-assigned (fs0, fs1, …) and matched to the following tool turn(s) in
+# order, so authors never write ids by hand.
+_FEWSHOT_DEFAULT: list[dict] = [
+    {"role": "user", "content": "タイマー3分"},
+    {"role": "assistant", "tool_calls": [{"name": "start_timer", "args": {"seconds": 180}}]},
+    {"role": "tool", "name": "start_timer", "content": "タイマー#1 を3分でセットしたよ"},
+
+    {"role": "user", "content": "今タイマーいくつ動いてる？"},
+    {"role": "assistant", "tool_calls": [{"name": "check_timers", "args": {}}]},
+    {"role": "tool", "name": "check_timers", "content": "タイマー#1 残り2分30秒"},
+    {"role": "assistant", "content": "1個動いてて、残り2分半くらいだよ。"},
+
+    {"role": "user", "content": "タイマー全部止めて"},
+    {"role": "assistant", "tool_calls": [{"name": "cancel_timer", "args": {"which": "全部"}}]},
+    {"role": "tool", "name": "cancel_timer", "content": "2件キャンセルした"},
+    {"role": "assistant", "content": "全部止めたよ。"},
+
+    {"role": "user", "content": "音声止めて"},
+    {"role": "assistant", "tool_calls": [{"name": "stop_audio", "args": {}}]},
+    {"role": "tool", "name": "stop_audio", "content": "停止した"},
+
+    {"role": "user", "content": "今日の天気は？"},
+    {"role": "assistant", "tool_calls": [{"name": "web_search", "args": {"query": "今日の天気"}}]},
+    {"role": "tool", "name": "web_search", "content": "AAは晴れ、最高BB度の見込み。"},
+    {"role": "assistant", "content": "AAは晴れで、最高BB度くらいみたいだよ。"},
+
+    {"role": "user", "content": "今日って何日だっけ？"},
+    {"role": "assistant", "tool_calls": [{"name": "run_shell", "args": {"command": "date"}}]},
+    {"role": "tool", "name": "run_shell", "content": "AA BB  X HH:MM:SS JST YYYY"},
+    {"role": "assistant", "content": "今日X月X日だよ。"},
+
+    {"role": "user", "content": "今何時？"},
+    {"role": "assistant", "tool_calls": [{"name": "run_shell", "args": {"command": "date"}}]},
+    {"role": "tool", "name": "run_shell", "content": "AA BB  X HH:MM:SS JST YYYY"},
+    {"role": "assistant", "content": "時刻はHH時MM分だよ。"},
+
+    {"role": "user", "content": "news フォルダの中に何がある？"},
+    {"role": "assistant", "tool_calls": [{"name": "run_shell", "args": {"command": "ls /workspace/share/news"}}]},
+    {"role": "tool", "name": "run_shell", "content": "20260607_morning.wav"},
+    {"role": "assistant", "content": "音声ファイルが１つ入ってるよ"},
+
+    {"role": "user", "content": "shareのメモ読んで"},
+    {"role": "assistant", "tool_calls": [{"name": "run_shell", "args": {"command": "ls /workspace/share"}}]},
+    {"role": "tool", "name": "run_shell", "content": "memo.txt\nnews/"},
+    {"role": "assistant", "tool_calls": [{"name": "read_file", "args": {"path": "/workspace/share/xxxxxx.txt"}}]},
+    {"role": "tool", "name": "read_file", "content": "XXXXXXXXXXXXXXXXXX"},
+    {"role": "assistant", "content": "メモには、XXXXXXXXXXXXXXXXXXって書いてあるよ。"},
+
+    {"role": "user", "content": "〇〇の音声再生して"},
+    {"role": "assistant", "tool_calls": [{"name": "play_audio_file", "args": {"paths": ["/workspace/share/news/xxxxxxxxxxxx.wav"]}}]},
+    {"role": "tool", "name": "play_audio_file", "content": "再生を開始した"},
+    {"role": "assistant", "content": "音声を流すね。"},
+
+    {"role": "user", "content": "〇〇の音声全部再生して"},
+    {"role": "assistant", "tool_calls": [{"name": "play_audio_file", "args": {"paths": ["/workspace/share/news/*.wav"]}}]},
+    {"role": "tool", "name": "play_audio_file", "content": "再生を開始した"},
+    {"role": "assistant", "content": "音声を流すね。"},
+
+    {"role": "user", "content": "システムチェックして"},
+    {"role": "assistant", "tool_calls": [{"name": "system_health", "args": {}}]},
+    {"role": "tool", "name": "system_health", "content": "agent OK / llm OK / tts OK / audio-io 応答なし"},
+    {"role": "assistant", "content": "audio-io が応答してないみたい。それ以外は正常だよ"},
+
+    {"role": "user", "content": "記憶リセットして"},
+    {"role": "assistant", "tool_calls": [{"name": "reset_memory", "args": {}}]},
+    {"role": "tool", "name": "reset_memory", "content": "会話の記憶をリセットした"},
+    {"role": "assistant", "content": "記憶をリセットしたよ。"},
+]
+
+
+def _fewshot_turns_to_messages(turns: list[dict]) -> list:
+    """Convert raw few-shot turn dicts into LangChain messages, auto-assigning
+    and matching tool_call ids (fs0, fs1, …). Linear examples only: each tool
+    turn binds to the oldest still-unmatched tool_call (FIFO)."""
+    msgs: list = []
+    pending_ids: list[str] = []
+    counter = 0
+    for t in turns:
+        role = t.get("role")
+        if role == "user":
+            msgs.append(HumanMessage(content=t.get("content", "")))
+        elif role == "assistant":
+            raw_tcs = t.get("tool_calls") or []
+            if raw_tcs:
+                lc_tcs = []
+                for tc in raw_tcs:
+                    tid = f"fs{counter}"
+                    counter += 1
+                    pending_ids.append(tid)
+                    lc_tcs.append({
+                        "name": tc["name"],
+                        "args": tc.get("args", {}),
+                        "id": tid,
+                        "type": "tool_call",
+                    })
+                msgs.append(AIMessage(content=t.get("content", ""), tool_calls=lc_tcs))
+            else:
+                msgs.append(AIMessage(content=t.get("content", "")))
+        elif role == "tool":
+            tid = pending_ids.pop(0) if pending_ids else f"fs{counter}"
+            msgs.append(ToolMessage(
+                content=t.get("content", ""),
+                name=t.get("name"),
+                tool_call_id=tid,
+            ))
+        else:
+            log.warning("few-shot: skipping turn with unknown role %r", role)
+    return msgs
+
+
+def _build_fewshot() -> list:
+    """Build the fixed few-shot message prefix from env. Empty when tools are
+    off or AGENT_TOOL_FEWSHOT is not enabled. A bad AGENT_TOOL_FEWSHOT_FILE
+    warns and falls back to the builtin examples rather than crashing."""
+    if not TOOLS_ENABLED:
+        return []
+    if os.environ.get("AGENT_TOOL_FEWSHOT", "off").strip().lower() not in (
+        "on", "true", "1", "yes"
+    ):
+        return []
+    turns, source = _FEWSHOT_DEFAULT, "builtin"
+    path = os.environ.get("AGENT_TOOL_FEWSHOT_FILE", "").strip()
+    if path:
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, list):
+                raise ValueError("top-level JSON must be a list of turn objects")
+            turns, source = data, "file"
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "few-shot file %r unusable (%s: %s); using builtin examples",
+                path, type(e).__name__, e,
+            )
+    msgs = _fewshot_turns_to_messages(turns)
+    log.info(
+        "agent: tool few-shot enabled: %d turns -> %d messages (source=%s)",
+        len(turns), len(msgs), source,
+    )
+    return msgs
+
+
+FEWSHOT_MESSAGES = _build_fewshot()
+
+
+def _fmt_msgs_for_log(messages: list) -> str:
+    """Compact rendering of a message list for debug logs. Surfaces the parts
+    that matter for tool debugging — assistant tool_calls and tool RESULTS
+    (the input fed back to the model after a tool runs) — with content
+    truncated so the line stays readable."""
+    out: list[str] = []
+    for m in messages:
+        if isinstance(m, ToolMessage):
+            c = m.content if isinstance(m.content, str) else str(m.content)
+            out.append(f"Tool[{m.name}]={c[:300]!r}")
+        elif isinstance(m, AIMessage):
+            c = m.content if isinstance(m.content, str) else str(m.content)
+            tcs = [(tc.get("name"), tc.get("args")) for tc in (m.tool_calls or [])]
+            out.append(f"AI(content={c[:200]!r}, tool_calls={tcs})")
+        elif isinstance(m, HumanMessage):
+            c = m.content if isinstance(m.content, str) else str(m.content)
+            out.append(f"Human={c[:200]!r}")
+        elif isinstance(m, SystemMessage):
+            out.append(f"System(chars={len(str(m.content))})")
+        else:
+            out.append(f"{type(m).__name__}={str(getattr(m, 'content', ''))[:120]!r}")
+    return " | ".join(out)
+
+
+# --- Share-folder knowledge primer --------------------------------------
+# Inject a compact map of the mounted share dir into the system prompt so the
+# agent knows what's available without ls-ing every turn. Format: a tree of
+# DIRECTORIES only; each dir is summarised by an extension histogram of its
+# DIRECT files ("wav×42, txt×3"). This is *knowledge*, so it lives in the
+# system prompt — not in the few-shot (which teaches tool-call shape, not
+# facts). Rebuilt in the background every REFRESH_SEC so newly added files show
+# up without a restart; empty/disabled → no block, no behaviour change.
+#
+# Env family `AGENT_CONTEXT_*` = dynamic blocks injected into the system
+# prompt. `AGENT_CONTEXT_SHARE` is the first; future siblings would each get
+# their own toggle + builder + section (e.g. `AGENT_CONTEXT_DATETIME` to inject
+# today's date/time). The Python identifiers below stay share-specific.
+SHARE_PRIMER_ENABLED = os.environ.get("AGENT_CONTEXT_SHARE", "off").strip().lower() in (
+    "on", "true", "1", "yes"
+)
+SHARE_PRIMER_DIR = os.environ.get("AGENT_CONTEXT_SHARE_DIR", "/workspace/share")
+SHARE_PRIMER_REFRESH_SEC = float(os.environ.get("AGENT_CONTEXT_SHARE_REFRESH_SEC", "300"))
+SHARE_PRIMER_MAX_DIRS = int(os.environ.get("AGENT_CONTEXT_SHARE_MAX_DIRS", "20"))
+
+
+def _build_share_primer() -> str:
+    """Render the share dir as a dirs-only tree, each dir summarised by an
+    extension×count histogram of its direct files. When there are more than
+    MAX_DIRS directories, keep the MAX_DIRS most-recently-modified ones (by
+    dir mtime) plus their ancestors (so the tree stays connected) and omit the
+    rest. "" when disabled or missing. Pure filesystem walk — no LLM."""
+    if not SHARE_PRIMER_ENABLED:
+        return ""
+    root = os.path.abspath(SHARE_PRIMER_DIR)
+    if not os.path.isdir(root):
+        return ""
+    # Walk once, collecting every dir in tree pre-order (siblings sorted) with
+    # its own mtime + an extension histogram of its DIRECT files.
+    entries: list[tuple[str, int, float, str]] = []  # (rel, depth, mtime, summary)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        rel = os.path.relpath(dirpath, root)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        try:
+            mtime = os.stat(dirpath).st_mtime
+        except OSError:
+            mtime = 0.0
+        counts: dict[str, int] = {}
+        for f in filenames:
+            ext = os.path.splitext(f)[1].lower().lstrip(".") or "noext"
+            counts[ext] = counts.get(ext, 0) + 1
+        if counts:
+            items = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+            summary = ", ".join(f"{e}×{c}" for e, c in items[:8])
+            if len(items) > 8:
+                summary += f", +{len(items) - 8} more"
+        else:
+            summary = "—"
+        entries.append((rel, depth, mtime, summary))
+    if not entries:
+        return ""
+    # Rank only "content" dirs — those with no sub-directory of their own.
+    # Structural ancestors (root + intermediate dirs) are always shown for free
+    # and never consume the cap; otherwise a parent's mtime (bumped whenever a
+    # child is added) would crowd out the very leaves we want. So the cap = how
+    # many of the newest *leaf* dirs to keep.
+    rels = {e[0] for e in entries}
+
+    def _has_subdir(rel: str) -> bool:
+        if rel == ".":
+            return any(o != "." for o in rels)
+        prefix = rel + os.sep
+        return any(o != rel and o.startswith(prefix) for o in rels)
+
+    leaves = [e for e in entries if not _has_subdir(e[0])]
+    truncated = len(leaves) > SHARE_PRIMER_MAX_DIRS
+    if truncated:
+        newest = sorted(leaves, key=lambda e: e[2], reverse=True)[:SHARE_PRIMER_MAX_DIRS]
+        keep = {e[0] for e in newest}
+        for rel in list(keep):  # add ancestors so the tree stays connected
+            parts = rel.split(os.sep)
+            for i in range(1, len(parts)):
+                keep.add(os.sep.join(parts[:i]))
+        keep.add(".")
+        entries = [e for e in entries if e[0] in keep]
+    lines: list[str] = []
+    for rel, depth, _mtime, summary in entries:
+        name = (os.path.basename(root) or "share") if rel == "." else os.path.basename(rel)
+        lines.append(f"{'  ' * depth}{name}/  {summary}")
+    if truncated:
+        lines.append(
+            f"… (newest {SHARE_PRIMER_MAX_DIRS} of {len(leaves)} content dirs by mtime; older omitted)"
+        )
+    body = "\n".join(lines)
+    return (
+        f"\n\n## 共有フォルダ ({root}) の構成"
+        "（ディレクトリのみ。各 dir は直下ファイルを「拡張子×件数」で要約）\n"
+        f"{body}\n"
+        "これは現在の中身の参考。実際に再生/読み込みする前に、必要なら "
+        "ls / read_file で正確なファイル名・パスを確認すること。"
+    )
+
+
+SHARE_PRIMER = _build_share_primer()
+
+
+async def _refresh_share_primer_loop() -> None:
+    """Rebuild SHARE_PRIMER every REFRESH_SEC so newly added files appear in the
+    system prompt without a restart. Best-effort; the walk runs off-thread so it
+    never blocks the event loop. A change busts the prompt-cache prefix once."""
+    global SHARE_PRIMER
+    while True:
+        await asyncio.sleep(SHARE_PRIMER_REFRESH_SEC)
+        try:
+            new = await asyncio.to_thread(_build_share_primer)
+        except Exception as e:  # noqa: BLE001
+            log.warning("share primer refresh failed: %s", e)
+            continue
+        if new != SHARE_PRIMER:
+            SHARE_PRIMER = new
+            log.info("share primer refreshed (%d chars)", len(new))
+
+
+def _compose_system_text() -> str:
+    """The system-prompt TEXT the LLM sees, before the share-context block:
+    THINK_PREFIX (mode 2 only) + persona + (tool-use policy when tools are on).
+    Single source of truth shared by the react graph, warmup, and the startup
+    prompt preview so they can't drift."""
+    if TOOLS_ENABLED:
+        base = (SYSTEM_PROMPT + TOOL_SYSTEM_SUFFIX) if SYSTEM_PROMPT else TOOL_SYSTEM_SUFFIX.strip()
+    else:
+        base = SYSTEM_PROMPT
+    return THINK_PREFIX + base
+
+
+def _log_full_prompt_preview() -> None:
+    """At startup, log the FULL fixed prefix the LLM will receive for a turn —
+    system prompt + AGENT_CONTEXT share block + few-shot — exactly as assembled
+    given the current AGENT_REASONING / AGENT_CONTEXT_SHARE / AGENT_TOOL_FEWSHOT
+    / AGENT_TOOLS_ENABLED settings (ON/OFF reflected in the actual content). The
+    live history + current user message are appended after this at request time;
+    this dump is the static part only. Gated by AGENT_LOG_LLM_RAW."""
+    if TOOLS_ENABLED:
+        sys_content = _compose_system_text() + SHARE_PRIMER
+        fewshot = FEWSHOT_MESSAGES
+    else:
+        sys_content = _compose_system_text()
+        fewshot = []
+    parts = [
+        "================= LLM PROMPT PREVIEW (startup) =================",
+        f"[settings] tools={TOOLS_ENABLED} reasoning_mode={REASONING_MODE} "
+        f"think_prefix={THINK_PREFIX!r} context_share={SHARE_PRIMER_ENABLED} "
+        f"few_shot={'on' if fewshot else 'off'}({len(fewshot)} msgs)",
+        "----------------------- SystemMessage -------------------------",
+        sys_content if sys_content else "(empty)",
+    ]
+    if TOOLS_ENABLED:
+        # The actual tool DEFINITIONS (name/description/params) the model can
+        # call. These are sent natively via llm.bind_tools(...) → ollama's
+        # `tools` field, SEPARATE from the messages above — that's why they
+        # don't appear in the per-turn `llm input` log.
+        tools = all_tools()
+        parts.append(
+            f"------------- tools ({len(tools)}) → native `tools` field (bind_tools) -------------"
+        )
+        for t in tools:
+            try:
+                args = ", ".join(
+                    f"{k}:{(v or {}).get('type', '?')}" for k, v in (t.args or {}).items()
+                )
+            except Exception:  # noqa: BLE001
+                args = "?"
+            parts.append(f"• {t.name}({args})")
+            parts.append(f"    {t.description}")
+    if fewshot:
+        parts.append(f"----------------- few-shot ({len(fewshot)} messages) -----------------")
+        for m in fewshot:
+            if isinstance(m, ToolMessage):
+                parts.append(f"[tool:{m.name}] {m.content}")
+            elif isinstance(m, AIMessage):
+                tcs = [(tc.get("name"), tc.get("args")) for tc in (m.tool_calls or [])]
+                parts.append(f"[assistant] content={m.content!r} tool_calls={tcs}")
+            elif isinstance(m, HumanMessage):
+                parts.append(f"[user] {m.content}")
+            else:
+                parts.append(f"[{type(m).__name__}] {getattr(m, 'content', '')}")
+    parts.append("-------- (then at request time: live history + current user) --------")
+    parts.append("===============================================================")
+    log.info("LLM prompt preview:\n%s", "\n".join(parts))
 
 
 class SessionManager:
@@ -194,6 +673,70 @@ class SessionManager:
             self.last_active = now
             return self.current_session
 
+    async def reset(self) -> str:
+        """Force a fresh session id NOW (bypassing the idle gap), so the next
+        turn starts with empty conversation memory in the checkpointer (fresh
+        `thread_id`). The current turn keeps running on its already-claimed id,
+        so the "reset" request itself stays on the old, now-abandoned thread.
+        Wired to the `reset_memory` tool via set_reset_memory_hook."""
+        async with self.lock:
+            old = self.current_session
+            self.current_session = uuid.uuid4().hex
+            self.last_active = time.monotonic()
+            log.info("session reset (manual): %s -> %s", old, self.current_session)
+            return self.current_session
+
+
+def _is_cjk(ch: str) -> bool:
+    """True for Japanese/Chinese characters — hiragana, katakana, kanji, CJK
+    punctuation, and full-width forms. Used by [`_approx_tokens`] to count CJK
+    at a higher token rate than Latin text."""
+    o = ord(ch)
+    return (
+        0x3000 <= o <= 0x9FFF     # CJK punct/symbols, hiragana, katakana, kanji (+Ext A)
+        or 0xF900 <= o <= 0xFAFF  # CJK compatibility ideographs
+        or 0xFF00 <= o <= 0xFFEF  # full-width forms
+    )
+
+
+def _approx_tokens(messages: list) -> int:
+    """Cheap local token estimate for [`_trim_history`], no `/tokenize` round-trip.
+
+    CJK is counted at ~1 token/char and other text at ~1/3 token/char (≈4
+    chars/token for Latin), plus per-message overhead. The earlier flat
+    0.5 tok/char UNDER-counted Japanese ~2x: history the estimate thought fit
+    [`MAX_HISTORY_TOKENS`] was really ~double that, so the system prompt + tool
+    schemas (sent on TOP of this budget) overflowed `OLLAMA_CONTEXT_LENGTH` and
+    ollama silently truncated them from the front — which broke tool calling.
+    Counting CJK honestly keeps the trimmed history within a real token budget.
+    """
+    total = 0
+    for m in messages:
+        content = m.content if isinstance(m.content, str) else str(m.content)
+        cjk = sum(_is_cjk(ch) for ch in content)
+        # CJK ~1 tok/char; the rest (Latin/digits/punct) ~1/3 tok/char.
+        total += cjk + (len(content) - cjk) // 3 + 8
+    return total
+
+
+def _trim_history(messages: list) -> list:
+    """Keep the most recent messages within [`MAX_HISTORY_TOKENS`].
+
+    `start_on="human"` guarantees the kept window begins on a user turn so a
+    tool-call AIMessage and its ToolMessage result are never split (an orphan
+    ToolMessage would be an invalid prompt). The system prompt is added by the
+    caller, on top of this budget, so `include_system=False` here.
+    """
+    return trim_messages(
+        messages,
+        max_tokens=MAX_HISTORY_TOKENS,
+        token_counter=_approx_tokens,
+        strategy="last",
+        include_system=False,
+        start_on="human",
+        allow_partial=False,
+    )
+
 
 def build_legacy_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
     """Single-node chat graph (pre-tools fallback).
@@ -216,9 +759,11 @@ def build_legacy_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
     """
 
     async def chat_node(state: MessagesState):
-        messages = list(state["messages"])
-        if SYSTEM_PROMPT:
-            messages = [SystemMessage(content=SYSTEM_PROMPT), *messages]
+        messages = _trim_history(list(state["messages"]))
+        # THINK_PREFIX (<|think|>) is empty unless AGENT_REASONING=2.
+        sys_content = THINK_PREFIX + SYSTEM_PROMPT
+        if sys_content:
+            messages = [SystemMessage(content=sys_content), *messages]
         # ainvoke (not astream) inside the node — LangGraph's
         # stream_mode="messages" surfaces token-level chunks from the
         # underlying ChatOllama anyway. The full AIMessage returned
@@ -234,29 +779,183 @@ def build_legacy_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
 
 
 def build_react_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
-    """ReAct (agent_node ↔ tools) graph for AGENT_TOOLS_ENABLED=true.
+    """ReAct (agent ↔ tools) graph for AGENT_TOOLS_ENABLED=true.
 
-    `create_react_agent` handles tool binding, the agent-vs-tools router,
-    and the loop back to agent_node after each tool result. We only
-    customise the prompt (system prompt + tool-usage guidance) so the
-    voice-agent persona is preserved while the LLM learns it has tools.
+    Hand-rolled instead of `create_react_agent` so we can add one thing the
+    prebuilt agent can't: when a *terminal* tool (`TERMINAL_TOOLS`, e.g.
+    stop_audio) runs successfully, end the turn WITHOUT a second LLM call.
+    Those tools are instant + deterministic, so re-invoking the model just to
+    paraphrase "done" adds a whole model-call of latency for nothing; the
+    user-facing confirmation comes from the tool's `TOOL_ACK_PHRASES` line
+    (spoken/streamed when the tool is invoked). A failed terminal tool, and
+    every non-terminal tool, loop back to the LLM as usual.
 
-    Tools live in `tools.py::all_tools()`. Adding one there + entering
-    its name in `TOOL_ACK_PHRASES` is enough to wire it — no changes
-    needed here.
+    The LLM call lives in `agent_node`, which injects the system prompt (not
+    persisted in state — so AGENT_SYSTEM_PROMPT changes take effect next turn)
+    and trims history to MAX_HISTORY_TOKENS, keeping system + tools first so the
+    prompt-cache prefix is stable. `ainvoke` inside the node still streams token
+    deltas via stream_mode="messages".
     """
     tools = all_tools()
-    prompt = (SYSTEM_PROMPT + TOOL_SYSTEM_SUFFIX) if SYSTEM_PROMPT else TOOL_SYSTEM_SUFFIX.strip()
-    # `prompt=` is injected as a SystemMessage on every LLM call, same
-    # pattern as the legacy graph — i.e. not persisted in state. So
-    # restarting with a different AGENT_SYSTEM_PROMPT still takes effect
-    # on the next turn.
-    return create_react_agent(
-        llm,
-        tools,
-        prompt=prompt,
-        checkpointer=checkpointer,
+    # THINK_PREFIX (mode 2) + persona + tool policy. Shared with warmup and the
+    # startup prompt preview via _compose_system_text so they can't drift.
+    system_text = _compose_system_text()
+    llm_with_tools = llm.bind_tools(tools)
+
+    async def agent_node(state: MessagesState):
+        history = _trim_history(list(state["messages"]))
+        # Insert the few-shot immediately BEFORE the most-recent user message,
+        # re-inserted every turn — keeps the examples adjacent to the current
+        # request (better recency for a weak model) instead of buried at the top.
+        # Trade-off vs a fixed top prefix: the block moves each turn, so the
+        # cross-turn prompt-cache prefix shrinks to [system(+share)] and the
+        # few-shot is re-prefilled per turn. Within one turn (agent→tool→agent)
+        # the insertion point is stable, so the in-turn cache still holds.
+        if FEWSHOT_MESSAGES:
+            last_user = next(
+                (i for i in range(len(history) - 1, -1, -1)
+                 if isinstance(history[i], HumanMessage)),
+                None,
+            )
+            if last_user is None:
+                body = [*FEWSHOT_MESSAGES, *history]
+            else:
+                body = [*history[:last_user], *FEWSHOT_MESSAGES, *history[last_user:]]
+        else:
+            body = list(history)
+        # System prompt + background-refreshed share knowledge block ("" when
+        # off). THINK_PREFIX stays at the very front (inside system_text).
+        sys_content = system_text + SHARE_PRIMER
+        messages = ([SystemMessage(content=sys_content)] if sys_content else []) + body
+        if LOG_LLM_RAW:
+            # Show the live turn (system + few-shot omitted); the tool RESULT fed
+            # back after a tool call is visible here on the 2nd agent_node call.
+            log.info(
+                "llm input: [system + %d few-shot before last user] + %s",
+                len(FEWSHOT_MESSAGES),
+                _fmt_msgs_for_log(history),
+            )
+        response = await llm_with_tools.ainvoke(messages)
+        if LOG_LLM_RAW:
+            # Output, as parsed by ollama. NOTE: the model's *raw* text (with
+            # the tool-call tokens before ollama parses them into tool_calls) is
+            # consumed server-side and is NOT returned over /api/chat — to see
+            # those literal tokens, enable the LLM server's verbose/debug log.
+            # additional_kwargs is where reasoning_content would land;
+            # response_metadata carries ollama's done_reason / counts.
+            content = (
+                response.content
+                if isinstance(response.content, str)
+                else str(response.content)
+            )
+            log.info(
+                "llm output: tool_calls=%s | content=%r | additional_kwargs=%r | response_metadata=%r",
+                [(tc.get("name"), tc.get("args")) for tc in (response.tool_calls or [])],
+                content[:1000],
+                dict(response.additional_kwargs or {}),
+                dict(getattr(response, "response_metadata", {}) or {}),
+            )
+        return {"messages": [response]}
+
+    def route_after_tools(state: MessagesState) -> str:
+        # Look at the ToolMessages this tools step just appended (the trailing
+        # run). If a terminal tool succeeded (_safe_invoke prefixes failures
+        # with [error]/[denied]), end via terminal_reply; otherwise loop back.
+        for msg in reversed(state["messages"]):
+            if not isinstance(msg, ToolMessage):
+                break
+            if msg.name in TERMINAL_TOOLS and not str(msg.content).startswith(
+                ("[error]", "[denied]")
+            ):
+                return "terminal_reply"
+        return "agent"
+
+    def terminal_reply(state: MessagesState):
+        # Fixed assistant message so the persisted history stays a well-formed
+        # ReAct exchange. NOT re-streamed (stream_mode="messages" only surfaces
+        # LLM output) — the spoken/printed confirmation already came from the
+        # tool's ack phrase, so we reuse that same phrase here for consistency.
+        name = next(
+            (
+                m.name
+                for m in reversed(state["messages"])
+                if isinstance(m, ToolMessage) and m.name in TERMINAL_TOOLS
+            ),
+            None,
+        )
+        text = (TOOL_ACK_PHRASES.get(name) if name else None) or "はい。"
+        return {"messages": [AIMessage(content=text)]}
+
+    builder = StateGraph(MessagesState)
+    builder.add_node("agent", agent_node)
+    builder.add_node("tools", ToolNode(tools))
+    builder.add_node("terminal_reply", terminal_reply)
+    builder.add_edge(START, "agent")
+    # agent → "tools" when the LLM emitted tool_calls, else → END.
+    builder.add_conditional_edges("agent", tools_condition)
+    # tools → terminal_reply (end, no 2nd LLM) on a successful terminal tool,
+    # else back to agent.
+    builder.add_conditional_edges(
+        "tools",
+        route_after_tools,
+        {"agent": "agent", "terminal_reply": "terminal_reply"},
     )
+    builder.add_edge("terminal_reply", END)
+    return builder.compile(checkpointer=checkpointer)
+
+
+async def warm_system_prefix() -> None:
+    """Prime ollama's KV cache with the system-prompt prefix the graphs send.
+
+    Best-effort, run as a background task at startup. The model is already
+    resident (llm/init.sh warms it on load + first decode), but the very first
+    *real* turn still has to prefill the long system prompt — `AGENT_SYSTEM_PROMPT`
+    (+ the tool guidance when tools are on, + the bound tool schemas). Sending
+    one inference here with the *exact* same effective system text and tool set
+    leaves that prefix cached, so the first real turn only evaluates the user
+    message. We rebuild the system text the same way the graphs do — legacy =
+    `SYSTEM_PROMPT`; react = `SYSTEM_PROMPT + TOOL_SYSTEM_SUFFIX` with `all_tools()`
+    bound — so the cached prefix matches token-for-token.
+
+    Never fatal: on any error the first turn just pays the prefill as before.
+    The wake-word flow means no real turn arrives before this finishes.
+    """
+    # Match the real graph's system content exactly (shared _compose_system_text
+    # + share-context block) so the warmed prompt-cache prefix lines up with the
+    # first live turn.
+    system_text = _compose_system_text() + SHARE_PRIMER
+    messages = []
+    if system_text:
+        messages.append(SystemMessage(content=system_text))
+    # few-shot goes right before the (only) user message, mirroring how the
+    # react agent_node now inserts it before the most-recent user message. This
+    # primes the [system, *few-shot] prefix for the FIRST real turn (history =
+    # [user]); later turns re-insert the few-shot deeper, so they re-prefill it.
+    # Empty unless AGENT_TOOL_FEWSHOT is on (and tools enabled).
+    messages.extend(FEWSHOT_MESSAGES)
+    messages.append(HumanMessage(content="ウォームアップ"))
+    # Dedicated capped client: a couple of tokens fill the prefix KV and warm
+    # the decode path without generating a real reply. Bind the same tools so
+    # the request — and thus the cached prefix — matches the react path exactly.
+    warm_llm = ChatOllama(
+        base_url=OLLAMA_BASE_URL, model=MODEL_NAME, temperature=0, num_predict=2,
+        reasoning=REASONING,
+    )
+    target = warm_llm.bind_tools(all_tools()) if TOOLS_ENABLED else warm_llm
+    # ollama may still be loading right after this container starts; retry briefly.
+    for attempt in range(1, 11):
+        try:
+            await target.ainvoke(messages)
+            log.info(
+                "agent: system-prefix warmup done (attempt=%d tools=%s sys_chars=%d)",
+                attempt, TOOLS_ENABLED, len(system_text),
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 — warmup is strictly best-effort
+            if attempt == 10:
+                log.warning("agent: system-prefix warmup gave up: %s", exc)
+                return
+            await asyncio.sleep(2)
 
 
 def extract_user_text(body: dict) -> str:
@@ -331,6 +1030,12 @@ async def stream_chat(graph, sessions: SessionManager, user_text: str
     # heard the ack and the action happened). Only emit fallback when
     # the silence really does follow a failure.
     last_tool_succeeded: bool | None = None
+    # Name of the most recent ACTION tool (play/stop/timer) that returned
+    # [error]/[denied] and hasn't since succeeded on a retry. When still set at
+    # end of turn, we speak a deterministic failure line and suppress the
+    # model's reply — which for these tools can falsely claim success (gemma4
+    # ignoring the [error]). See TOOL_FAIL_PHRASES / ACTION_TOOLS.
+    failed_action_tool: str | None = None
 
     try:
         async for chunk, _meta in graph.astream(
@@ -338,9 +1043,17 @@ async def stream_chat(graph, sessions: SessionManager, user_text: str
         ):
             if isinstance(chunk, ToolMessage):
                 content = chunk.content if isinstance(chunk.content, str) else ""
-                last_tool_succeeded = not content.startswith(
-                    ("[error]", "[denied]")
-                )
+                failed = content.startswith(("[error]", "[denied]"))
+                last_tool_succeeded = not failed
+                # Track action-tool failure so we can override the model's
+                # final reply with a deterministic honest line. A later
+                # SUCCESS of the *same* tool (retry with a fixed arg) clears
+                # it; a different tool succeeding does not mask this failure.
+                if chunk.name in ACTION_TOOLS:
+                    if failed:
+                        failed_action_tool = chunk.name
+                    elif chunk.name == failed_action_tool:
+                        failed_action_tool = None
                 continue
             if not isinstance(chunk, AIMessageChunk):
                 # SystemMessage etc — not for TTS.
@@ -367,6 +1080,12 @@ async def stream_chat(graph, sessions: SessionManager, user_text: str
             # `list[ContentBlock]` for multimodal — we ignore those
             # because the orchestrator's parser expects str.
             if isinstance(chunk.content, str) and chunk.content:
+                # If an action tool failed this turn, the model's final text
+                # is untrustworthy (it may claim success despite the [error]).
+                # Drop it; a deterministic failure line is spoken after the
+                # loop instead.
+                if failed_action_tool is not None:
+                    continue
                 real_content_yielded = True
                 yield {"message": {"content": chunk.content}, "done": False}
     except GraphRecursionError:
@@ -379,6 +1098,21 @@ async def stream_chat(graph, sessions: SessionManager, user_text: str
             RECURSION_LIMIT, session_id,
         )
         yield {"message": {"content": FALLBACK_TEXT}, "done": False}
+        real_content_yielded = True
+        # Recursion fallback already spoke; don't also emit the action line.
+        failed_action_tool = None
+
+    if failed_action_tool is not None:
+        # Deterministic honest failure for an action tool — bypasses the LLM
+        # entirely so a false 「再生したよ」 can never reach the speaker. The
+        # model's own reply (if any) was suppressed above.
+        fail_line = TOOL_FAIL_PHRASES.get(failed_action_tool) or FALLBACK_TEXT
+        log.info(
+            "action tool %s failed for session %s; speaking deterministic "
+            "failure line (model reply suppressed)",
+            failed_action_tool, session_id,
+        )
+        yield {"message": {"content": fail_line}, "done": False}
         real_content_yielded = True
 
     if not real_content_yielded and last_tool_succeeded is not True:
@@ -449,7 +1183,16 @@ async def chat_handler(request: web.Request) -> web.StreamResponse:
         raise
     except Exception as e:  # noqa: BLE001
         log.error("chat stream failed: %s", e)
-    await resp.write_eof()
+    # write_eof() can itself raise on a client that already went away — a
+    # barge-in resets the orchestrator→agent connection mid-stream, the
+    # `except ConnectionResetError` above logs that as a normal cancel, but
+    # the terminating chunk here would then throw a *second* reset that
+    # aiohttp surfaces as an ERROR + traceback. Guard it so an aborted turn
+    # stays quiet. (The CancelledError branch re-raises before reaching here.)
+    try:
+        await resp.write_eof()
+    except ConnectionResetError:
+        pass
     return resp
 
 
@@ -482,9 +1225,15 @@ async def amain() -> None:
     )
 
     log.info(
-        "agent: ollama=%s model=%s db=%s tools=%s recursion_limit=%d",
+        "agent: ollama=%s model=%s db=%s tools=%s recursion_limit=%d "
+        "reasoning_mode=%d (native_think=%s think_prefix=%r)",
         OLLAMA_BASE_URL, MODEL_NAME, DB_PATH, TOOLS_ENABLED, RECURSION_LIMIT,
+        REASONING_MODE, REASONING is True, THINK_PREFIX,
     )
+    # Dump the full fixed prefix (system + share context + few-shot) the LLM
+    # will receive, as assembled from the current ON/OFF settings.
+    if LOG_LLM_RAW:
+        _log_full_prompt_preview()
 
     # ChatOllama streams tokens from ollama via httpx. temperature=0
     # matches the orchestrator's previous /api/chat config (no temp
@@ -494,6 +1243,10 @@ async def amain() -> None:
         base_url=OLLAMA_BASE_URL,
         model=MODEL_NAME,
         temperature=0,
+        # reasoning は AGENT_REASONING (mode 0/1/2) 由来。True=native think
+        # (mode 1) のみ、mode 0/2 は None で think を送らない。詳細は
+        # _reasoning_mode / THINK_PREFIX の定義を参照。
+        reasoning=REASONING,
     )
 
     # Open the checkpoint DB once and keep it open for the process
@@ -508,6 +1261,9 @@ async def amain() -> None:
 
     graph = build_react_graph(llm, saver) if TOOLS_ENABLED else build_legacy_graph(llm, saver)
     sessions = SessionManager(SESSION_IDLE_SEC)
+    # Let the reset_memory tool clear conversation memory by rotating the
+    # session id (next turn → fresh thread_id → empty history).
+    set_reset_memory_hook(sessions.reset)
 
     app = web.Application()
     app["graph"] = graph
@@ -527,9 +1283,29 @@ async def amain() -> None:
     await site.start()
     log.info("agent listening on :%d", PORT)
 
+    # Prime ollama's KV cache with the system-prompt prefix in the background
+    # so the first real turn doesn't re-prefill it. Best-effort; serving has
+    # already started, and the wake-word flow means no real turn lands first.
+    warmup_task = asyncio.create_task(warm_system_prefix())
+    # Keep the share knowledge block fresh (initial build already ran at import;
+    # this only handles ongoing changes). Skipped entirely when disabled.
+    primer_task = (
+        asyncio.create_task(_refresh_share_primer_loop())
+        if SHARE_PRIMER_ENABLED
+        else None
+    )
+    if SHARE_PRIMER_ENABLED:
+        log.info(
+            "share primer enabled: dir=%s refresh=%.0fs (initial %d chars)",
+            SHARE_PRIMER_DIR, SHARE_PRIMER_REFRESH_SEC, len(SHARE_PRIMER),
+        )
+
     try:
         await asyncio.Event().wait()
     finally:
+        warmup_task.cancel()
+        if primer_task is not None:
+            primer_task.cancel()
         await runner.cleanup()
         await conn.close()
 

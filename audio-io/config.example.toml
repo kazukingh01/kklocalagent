@@ -38,7 +38,10 @@ mic_broadcast_frames = 64
 # Track id is selected with `?track=N` on the /spk WebSocket (default 0 keeps
 # the legacy single-client setup working unchanged); `/spk/stop` accepts the
 # same `?track=N` to stop just that track, or no query to stop all.
-playback_tracks = 2
+# The full stack uses three: TTS (track 0), the agent's play_audio_file
+# (track 1) and the agent's timer alarm (track 2). Keep this >= 3 or the
+# timer alarm's ?track=2 connection is closed immediately and no beep sounds.
+playback_tracks = 3
 
 [aec]
 # Acoustic echo cancellation (issue #20). audio-io cancels its own speaker
