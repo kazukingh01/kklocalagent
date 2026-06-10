@@ -674,17 +674,35 @@ class SessionManager:
             return self.current_session
 
 
+def _is_cjk(ch: str) -> bool:
+    """True for Japanese/Chinese characters — hiragana, katakana, kanji, CJK
+    punctuation, and full-width forms. Used by [`_approx_tokens`] to count CJK
+    at a higher token rate than Latin text."""
+    o = ord(ch)
+    return (
+        0x3000 <= o <= 0x9FFF     # CJK punct/symbols, hiragana, katakana, kanji (+Ext A)
+        or 0xF900 <= o <= 0xFAFF  # CJK compatibility ideographs
+        or 0xFF00 <= o <= 0xFFEF  # full-width forms
+    )
+
+
 def _approx_tokens(messages: list) -> int:
     """Cheap local token estimate for [`_trim_history`], no `/tokenize` round-trip.
 
-    ~0.5 tokens/char + per-message overhead. This under-counts dense CJK, so
-    the budget ([`MAX_HISTORY_TOKENS`]) is deliberately set well under the
-    context window to keep a safety margin even when the estimate is low.
+    CJK is counted at ~1 token/char and other text at ~1/3 token/char (≈4
+    chars/token for Latin), plus per-message overhead. The earlier flat
+    0.5 tok/char UNDER-counted Japanese ~2x: history the estimate thought fit
+    [`MAX_HISTORY_TOKENS`] was really ~double that, so the system prompt + tool
+    schemas (sent on TOP of this budget) overflowed `OLLAMA_CONTEXT_LENGTH` and
+    ollama silently truncated them from the front — which broke tool calling.
+    Counting CJK honestly keeps the trimmed history within a real token budget.
     """
     total = 0
     for m in messages:
         content = m.content if isinstance(m.content, str) else str(m.content)
-        total += len(content) // 2 + 8
+        cjk = sum(_is_cjk(ch) for ch in content)
+        # CJK ~1 tok/char; the rest (Latin/digits/punct) ~1/3 tok/char.
+        total += cjk + (len(content) - cjk) // 3 + 8
     return total
 
 
