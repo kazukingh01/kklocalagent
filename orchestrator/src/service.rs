@@ -1,15 +1,6 @@
-//! HTTP server: `POST /events` + `GET /health`.
-//!
-//! `/events` is the single entry point for all upstream producers (VAD,
-//! wake-word-detection, future sources). Events are dispatched by `name`
-//! on a best-effort basis — unknown names are logged and acknowledged
-//! (forward-compat: producers can add new event types before the
-//! orchestrator learns about them).
-//!
-//! v1.0 introduces wake-gated dispatch (see `state::WakeMachine`):
-//! `SpeechEnded` events run the pipeline only when preceded by a
-//! recent `WakeWordDetected`. Set `wake.required = false` to fall
-//! back to v0.1 always-listening behaviour.
+//! HTTP server: `POST /events` + `GET /health`. Events dispatch by `name`;
+//! unknown names are logged and acknowledged (forward-compat). Wake-gated
+//! dispatch lives in `state::WakeMachine`.
 
 use std::sync::{Arc, Mutex};
 
@@ -35,13 +26,10 @@ use crate::state::{DispatchOutcome, SpeechStartedOutcome, WakeMachine, WakeResul
 struct AppState {
     backends: Arc<Backends>,
     wake: Arc<WakeMachine>,
-    /// Handle to the spawned `run_turn` task for the in-flight turn.
-    /// `WakeResult::BargeIn` calls `abort()` on this so every await
-    /// inside run_turn (in-flight ASR/LLM/TTS HTTP, mpsc sentence
-    /// channel, consumer JoinHandle) tears down immediately instead
-    /// of polling between stages and leaving the trailing work to
-    /// drain by itself. Set on dispatch, taken-and-cleared by
-    /// barge-in or by the task itself when it finishes naturally.
+    /// In-flight `run_turn` task handle. `WakeResult::BargeIn` aborts it
+    /// so every await inside run_turn tears down immediately. Set on
+    /// dispatch; taken-and-cleared by barge-in or by the task itself on
+    /// natural completion.
     inflight_turn: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
@@ -82,9 +70,7 @@ pub async fn run(config: Config) -> Result<()> {
 }
 
 async fn health() -> impl IntoResponse {
-    // v0.1: liveness only. We don't probe ASR/LLM here because the
-    // orchestrator is designed to *degrade* (log + drop) when a backend
-    // is down rather than refuse incoming events.
+    // Liveness only — backends down = degrade (log + drop), not refuse.
     (StatusCode::OK, Json(json!({"ok": true})))
 }
 
@@ -92,9 +78,7 @@ async fn events(
     State(state): State<AppState>,
     Json(ev): Json<EventEnvelope>,
 ) -> impl IntoResponse {
-    // Log a compact view of the event before dispatching. Never log the
-    // full `audio_base64` blob (it's big and the content is in the PCM,
-    // not interesting as text).
+    // Never log the full audio_base64 blob.
     info!(
         target: "orch::events",
         name = %ev.name,
@@ -106,14 +90,11 @@ async fn events(
 
     match ev.name.as_str() {
         "SpeechStarted" => {
-            // Pre-gate: drop while the assistant's own TTS is still
-            // bleeding through audio-io's playback ring. Without this,
-            // the speaker → mic loop fires VAD with the assistant's
-            // voice and we'd dispatch an echo turn. Run BEFORE the
-            // wake-machine call so a dropped event doesn't churn
-            // armed-timer state. WakeWordDetected itself is *not*
-            // gated here — the operator deliberately barging in is
-            // exactly the case the gate must let through.
+            // Echo pre-gate: drop while the assistant's own TTS is still
+            // draining (speaker → mic loop would dispatch an echo turn).
+            // Runs BEFORE the wake-machine call so a dropped event doesn't
+            // churn armed-timer state. WakeWordDetected is deliberately
+            // NOT gated — barge-in must get through.
             if state.backends.in_tts_quiet_window() {
                 info!(
                     target: "orch::events",
@@ -125,14 +106,8 @@ async fn events(
                 );
                 return (StatusCode::OK, Json(json!({"ok": true})));
             }
-            // SpeechStarted is the *cancel* trigger for armed-window
-            // timers (per v1.0 spec). on_speech_started() handles the
-            // state transition (ArmedAfter* → Listening); here we
-            // just turn its outcome into a structured log line so
-            // the operator can see exactly why each VAD frame was
-            // accepted or dropped. Drop logs share `event=` /
-            // `reason=` fields with SpeechEnded drops below — a
-            // single `grep 'reason='` finds every dropped VAD event.
+            // Drop logs share `event=` / `reason=` fields with the
+            // SpeechEnded drops below — `grep 'reason='` finds them all.
             match state.wake.on_speech_started() {
                 SpeechStartedOutcome::Bypass => {
                     info!(
@@ -198,11 +173,8 @@ async fn events(
             }
         }
         "SpeechEnded" => {
-            // Same pre-gate as SpeechStarted: an SE landing inside
-            // the TTS playback tail is almost certainly the
-            // assistant's reply being captured by the mic. Drop
-            // here before the wake-machine sees it so neither phase
-            // nor permits move.
+            // Same echo pre-gate as SpeechStarted, before the wake machine
+            // sees it so neither phase nor permits move.
             if state.backends.in_tts_quiet_window() {
                 info!(
                     target: "orch::events",
@@ -222,10 +194,6 @@ async fn events(
                     "VAD event dropped: missing audio_base64"
                 );
             } else {
-                // Wake gate: drop SpeechEnded events that don't pass
-                // the gate. Each outcome is logged with a distinct
-                // `reason=` so a particular dropped utterance can be
-                // traced to the exact branch.
                 match state.wake.try_dispatch() {
                     DispatchOutcome::Run(guard) => {
                         if let Err(e) = dispatch_utterance(&state, &ev, guard) {
@@ -290,9 +258,7 @@ async fn events(
             }
         }
         "WakeWordDetected" => {
-            // Always forward to result_sink — observers (the v0.1
-            // assertion harness, future activity logs) want every
-            // wake event regardless of state.
+            // Forwarded to result_sink regardless of wake state.
             let payload = json!({
                 "name": "WakeWordDetected",
                 "model": ev.model,
@@ -337,30 +303,20 @@ async fn events(
                         score = ?ev.score,
                         "wake word detected mid-turn: barge-in — cancelling current TTS and aborting turn"
                     );
-                    // Abort the in-flight run_turn task. This drops
-                    // every await inside it: in-flight ASR/LLM/TTS
-                    // HTTP responses are dropped (closing the
-                    // connection so ollama/whisper-server stop
-                    // generating), the mpsc sentence channel's sender
-                    // is dropped (so the consumer task unblocks on
-                    // recv() == None and exits, releasing the
-                    // turn-scoped TTS permit), and the run_turn
-                    // local's drop chain releases the ASR/LLM
-                    // semaphore permits. None of this leaves residual
-                    // work for the next turn to fight over. The
-                    // aborted turn's ProcessingGuard::drop also runs
-                    // — generation-checking in WakeMachine::complete
-                    // makes it a no-op so it can't roll back the
-                    // post-barge-in ArmedAfterWake phase.
+                    // Abort the in-flight run_turn: every await inside it
+                    // drops (HTTP connections close so upstreams stop
+                    // generating; the sentence channel closes, releasing
+                    // the turn-scoped TTS permit; ASR/LLM permits drop with
+                    // the locals). The aborted turn's ProcessingGuard::drop
+                    // also runs — generation-checking in
+                    // WakeMachine::complete makes it a no-op so it can't
+                    // roll back the post-barge-in ArmedAfterWake phase.
                     if let Some(h) = state.inflight_turn.lock().expect("inflight poisoned").take() {
                         h.abort();
                     }
-                    // Then the TTS-side cleanup. tts_stop POSTs /stop
-                    // to the streamer (which cancels speak_one and
-                    // POSTs /spk/stop to audio-io to drain its
-                    // playback ring). Spawn so the events handler
-                    // returns 200 quickly even if the streamer is
-                    // slow.
+                    // tts_stop cancels the streamer's speak and drains
+                    // audio-io's playback ring; spawned so the handler
+                    // returns 200 quickly even if the streamer is slow.
                     let backends_for_stop = state.backends.clone();
                     tokio::spawn(async move {
                         tts_stop(&backends_for_stop).await;
@@ -370,15 +326,11 @@ async fn events(
                     });
                 }
             }
-            // Audible wake-ack feedback for the idle accepted cases only.
-            // BargeIn speaks its own ack after the TTS /stop above. ArmedBusy
-            // is deliberately SILENT: barge_in=false means "let the current
-            // reply finish", but the ack goes through /speak whose Speak mode
-            // aborts the in-flight streamer tasks — the ack itself would
-            // half-interrupt the very reply that mode promises to finish (and
-            // the turn ends in ArmedAfterWake anyway, so the feedback adds
-            // little). No-op when tts.wake_ack_text is empty. Spawned so the
-            // events handler still returns 200 immediately.
+            // Wake ack for idle accepted cases only. BargeIn speaks its own
+            // ack after /stop. ArmedBusy is deliberately SILENT: the ack
+            // goes through /speak, which aborts the in-flight streamer
+            // tasks — it would half-interrupt the very reply that
+            // barge_in=false promises to finish.
             if matches!(wake_result, WakeResult::Armed | WakeResult::Bypass) {
                 let backends_for_ack = state.backends.clone();
                 tokio::spawn(async move {
@@ -398,7 +350,7 @@ fn dispatch_utterance(
     ev: &EventEnvelope,
     guard: crate::state::ProcessingGuard,
 ) -> Result<()> {
-    // Defensive: has_utterance_audio() has already established these.
+    // has_utterance_audio() has already established these.
     let b64 = ev
         .audio_base64
         .as_deref()
@@ -406,31 +358,23 @@ fn dispatch_utterance(
     let sample_rate = ev.sample_rate.context("sample_rate missing")?;
     let pcm = pipeline::decode_audio(b64)?;
 
-    // Move the guard into the spawned task so the wake machine stays
-    // in `Processing` until the pipeline finishes — barge-in detection
-    // (WakeResult::BargeIn) and the "drop second SpeechEnded mid-turn"
-    // semantics both depend on this.
-    //
-    // Pass `wake` into run_turn too: the pipeline polls
-    // `wake.is_in_turn()` between stages, so a barge-in flips the
-    // state to Armed and the next stage's HTTP is skipped.
+    // The guard moves into the spawned task so the wake machine stays in
+    // `Processing` until the pipeline finishes — barge-in detection and
+    // "drop second SpeechEnded mid-turn" both depend on this.
     let backends = state.backends.clone();
     let wake = state.wake.clone();
     let inflight_slot = state.inflight_turn.clone();
     let handle = tokio::spawn(async move {
         pipeline::run_turn(backends, wake, pcm, sample_rate).await;
         drop(guard);
-        // Self-clear so a barge-in arriving *after* this turn finished
-        // naturally doesn't try to abort an already-completed handle.
-        // Race-safe: if barge-in's `take()` ran first the slot is
-        // already None; if ours runs first a later barge-in finds None
-        // and treats it as "no in-flight turn", which is correct.
+        // Self-clear so a later barge-in doesn't abort a completed handle.
+        // Race-safe either ordering: whichever `take()` runs second finds
+        // None, which is correct.
         let _ = inflight_slot.lock().expect("inflight poisoned").take();
     });
-    // Replacing an existing handle would mean a previous turn was
-    // still in flight — try_dispatch returned Run only when phase was
-    // Listening / ArmedAfter*, never Processing, so this slot must be
-    // empty. Aborting an unexpected old handle is the safe fallback.
+    // try_dispatch returns Run only when no turn is Processing, so this
+    // slot must be empty; aborting an unexpected old handle is the safe
+    // fallback.
     if let Some(old) = state
         .inflight_turn
         .lock()

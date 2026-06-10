@@ -16,8 +16,7 @@ async fn spawn_test_server() -> SocketAddr {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    // Wait for the server to start accepting connections instead of a fixed
-    // sleep — prevents CI flake on slow runners.
+    // Poll readiness instead of a fixed sleep — prevents CI flake.
     let client = reqwest::Client::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     loop {
@@ -86,7 +85,6 @@ async fn ws_spk_closes_when_playback_not_running() {
     let addr = spawn_test_server().await;
     let url = format!("ws://{addr}/spk");
     let (mut ws, _resp) = connect_async(&url).await.unwrap();
-    // Server should close the socket immediately because playback is not running.
     let msg = ws.next().await;
     assert!(
         matches!(

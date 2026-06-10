@@ -1,20 +1,6 @@
-"""Integration test driver / sink.
-
-Receives forwarded events from the orchestrator's `result_sink` and
-asserts the expected sequence happened end-to-end:
-
-  1. WakeWordDetected fired (proves wake-word-detection ran on the
-     stream and reached the orchestrator).
-  2. TurnCompleted fired with non-empty `user` and `assistant` (proves
-     VAD → orchestrator → ASR → LLM all worked).
-  3. spk-sink received non-zero bytes on its /spk WS (proves the
-     orchestrator's TTS stage synthesized the assistant reply and
-     streamed it to the audio-io edge).
-
-Exits 0 when all three observed within ASSERT_TIMEOUT_SEC, 1 on
-timeout. Logs every received event so failures are diagnosable from
-container logs alone.
-"""
+"""Integration test driver / sink: exits 0 once WakeWordDetected,
+TurnCompleted (non-empty user/assistant), and non-silent spk-sink bytes
+are all observed within ASSERT_TIMEOUT_SEC; exits 1 on timeout."""
 
 from __future__ import annotations
 
@@ -65,9 +51,7 @@ async def sink_handler(request: web.Request) -> web.Response:
 
 
 async def poll_spk_sink() -> None:
-    """Poll the spk-sink's /stats. Sets `tts_received` once non-silent
-    frames have arrived. Logs every distinct change so timing of when
-    audio reached the edge is visible in container logs."""
+    """Poll spk-sink /stats; set `tts_received` once non-silent frames arrive."""
     global last_spk_stats
     last_logged_bytes = -1
     async with aiohttp.ClientSession() as sess:

@@ -7,7 +7,6 @@ pub mod http;
 pub mod pcm;
 pub mod playback;
 pub mod service;
-/// Speex DSP echo-cancellation backend, compiled only with `--features speex`.
 #[cfg(feature = "speex")]
 pub mod speex;
 pub mod state;
@@ -52,11 +51,8 @@ pub async fn run(config: Config) -> Result<()> {
 pub fn build_state(config: Config) -> AppState {
     let cap = config.runtime.mic_broadcast_frames.max(1) as usize;
     let (mic_tx, _) = broadcast::channel(cap);
-    // AEC channels exist regardless of `aec.enabled` so the producers needn't
-    // branch on a runtime toggle; with the mixer/AEC tasks not spawned there
-    // are simply no subscribers/producers. The far-end ingress (fed by each
-    // playback track's consumption tap) is sized larger because multiple
-    // tracks feed it.
+    // AEC channels exist even when aec.enabled=false so producers need no runtime
+    // branch; ref_in is sized larger because multiple playback tracks feed it.
     let (ref_in_tx, _) = broadcast::channel(cap * 2);
     let (ref_tx, _) = broadcast::channel(cap);
     let (mic_aec_tx, _) = broadcast::channel(cap);

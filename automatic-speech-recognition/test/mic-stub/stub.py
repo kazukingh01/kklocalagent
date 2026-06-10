@@ -1,31 +1,11 @@
 """
-Tiny WebSocket server that mimics audio-io's `/mic` endpoint by streaming
-a wav file (or a sequence of wav files) as 20 ms PCM frames. Used by
-smoke tests because audio-io itself is Windows-native and lives outside
-compose.
-
-Wire format (must match audio-io): s16le, 16 kHz, mono, 640 bytes/frame.
-
-Behaviour:
-- Accepts WS clients on any path (VAD/wake-word connect to /mic).
-- On connect, replays the configured sample(s) in real time LOOP_COUNT
-  times. Each loop is followed by LOOP_DELAY_MS of digital silence so
-  the VAD's hang_frames trigger a SpeechEnded between iterations.
-- When multiple samples are configured (SAMPLE_PATHS), they are played
-  in order with INTER_SAMPLE_SILENCE_MS of digital silence between
-  each — this lets a single stream contain e.g. a wake-word fragment
-  followed by a user utterance, with the silence gap forcing VAD to
-  emit two distinct SpeechEnded events.
-- After LOOP_COUNT iterations, keeps the WS open and streams pure
-  silence forever. This stops new transcriptions while preventing the
-  VAD from reconnect-spamming. Tear down with `docker compose down`.
-- LOOP_COUNT=0 means infinite — the original "play and never stop" mode.
-- Disconnects don't crash the server; it waits for the next client.
-
-Backwards compatibility:
-- SAMPLE_PATH (singular) still works for the single-WAV case.
-- SAMPLE_PATHS (plural, comma-separated) takes precedence when set and
-  is the form used by multi-sample tests.
+Mimics audio-io's `/mic` WS endpoint (audio-io is Windows-native, outside
+compose) by replaying wav files as 20 ms PCM frames. Wire format must match
+audio-io: s16le, 16 kHz, mono, 640 bytes/frame. Replays LOOP_COUNT times
+(0 = infinite) with silence gaps so the VAD's hang_frames can fire
+SpeechEnded, then idles with silence forever — stops new transcriptions
+without provoking VAD reconnect-spam. SAMPLE_PATHS (comma-separated) plays
+several wavs per loop; SAMPLE_PATH stays for back-compat.
 """
 
 import asyncio
@@ -42,9 +22,6 @@ SAMPLE_PATH = os.environ.get("SAMPLE_PATH", "/samples/jfk.wav")
 SAMPLE_PATHS_RAW = os.environ.get("SAMPLE_PATHS", "")
 LOOP_DELAY_MS = int(os.environ.get("LOOP_DELAY_MS", "2000"))
 LOOP_COUNT = int(os.environ.get("LOOP_COUNT", "1"))  # 0 = infinite
-# Silence inserted *between* samples within one loop (only meaningful
-# when SAMPLE_PATHS contains 2+ entries). Defaults to LOOP_DELAY_MS so
-# inter-utterance and inter-loop silence are uniform unless overridden.
 INTER_SAMPLE_SILENCE_MS = int(os.environ.get("INTER_SAMPLE_SILENCE_MS", str(LOOP_DELAY_MS)))
 
 SAMPLE_RATE = 16000
@@ -93,14 +70,11 @@ async def stream(ws, pcms: List[bytes]) -> None:
     while LOOP_COUNT == 0 or loops_done < LOOP_COUNT:
         for idx, pcm in enumerate(pcms):
             await stream_pcm(ws, pcm, frame_period)
-            # Silence between samples in this loop (skipped after the
-            # last sample — that gap is contributed by LOOP_DELAY_MS
-            # below).
             if idx < len(pcms) - 1:
                 await stream_silence(ws, inter_sample_silence_frames, frame_period)
         loops_done += 1
-        # Trailing silence — gives the VAD's hang_frames a chance to fire
-        # SpeechEnded for the last utterance of this loop.
+        # Trailing silence lets the VAD's hang_frames fire SpeechEnded for
+        # the loop's last utterance.
         await stream_silence(ws, loop_delay_frames, frame_period)
 
     print(

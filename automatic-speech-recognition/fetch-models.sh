@@ -1,8 +1,4 @@
 #!/bin/sh
-# Download a whisper.cpp ggml model into ./models. Default = ggml-tiny.bin
-# (~75 MB). Override by passing the file name as the first argument:
-#   ./fetch-models.sh ggml-base.bin
-#   ./fetch-models.sh ggml-small.bin
 
 set -e
 

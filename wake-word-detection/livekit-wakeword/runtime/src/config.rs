@@ -1,25 +1,9 @@
-//! Runtime configuration sourced from environment variables. The names
-//! mirror the openwakeword Python shim where the semantics are
-//! identical (`WW_MIC_URL`, `WW_MODELS`, `WW_THRESHOLD`, etc.) so
-//! flipping `compose.yaml`'s `build.context` between the two
-//! implementations requires no env-var renames in the common case.
-//!
-//! Differences from the Python shim:
-//!   * `WW_MODELS` is comma-separated **filenames** (resolved against
-//!     `WW_MODELS_DIR`), not bare names from an internal registry —
-//!     the runtime loads plain ONNX files.
-//!   * `WW_MODELS_DIR` (default `/opt/models`) is new — directory
-//!     containing the classifier ONNX(s) plus the upstream
-//!     `melspectrogram.onnx` + `embedding_model.onnx`. Using the train
-//!     artefacts directly (rather than freezing a copy in the binary)
-//!     guarantees the runtime extracts features identically to how the
-//!     classifier was trained — silent drift across upstream version
-//!     bumps was the failure mode this avoids.
-//!   * `WW_INFERENCE_FRAMEWORK` is gone — onnxruntime is the only
-//!     backend (loaded via `load-dynamic` from ldconfig paths).
-//!   * `WW_PREDICT_WINDOW_MS` is new — bounds the ring buffer fed to
-//!     `WakeWordModel::predict`. The model returns all-zero scores
-//!     for windows shorter than ~2 s, so the default is 2000.
+//! Env-var config. Names mirror the openwakeword Python shim so swapping
+//! compose's `build.context` needs no env renames; unlike the shim,
+//! `WW_MODELS` is comma-separated filenames resolved under `WW_MODELS_DIR`,
+//! which must also hold the upstream `melspectrogram.onnx` +
+//! `embedding_model.onnx` (same artefacts as training, so feature
+//! extraction can't silently drift across upstream version bumps).
 
 use anyhow::{anyhow, Context, Result};
 use std::net::SocketAddr;
@@ -41,10 +25,8 @@ pub struct Config {
     pub embedding_onnx_path: PathBuf,
     pub threshold: f32,
     pub cooldown: Duration,
-    /// How many threshold crossings (each de-duplicated by `cooldown`) must
-    /// land within `confirm_window` before a Detection is forwarded to the
-    /// sink. 1 = forward immediately (legacy). >=2 suppresses false fires by
-    /// requiring the wake word within a short span (e.g. say it twice).
+    /// Threshold crossings (cooldown-deduplicated) required within
+    /// `confirm_window` before a Detection is forwarded; 1 = immediate.
     pub confirm_count: u32,
     pub confirm_window: Duration,
     pub predict_window_ms: u32,
@@ -55,11 +37,8 @@ pub struct Config {
     pub peak_log_floor: f32,
 }
 
-/// Filenames inside `WW_MODELS_DIR`. These match what the upstream
-/// Python `livekit-wakeword` package ships under
-/// `livekit/wakeword/resources/`, so a bind-mount of that directory
-/// (or a COPY of those two files) into `WW_MODELS_DIR` works without
-/// renaming.
+/// Filenames match what upstream `livekit-wakeword` ships under
+/// `livekit/wakeword/resources/`, so a bind-mount works without renaming.
 const MEL_ONNX_FILENAME: &str = "melspectrogram.onnx";
 const EMBEDDING_ONNX_FILENAME: &str = "embedding_model.onnx";
 const DEFAULT_MODELS_DIR: &str = "/opt/models";
@@ -78,10 +57,8 @@ impl Config {
 
         let raw_models = std::env::var("WW_MODELS")
             .unwrap_or_else(|_| DEFAULT_CLASSIFIER_FILENAME.to_string());
-        // Each entry must be a plain filename inside `models_dir`. Reject
-        // path separators and `..` components so an operator can't
-        // (accidentally or otherwise) escape the bind-mounted models dir
-        // and load arbitrary files from the container.
+        // Reject path separators / `..` so WW_MODELS entries can't escape
+        // the bind-mounted models dir.
         let names: Vec<&str> = raw_models
             .split(',')
             .map(str::trim)
@@ -134,12 +111,9 @@ impl Config {
 
         let threshold = parse_env_f32("WW_THRESHOLD", 0.5)?;
         let cooldown = Duration::from_secs_f32(parse_env_f32("WW_COOLDOWN_SEC", 2.0)?);
-        // Confirmation gate (anti-false-fire). confirm_count=1 → forward every
-        // detection immediately. confirm_count>=2 → require that many within
-        // confirm_window. NOTE the interaction with cooldown: a single
-        // utterance scores high for up to ~1.5 s, and `cooldown` is what stops
-        // it from counting twice, so confirm_window MUST be > cooldown for a
-        // count>=2 to ever be reachable by two *separate* utterances.
+        // NOTE: a single utterance scores high for up to ~1.5 s and only
+        // `cooldown` stops it counting twice, so confirm_window MUST be >
+        // cooldown for confirm_count>=2 to be reachable by separate utterances.
         let confirm_count = parse_env_u32("WW_CONFIRM_COUNT", 1)?;
         if confirm_count == 0 {
             return Err(anyhow!("WW_CONFIRM_COUNT must be >= 1"));

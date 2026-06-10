@@ -1,35 +1,7 @@
-//! Offline AEC harness for human A/B listening (issue #20).
-//!
-//! Runs the production [`audio_io::aec::Aec`] over WAV files and writes
-//! before/after WAVs so a person can *listen* to whether the echo is gone
-//! and the near-end voice survives — the verification that automated ERLE
-//! asserts can't fully capture.
-//!
-//! Two ways to provide the near-end (mic) signal:
-//!   * synthetic (default): the harness fabricates the echo as a delayed,
-//!     attenuated copy of the far-end mix — no hardware needed, but the echo
-//!     is a linear model, not a real room.
-//!   * recorded (`--near rec.wav`): feed a real mic recording captured while
-//!     audio-io played the far-end (e.g. `websocat /mic` during playback) —
-//!     real acoustic echo, still offline.
-//!
-//! Usage:
-//!   cargo run --example aec_offline -- --far tts.wav [--far2 file.wav] \
-//!       [--near-voice voice.wav] [--near recorded.wav] \
-//!       [--delay-ms 120] [--gain 0.5] \
-//!       [--filter-ms 128] [--out-dir /tmp/aec]
-//!
-//! Inputs must be 16 kHz, 16-bit PCM WAV. Mono is used as-is; stereo is
-//! downmixed. Convert anything else first, e.g.
-//!   ffmpeg -i in.mp3 -ar 16000 -ac 1 -c:a pcm_s16le tts.wav
-//!
-//! Outputs (in --out-dir, default ./aec_out):
-//!   far_mix.wav   the far-end (what the speaker played)
-//!   near.wav      the AEC input (echo [+ voice]) — listen: assistant bleeds in
-//!   residual.wav  the AEC output (= what /mic serves) — listen: echo gone
-//!
-//! The program prints ERLE (dB) and, when --near-voice is given, how much of
-//! the voice survived. To *see* it, render spectrograms (printed at the end).
+//! Offline AEC harness for human A/B listening (issue #20): runs the
+//! production [`audio_io::aec::Aec`] over WAV files and writes before/after
+//! WAVs — the verification that automated ERLE asserts can't fully capture.
+//! Run with `--help` for usage; inputs must be 16 kHz 16-bit PCM WAV.
 
 use std::path::Path;
 
@@ -38,17 +10,13 @@ use audio_io::aec::Aec;
 const RATE: u32 = 16000;
 const FRAME: usize = 320; // 20 ms @ 16 kHz
 
-// --- minimal WAV I/O (std only; keeps audio-io's deps untouched) ----------
-
-/// Read a 16-bit PCM WAV, returning mono i16 samples at its sample rate.
-/// Stereo is downmixed by averaging. Errors out on non-PCM / non-16-bit.
 fn read_wav_mono_i16(path: &str) -> Result<Vec<i16>, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
     if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return Err(format!("{path}: not a RIFF/WAVE file"));
     }
-    // Walk chunks to find "fmt " and "data" (don't assume a 44-byte header —
-    // real-world WAVs carry LIST/fact chunks before data).
+    // Walk chunks rather than assuming a 44-byte header — real-world WAVs
+    // carry LIST/fact chunks before data.
     let mut pos = 12;
     let (mut channels, mut rate, mut bits) = (0u16, 0u32, 0u16);
     let mut data: Option<&[u8]> = None;
@@ -91,7 +59,6 @@ fn read_wav_mono_i16(path: &str) -> Result<Vec<i16>, String> {
     if ch == 1 {
         Ok(samples)
     } else {
-        // Downmix interleaved → mono by averaging the channels.
         Ok(samples
             .chunks(ch)
             .map(|f| (f.iter().map(|&s| s as i32).sum::<i32>() / ch as i32) as i16)
@@ -120,8 +87,6 @@ fn write_wav_mono_i16(path: &Path, samples: &[i16]) -> Result<(), String> {
     }
     std::fs::write(path, wav).map_err(|e| format!("{}: {e}", path.display()))
 }
-
-// --- helpers ---------------------------------------------------------------
 
 fn rms(s: &[i16]) -> f64 {
     if s.is_empty() {
@@ -169,7 +134,6 @@ fn main() -> Result<(), String> {
     let filter_ms: u32 = arg_or(&args, "--filter-ms", 128);
     let out_dir = arg(&args, "--out-dir").unwrap_or_else(|| "aec_out".into());
 
-    // Far-end = mix of track0 (+ optional track1), the audio audio-io plays.
     let far0 = read_wav_mono_i16(&arg(&args, "--far").unwrap())?;
     let far2 = arg(&args, "--far2")
         .map(|p| read_wav_mono_i16(&p))
@@ -185,8 +149,6 @@ fn main() -> Result<(), String> {
         })
         .collect();
 
-    // Near-end (mic): real recording if given, else synthesize the echo as a
-    // delayed + attenuated copy of the far mix, plus an optional near voice.
     let voice = arg(&args, "--near-voice")
         .map(|p| read_wav_mono_i16(&p))
         .transpose()?;
@@ -207,15 +169,15 @@ fn main() -> Result<(), String> {
             .collect()
     };
 
-    // Run the production AEC, frame by frame (20 ms), as the live path does.
-    // The bulk delay is auto-estimated inside the AEC; no hint is passed.
+    // Frame-by-frame as the live path; the bulk delay is auto-estimated inside
+    // the AEC, no hint is passed.
     let mut aec = Aec::new(RATE, filter_ms);
     let mut residual = Vec::with_capacity(near.len());
     let mut i = 0;
     while i < near.len() {
         let end = (i + FRAME).min(near.len());
         let near_f = &near[i..end];
-        // Far reference aligned index-for-index with near (undelayed; the
+        // Far reference aligned index-for-index with near (undelayed — the
         // AEC's internal delay line models the transport delay).
         let far_f: Vec<i16> = (i..end)
             .map(|j| far_mix.get(j).copied().unwrap_or(0))
@@ -230,10 +192,9 @@ fn main() -> Result<(), String> {
     write_wav_mono_i16(&dir.join("near.wav"), &near)?;
     write_wav_mono_i16(&dir.join("residual.wav"), &residual)?;
 
-    // ERLE only means "echo reduction" over stretches with no near voice
-    // (during double-talk the residual *should* keep the voice). When we know
-    // where the voice is (synthetic path with --near-voice), measure ERLE on
-    // the echo-only samples; otherwise use the whole signal.
+    // ERLE only means "echo reduction" where there is no near voice (during
+    // double-talk the residual *should* keep the voice), so measure on the
+    // echo-only samples when the voice position is known.
     let echo_only: Vec<usize> = match &voice {
         Some(v) => (0..near.len())
             .filter(|&i| v.get(i).copied().unwrap_or(0).abs() < 100)
@@ -257,8 +218,6 @@ fn main() -> Result<(), String> {
     println!("  echo-only resid RMS : {resid_e:8.1}");
     println!("  ERLE (echo region)  : {erle:8.1} dB   (higher = more echo removed)");
     if let Some(v) = &voice {
-        // During the voiced region, the residual should retain most of the
-        // voice energy (ratio near 1.0 = voice preserved, ~0 = over-suppressed).
         let voiced: Vec<usize> = (0..near.len())
             .filter(|&i| v.get(i).copied().unwrap_or(0).abs() >= 100)
             .collect();

@@ -38,45 +38,31 @@ struct Args {
     #[arg(long, env = "VAD_LOG_AUDIO_IN_EVENT")]
     log_audio_in_event: Option<bool>,
 
-    /// Override `detector.hang_frames` (consecutive silent 20 ms
-    /// frames before SpeechEnded fires). Each frame is `frame_ms`
-    /// (default 20 ms), so 10 ≈ 200 ms of silence, 20 ≈ 400 ms
-    /// (the legacy default). Lower values shave end-of-utterance
-    /// latency at the cost of cutting off natural mid-utterance
-    /// pauses.
+    /// Override `detector.hang_frames` (consecutive silent frames before
+    /// SpeechEnded). Lower values shave end-of-utterance latency at the
+    /// cost of cutting off natural mid-utterance pauses.
     #[arg(long, env = "VAD_HANG_FRAMES")]
     hang_frames: Option<u32>,
 
-    /// Override `detector.start_frames` (consecutive voiced 20 ms
-    /// frames before SpeechStarted fires). Default 3 ≈ 60 ms.
-    /// Bump to 5–7 (100–140 ms) to filter out short impulse noise
-    /// (single claps, taps, mouse clicks) that webrtc-vad would
-    /// otherwise mis-classify as speech onset. Trade-off: very
-    /// fast utterance starts ("はい") get their first frames eaten.
+    /// Override `detector.start_frames` (consecutive voiced frames before
+    /// SpeechStarted). Bump to 5–7 to filter impulse noise (claps, taps)
+    /// that webrtc-vad otherwise mis-classifies as speech onset.
     #[arg(long, env = "VAD_START_FRAMES")]
     start_frames: Option<u32>,
 
-    /// Override `detector.aggressiveness` (0..=3). webrtc-vad
-    /// internal strictness: 0 = Quality (most permissive),
-    /// 3 = VeryAggressive (strictest, most false-negatives on
-    /// quiet speech but cuts impulse / borderline noise hardest).
-    /// Default 2.
+    /// Override `detector.aggressiveness` (0..=3): webrtc-vad strictness,
+    /// 0 = Quality (most permissive), 3 = VeryAggressive (strictest).
     #[arg(long, env = "VAD_AGGRESSIVENESS")]
     aggressiveness: Option<u8>,
 
-    /// Override `detector.denoise`. When true, every incoming
-    /// 20 ms frame is run through nnnoiseless (RNNoise) before VAD
-    /// classification *and* before being buffered for ASR. Cleans
-    /// steady-state background noise (fans, AC, low hum); reduces
-    /// VAD false positives and Whisper's silence-hallucination
-    /// rate ("ご視聴ありがとうございました" etc.).
+    /// Override `detector.denoise`: run each frame through nnnoiseless
+    /// (RNNoise) before VAD and ASR buffering. Reduces VAD false positives
+    /// and Whisper's silence-hallucination rate ("ご視聴ありがとうございました" etc.).
     #[arg(long, env = "VAD_DENOISE")]
     denoise: Option<bool>,
 
-    /// Override `detector.min_utterance_rms_dbfs`. SpeechEnded
-    /// events whose buffered audio has RMS below this dBFS value
-    /// are dropped before reaching the sink. 0 (or any non-
-    /// negative value) disables the gate. Recommended starting
+    /// Override `detector.min_utterance_rms_dbfs`: drop SpeechEnded whose
+    /// audio RMS is below this dBFS (>= 0 disables). Recommended starting
     /// point for hallucination-suppression: -45.
     #[arg(long, env = "VAD_MIN_UTTERANCE_RMS_DBFS")]
     min_utterance_rms_dbfs: Option<f32>,

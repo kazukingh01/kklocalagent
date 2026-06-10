@@ -19,19 +19,13 @@ pub async fn ws_mic(
     Query(params): Query<HashMap<String, String>>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    // `?ts=1` opts the client into an 8-byte little-endian u64 header
-    // (epoch ns of the frame's *last* sample) prepended to each PCM
-    // frame. Default behavior is unchanged so existing consumers (VAD,
-    // openwakeword shim, tests) keep working without modification.
+    // `?ts=1` prepends an 8-byte LE u64 (epoch ns of the frame's *last*
+    // sample) to each PCM frame.
     let with_ts = matches!(params.get("ts").map(String::as_str), Some("1"));
     ws.on_upgrade(move |socket| handle_mic(socket, state, with_ts))
 }
 
 async fn handle_mic(mut socket: WebSocket, state: AppState, with_ts: bool) {
-    // AEC (issue #20) is a single switch: when `aec.enabled`, `/mic` serves
-    // the echo-cancelled stream; otherwise the raw mic. No per-connection
-    // opt-in — every consumer (VAD, wwd) transparently gets whichever the
-    // host config selected, so enabling AEC needs no client/compose change.
     let aec = state.config.aec.enabled;
     let mut rx = if aec {
         state.mic_aec_tx.subscribe()
@@ -78,8 +72,6 @@ pub async fn ws_spk(
     Query(params): Query<HashMap<String, String>>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    // `?track=N` picks one of the parallel playback streams (default 0).
-    // 0 keeps the existing TTS-streamer client working unmodified.
     let track_id: usize = params
         .get("track")
         .and_then(|s| s.parse().ok())
@@ -89,12 +81,6 @@ pub async fn ws_spk(
 
 async fn handle_spk(mut socket: WebSocket, state: AppState, track_id: usize) {
     info!(track_id, "spk ws: client connected");
-    // Tracks whether this WS actually pushed any PCM. cpal is always
-    // running (consuming silence when no producer), so a drift report
-    // for a zero-PCM session would still log a number — but it would
-    // be measuring host scheduling jitter against the device crystal,
-    // not anything related to /spk. Suppress that case so the log
-    // line is unambiguously "this session's PCM throughput vs hw clock".
     let mut pcm_frames_received: u64 = 0;
     let (spk_tx, close) = {
         let guard = state.spk_tracks.lock().await;
@@ -117,11 +103,8 @@ async fn handle_spk(mut socket: WebSocket, state: AppState, track_id: usize) {
         }
     };
 
-    // Hardware-vs-system clock drift snapshot. We baseline cpal's
-    // hardware-clock-paced counters at connect and diff at disconnect;
-    // the wall-clock duration of the session is the system-clock
-    // reference. The drift is per-track (each cpal stream has its own
-    // hardware-clock-paced sample counter).
+    // Hardware-vs-system clock drift: baseline cpal's hardware-clock-paced
+    // counters at connect, diff at disconnect against wall-clock elapsed.
     let drift_baseline = {
         let guard = state.handles.lock().await;
         guard.playback.get(track_id).map(|h| {
@@ -137,10 +120,8 @@ async fn handle_spk(mut socket: WebSocket, state: AppState, track_id: usize) {
         })
     };
 
-    // Break the recv loop on either a client message or a /spk/stop close
-    // signal for this track. The `Notified` future is created once and pinned
-    // so it stays registered across iterations (no lost wakeup); `biased`
-    // checks the close first so a stop is acted on promptly.
+    // The `Notified` future is created once and pinned so it stays registered
+    // across select iterations (no lost wakeup); `biased` checks close first.
     let close_notified = close.notified();
     tokio::pin!(close_notified);
     loop {
@@ -175,10 +156,9 @@ async fn handle_spk(mut socket: WebSocket, state: AppState, track_id: usize) {
                     break;
                 }
                 let frame = Bytes::from(data);
-                // NB: the AEC far-end reference is NOT teed here. It is tapped
-                // where cpal actually consumes the audio (playback output
-                // callback), so the reference is aligned to the speaker output
-                // rather than leading it by the whole playback-ring residency.
+                // NB: the AEC far-end reference is NOT teed here but in the
+                // playback output callback, so it aligns with the speaker
+                // output instead of leading it by the playback-ring residency.
                 if spk_tx.send(PlaybackMessage::Frame(frame)).await.is_err() {
                     warn!("spk ws: playback task gone; closing");
                     break;
@@ -186,19 +166,10 @@ async fn handle_spk(mut socket: WebSocket, state: AppState, track_id: usize) {
                 pcm_frames_received = pcm_frames_received.saturating_add(1);
             }
             Ok(Message::Text(text)) => {
-                // EOS/drain handshake. Client sends `{"type":"eos"}`
-                // after the last PCM frame; we forward an Eos marker
-                // through the producer task, wait for it to confirm
-                // the cpal ring is empty, then echo
-                // `{"type":"drained"}` back so the client knows the
-                // speaker has *actually* finished. Lets the
-                // orchestrator stop guessing the audio-tail with a
-                // tail_quiet_ms timeout and trust the WS handshake
-                // as the precise boundary instead.
-                //
-                // Unknown types are logged + ignored — keeps the
-                // protocol forward-compatible if we add other control
-                // messages later (e.g. mid-stream priority hints).
+                // EOS/drain handshake: client sends `{"type":"eos"}` after the
+                // last PCM frame; we reply `{"type":"drained"}` once the cpal
+                // ring is confirmed empty, so the speaker has *actually*
+                // finished. Unknown types are ignored for forward compat.
                 let parsed: Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
                     Err(e) => {
@@ -222,12 +193,9 @@ async fn handle_spk(mut socket: WebSocket, state: AppState, track_id: usize) {
                     warn!("spk ws: playback task gone before drain handshake; closing");
                     break;
                 }
-                // The producer task fires drain_done either when the
-                // ring is empty (normal path) or when /spk/stop's
-                // flush yanked everything (cancellation). RecvError
-                // on the oneshot means the producer task itself
-                // exited — treat it the same as a successful drain
-                // so the client doesn't hang on the WS forever.
+                // drain_done fires when the ring empties or /spk/stop flushed
+                // it; a oneshot RecvError (producer task exited) is treated as
+                // drained so the client doesn't hang forever.
                 let _ = drain_done_rx.await;
                 let payload = json!({"type": "drained"}).to_string();
                 if socket.send(Message::Text(payload)).await.is_err() {
@@ -245,10 +213,8 @@ async fn handle_spk(mut socket: WebSocket, state: AppState, track_id: usize) {
     }
     if let Some((start, cb0, samples0, native_rate, native_channels, stats)) = drift_baseline {
         if pcm_frames_received == 0 {
-            // No /spk traffic this session → skip the drift line. cpal's
-            // sample counter advances on silence too (the consumer task
-            // pushes zeros when the producer is idle), and reporting that
-            // as "drift_ms" is meaningless for /spk diagnosis.
+            // Skip the drift line: cpal's sample counter advances on silence
+            // too, so "drift" for a zero-PCM session is meaningless.
         } else {
             let elapsed_ms = start.elapsed().as_millis() as u64;
             let (cb1, samples1) = stats.snapshot();

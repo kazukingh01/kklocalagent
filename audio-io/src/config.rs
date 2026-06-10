@@ -40,45 +40,28 @@ pub struct RuntimeConfig {
     pub autostart: bool,
     pub playback_buffer_ms: u32,
     pub mic_broadcast_frames: u32,
-    /// Number of parallel playback tracks. Each track owns its own cpal
-    /// output stream, ring buffer, producer task, and `FlushSignals`,
-    /// and is identified externally by integer id `0..playback_tracks`.
-    /// WASAPI shared mode (the Windows default) mixes the per-stream
-    /// outputs at the OS layer, so independent senders never interfere.
-    /// `/spk` (no query) defaults to track 0 for backwards compatibility
-    /// with the existing TTS-streamer client; new callers (e.g. an agent
-    /// playing pre-rendered audio files) pass `?track=1`, and the agent's
-    /// timer alarm fires on `?track=2`. The default of 3 covers all three;
-    /// a value below the highest track any client requests makes audio-io
-    /// close that `?track=N` WS immediately (the alarm just won't sound).
+    /// Number of parallel playback tracks (each its own cpal output stream;
+    /// WASAPI shared mode mixes them at the OS layer). A value below the
+    /// highest `?track=N` a client requests makes audio-io close that WS
+    /// immediately, silently dropping that channel.
     pub playback_tracks: u32,
 }
 
-/// Acoustic echo cancellation. Runs *inside* audio-io because near-end
-/// (mic capture) and far-end (the mixed `/spk` track PCM) live in the same
-/// process on the same clock — so the echo-cancelled mic can be served via
-/// `/mic` to every consumer (VAD, wake-word-detection) from a single
-/// computation. Disabled by default; when off, no mixer/AEC task is spawned
-/// and `/mic` serves the raw capture (byte-identical to pre-#20). When on,
-/// `/mic` transparently serves the echo-cancelled stream — no client change.
+/// Acoustic echo cancellation (issue #20). Runs inside audio-io because
+/// near-end and far-end live in the same process on the same clock; when off,
+/// `/mic` serves the raw capture byte-identically to pre-#20.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct AecConfig {
     pub enabled: bool,
-    /// Adaptive-filter backend:
-    /// * `"nlms"` — the built-in pure-Rust normalized-LMS canceller. No native
-    ///   dependency, cross-compiles cleanly to the mingw Windows target, and is
-    ///   always available (the default).
-    /// * `"speex"` — Speex DSP (MDF echo canceller + preprocessor) via the
-    ///   `aec-rs` crate. Only present when built with `--features speex`;
-    ///   selecting it in a binary built without that feature is a clear startup
-    ///   error rather than a config-load failure.
+    /// `"nlms"` (built-in, always available) or `"speex"` (aec-rs, only when
+    /// built with `--features speex`; selecting it otherwise is a startup
+    /// error, not a config-load failure).
     pub backend: String,
-    /// Adaptive filter length in milliseconds — the reverb *tail* the filter
-    /// models. It no longer has to cover the bulk speaker→mic delay: that is
-    /// measured automatically and removed by a pre-delay, so a compact filter
-    /// works for any delay. Longer captures more reverberant rooms at higher
-    /// CPU/convergence cost; ~100–150 ms suits typical rooms.
+    /// Filter length = the reverb *tail* modeled, not the bulk speaker→mic
+    /// delay (that is measured and removed by a pre-delay). Longer captures
+    /// more reverberant rooms at higher CPU/convergence cost; ~100–150 ms
+    /// suits typical rooms.
     pub filter_length_ms: u32,
 }
 
@@ -128,11 +111,8 @@ impl Default for RuntimeConfig {
             autostart: true,
             playback_buffer_ms: 200,
             mic_broadcast_frames: 64,
-            // 3 = the stack's three logical playback channels: TTS (track 0),
-            // play_audio_file (track 1) and the timer alarm (track 2). The
-            // timer feature streams its beep to track 2, so a default of 2
-            // would silently drop every alarm (audio-io closes the ?track=2 WS
-            // immediately). Bump in lock-step if more channels are added.
+            // 3 = TTS (track 0), play_audio_file (track 1), timer alarm
+            // (track 2); a default of 2 would silently drop every alarm.
             playback_tracks: 3,
         }
     }
@@ -186,9 +166,8 @@ impl Config {
             anyhow::bail!("runtime.playback_tracks must be >= 1");
         }
         if self.aec.enabled {
-            // "speex" is accepted here regardless of build features; if the
-            // binary wasn't built with `--features speex`, start_services emits
-            // a clear runtime error rather than failing config load.
+            // "speex" passes validation even without --features speex;
+            // start_services emits the clear error instead.
             if !matches!(self.aec.backend.as_str(), "nlms" | "speex") {
                 anyhow::bail!(
                     "aec.backend '{}' is not supported (use 'nlms' or 'speex')",

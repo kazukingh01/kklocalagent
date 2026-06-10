@@ -1,10 +1,5 @@
-# Test harness for the orchestrator. Hosts mock backends (ASR / LLM
-# / TTS / sink) on :9100..:9400 and runs scenario test cases that
-# POST events at the orchestrator under test.
-#
-# Long-lived (entrypoint = sleep infinity) so test.sh can `docker
-# exec` the actual test runner with a different `--flavor` per
-# orchestrator config without re-pulling the image each time.
+# Long-lived (CMD = sleep infinity) so test.sh can `docker exec` the
+# test runner once per orchestrator config flavor.
 
 FROM python:3.11-slim-bookworm
 WORKDIR /app

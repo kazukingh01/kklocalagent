@@ -29,9 +29,8 @@ fn resample_chunk_for(rate: u32) -> usize {
     (rate as usize).div_ceil(100).max(160)
 }
 
-/// Converts native-format interleaved mic samples into s16le mono frames
-/// at a fixed target sample rate. Accumulates inputs and emits zero or more
-/// complete frames per push.
+/// Native-format interleaved mic samples → s16le mono frames at a fixed
+/// target rate; emits zero or more complete frames per push.
 pub struct CaptureFramer {
     native_channels: usize,
     target_samples_per_frame: usize,
@@ -64,10 +63,6 @@ impl CaptureFramer {
         })
     }
 
-    /// Accept native device samples of any cpal sample type and emit 16 kHz
-    /// mono s16le frames. `T` is converted to normalized f32 via cpal, then
-    /// downmixed and resampled. One generic entry point replaces the former
-    /// per-format `push_i16` / `push_u16` methods.
     pub fn push<T>(&mut self, data: &[T]) -> Vec<Vec<u8>>
     where
         T: Sample,
@@ -77,8 +72,6 @@ impl CaptureFramer {
         self.emit()
     }
 
-    /// Convenience for the already-f32 paths (the playback reference tap and the
-    /// tests). Equivalent to [`push::<f32>`](Self::push).
     pub fn push_f32(&mut self, data: &[f32]) -> Vec<Vec<u8>> {
         self.push(data)
     }
@@ -116,9 +109,8 @@ impl CaptureFramer {
     }
 }
 
-/// Converts incoming s16le mono bytes at `source_rate` into interleaved f32
-/// samples at the native output rate × channel count. Output is what the
-/// cpal callback will stream to the device.
+/// s16le mono bytes at `source_rate` → interleaved f32 at the native output
+/// rate × channel count.
 pub struct PlaybackFramer {
     native_channels: usize,
     resampler: Option<SincFixedIn<f32>>,
@@ -144,9 +136,8 @@ impl PlaybackFramer {
         })
     }
 
-    /// Drop any buffered samples. Call on barge-in so residual audio already
-    /// consumed from the wire but not yet pushed into the ring does not leak
-    /// after the flush flag has been cleared.
+    /// Call on barge-in: residual audio already consumed from the wire but not
+    /// yet pushed into the ring must not leak after the flush flag clears.
     pub fn flush(&mut self) {
         self.mono_buf.clear();
         self.resampled_buf.clear();
@@ -155,12 +146,8 @@ impl PlaybackFramer {
         }
     }
 
-    /// Accept s16le bytes and return interleaved native-format f32 samples.
-    /// Callers must pass even-length byte slices; odd-length input is rejected
-    /// upstream to avoid silent stream desync.
-    ///
-    /// The returned samples are mono duplicated across all native channels,
-    /// which is the usual 2-channel case. On 5.1+ output this means every
+    /// Odd-length input is rejected upstream to avoid silent stream desync.
+    /// Mono is duplicated across all native channels, so on 5.1+ output every
     /// surround channel plays at full level — audible but not broken.
     pub fn push_s16le(&mut self, bytes: &[u8]) -> Vec<f32> {
         for pair in bytes.chunks_exact(2) {
@@ -196,7 +183,6 @@ mod tests {
     #[test]
     fn capture_passthrough_when_rates_match() {
         let mut f = CaptureFramer::new(16000, 1, 16000, 320).unwrap();
-        // Push 640 mono f32 samples → expect 2 frames of 640 bytes each.
         let input: Vec<f32> = (0..640).map(|i| (i as f32 / 640.0) - 0.5).collect();
         let frames = f.push_f32(&input);
         assert_eq!(frames.len(), 2);
@@ -207,7 +193,6 @@ mod tests {
     #[test]
     fn capture_downmixes_stereo() {
         let mut f = CaptureFramer::new(16000, 2, 16000, 320).unwrap();
-        // 320 stereo pairs = 640 f32 → 320 mono samples → 1 frame.
         let input: Vec<f32> = vec![0.25; 640];
         let frames = f.push_f32(&input);
         assert_eq!(frames.len(), 1);
@@ -217,10 +202,9 @@ mod tests {
     #[test]
     fn capture_resamples_48k_to_16k() {
         let mut f = CaptureFramer::new(48000, 1, 16000, 320).unwrap();
-        // Feed ~1 second of silence — should produce many frames.
         let input = vec![0.0f32; 48000];
         let frames = f.push_f32(&input);
-        // Expect ~50 frames of 640 bytes; allow a little slack for resampler warmup.
+        // ~50 frames expected; slack allows for resampler warmup.
         assert!(frames.len() >= 45, "got {} frames", frames.len());
         for fr in &frames {
             assert_eq!(fr.len(), 640);
@@ -230,7 +214,6 @@ mod tests {
     #[test]
     fn playback_passthrough_when_rates_match() {
         let mut p = PlaybackFramer::new(16000, 16000, 2).unwrap();
-        // 320 samples of s16le = 640 bytes → 320 * 2 = 640 f32 (stereo interleaved).
         let bytes = vec![0u8; 640];
         let out = p.push_s16le(&bytes);
         assert_eq!(out.len(), 640);
@@ -239,16 +222,15 @@ mod tests {
     #[test]
     fn playback_resamples_16k_to_48k() {
         let mut p = PlaybackFramer::new(16000, 48000, 1).unwrap();
-        let bytes = vec![0u8; 16000 * 2]; // 1 second
+        let bytes = vec![0u8; 16000 * 2];
         let out = p.push_s16le(&bytes);
         assert!(out.len() >= 44000, "got {} samples", out.len());
     }
 
     #[test]
     fn playback_flush_clears_residual() {
-        // Partial chunk sized so resampler can't emit yet — bytes sit in mono_buf.
         let mut p = PlaybackFramer::new(16000, 48000, 1).unwrap();
-        let partial = vec![0x10u8; 32]; // 16 samples, well under the resample chunk
+        let partial = vec![0x10u8; 32]; // well under the resample chunk, so it sits in mono_buf
         let out = p.push_s16le(&partial);
         assert!(
             out.len() < 100,
@@ -256,8 +238,6 @@ mod tests {
             out.len()
         );
         p.flush();
-        // After flush, feeding a full second should behave like a fresh framer —
-        // no pre-flush residue should bleed into the first callback's output.
         let bytes = vec![0u8; 16000 * 2];
         let out_after = p.push_s16le(&bytes);
         assert!(out_after.len() >= 44000, "got {} samples", out_after.len());
@@ -265,8 +245,6 @@ mod tests {
 
     #[test]
     fn capture_accumulates_across_non_boundary_pushes() {
-        // Feeding in uneven chunks must produce the same total frame count
-        // as feeding one big buffer: residual samples carry across pushes.
         let mut f = CaptureFramer::new(48000, 1, 16000, 320).unwrap();
         let total: Vec<f32> = vec![0.0; 48000];
         let mut frames_total = 0;

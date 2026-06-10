@@ -14,9 +14,7 @@ use crate::config::{Config, DiagConfig, SinkMode};
 use crate::detector::{Event, SpeechFsm};
 use wav_utils::wav_from_pcm_s16le_mono;
 
-/// Accumulates RMS energy and speech_ratio over a window of frames and logs
-/// a summary line each time the window fills. Enabled only in debug mode so
-/// normal operation is quiet.
+/// Accumulates RMS + speech_ratio over a frame window and logs a summary.
 struct Diag {
     enabled: bool,
     window_frames: u32,
@@ -42,8 +40,8 @@ impl Diag {
         if !self.enabled {
             return;
         }
-        // Mean square of this frame — summing squares of i16 into u64 is safe
-        // for any reasonable frame length (320 * 32768^2 ≈ 3.4e11 ≪ u64 max).
+        // Summing squares of i16 into u64 can't overflow for any reasonable
+        // frame length (320 * 32768^2 ≈ 3.4e11 ≪ u64 max).
         let sumsq: u64 = samples
             .iter()
             .map(|s| {
@@ -60,10 +58,8 @@ impl Diag {
             let mean_sq = self.sum_of_frame_mean_sq as f64 / self.frames as f64;
             let rms = mean_sq.sqrt() as u32;
             let ratio = self.voiced as f32 / self.frames as f32;
-            // Debug-level: a per-second summary line is too chatty
-            // for production INFO. Operators investigating false
-            // triggers can re-enable it via
-            // `RUST_LOG=info,vad::diag=debug`.
+            // Debug-level: too chatty for production INFO. Re-enable via
+            // `RUST_LOG=info,vad::diag=debug` when investigating false triggers.
             debug!(
                 target: "vad::diag",
                 "[diag] rms={rms} speech_ratio={ratio:.2} ({}/{} voiced)",
@@ -80,17 +76,15 @@ impl Diag {
 pub async fn run(config: Config) -> Result<()> {
     let cfg = Arc::new(config);
     let http = Arc::new(
-        // Per-request timeouts (asr_timeout_ms / orchestrator_timeout_ms)
-        // are applied at each POST builder so the two stages have
-        // independent budgets.
+        // No global timeout: asr_timeout_ms / orchestrator_timeout_ms are
+        // applied per-POST so the two stages have independent budgets.
         reqwest::Client::builder()
             .build()
             .context("build reqwest client")?,
     );
-    // Bounds the number of in-flight asr-direct POSTs. Excess utterances
-    // are dropped with a warning rather than queued so backpressure is
-    // visible in logs instead of presenting as silent timeouts. Survives
-    // WS reconnects so we don't lose backpressure state on a flap.
+    // Bound in-flight POSTs; excess utterances are dropped with a warning so
+    // backpressure is visible instead of presenting as silent timeouts.
+    // Created outside the reconnect loop so a WS flap doesn't reset state.
     let asr_inflight = Arc::new(Semaphore::new(cfg.sink.asr_max_inflight as usize));
     let orchestrator_inflight =
         Arc::new(Semaphore::new(cfg.sink.orchestrator_max_inflight as usize));
@@ -147,10 +141,8 @@ async fn connect_and_run(
 
     let bytes_per_frame = cfg.detector.bytes_per_frame();
     let samples_per_frame = cfg.detector.samples_per_frame();
-    // Optional denoiser. Built once and held across frames so the
-    // RNNoise state and rubato FFT plans amortise across the whole
-    // session. None when `detector.denoise = false` — the audio
-    // path stays byte-identical to the previous build in that case.
+    // Built once per session so RNNoise state and rubato FFT plans amortise;
+    // None keeps the audio path byte-identical to the pre-denoise build.
     let mut denoiser = if cfg.detector.denoise {
         if cfg.detector.sample_rate != 16_000 {
             anyhow::bail!(
@@ -199,12 +191,9 @@ async fn connect_and_run(
                     .chunks_exact(2)
                     .map(|p| i16::from_le_bytes([p[0], p[1]])),
             );
-            // RNNoise pre-stage. Mutates `samples` in place; we then
-            // re-encode the cleaned PCM back into `frame` so the
-            // utterance buffer that goes to ASR (via fsm.push_frame
-            // → fsm.utterance_buffer()) carries the denoised audio
-            // too — Whisper sees a less ambiguous signal, fewer
-            // hallucinations on near-silence.
+            // Re-encode the denoised samples back into `frame` so the
+            // utterance buffer sent to ASR carries the cleaned audio too —
+            // fewer Whisper hallucinations on near-silence.
             if let Some(d) = denoiser.as_mut() {
                 d.process(&mut samples).context("denoise frame")?;
                 for (i, s) in samples.iter().enumerate() {
@@ -218,15 +207,10 @@ async fn connect_and_run(
                 .map_err(|_| anyhow!("vad classify: frame length mismatch"))?;
             diag.record(&samples, is_speech);
             if let Some(event) = fsm.push_frame(&frame, is_speech) {
-                // RMS-energy gate on SpeechEnded: drop utterances
-                // whose buffered audio is below `min_utterance_rms_dbfs`
-                // (negative dBFS, threshold disabled when >= 0). The
-                // typical hallucination trigger is "VAD spuriously
-                // armed on near-silence + sent the empty buffer to
-                // ASR + Whisper filled the void with `(拍手)` /
-                // `ご視聴ありがとうございました`". Gating below e.g.
-                // -45 dBFS catches that without rejecting legitimate
-                // quiet speech (real voice is typically -10..-25).
+                // RMS gate on SpeechEnded (disabled when threshold >= 0):
+                // drops near-silent utterances from a spuriously armed VAD
+                // that Whisper would otherwise fill with `(拍手)` /
+                // `ご視聴ありがとうございました`.
                 if cfg.detector.min_utterance_rms_dbfs < 0.0 {
                     if let Event::SpeechEnded { .. } = &event {
                         let buf = fsm.utterance_buffer();
@@ -265,11 +249,8 @@ async fn connect_and_run(
     Ok(())
 }
 
-/// Compute RMS dBFS of a little-endian s16 PCM buffer. 0 dBFS =
-/// full-scale i16; real voice is typically -10..-25, room ambient
-/// is -50..-60. Returns `f32::NEG_INFINITY` on empty input or true
-/// digital silence. ~1 µs per 320-sample (20 ms) frame so calling
-/// it once per SpeechEnded is free.
+/// RMS dBFS of an s16le PCM buffer (0 dBFS = full-scale i16). Returns
+/// `f32::NEG_INFINITY` on empty input or digital silence.
 fn rms_dbfs_i16le(buf: &[u8]) -> f32 {
     let n = buf.len() / 2;
     if n == 0 {
@@ -349,16 +330,13 @@ fn handle_event(
 
     match mode {
         SinkMode::DryRun => {
-            // Dry-run sink: pretend to POST to the orchestrator and just log.
             info!(target: "vad::sink", "[orchestrator-stub <-] {json}");
         }
         SinkMode::Orchestrator => {
             info!(target: "vad::sink", "[orchestrator <-] {} bytes",
                   json.len());
-            // try_acquire_owned drops events when orchestrator_max_inflight
-            // POSTs are already in flight — same backpressure pattern as
-            // asr-direct, scoped to a separate semaphore so a slow ASR
-            // doesn't starve VAD-event delivery.
+            // Separate semaphore from asr-direct so a slow ASR doesn't
+            // starve VAD-event delivery; drop instead of queue when full.
             let permit = match orchestrator_inflight.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
@@ -384,10 +362,6 @@ fn handle_event(
         SinkMode::AsrDirect => {
             info!(target: "vad::sink", "[event] {json}");
             if let Event::SpeechEnded { .. } = event {
-                // try_acquire_owned returns Err iff every permit is held —
-                // i.e. asr_max_inflight POSTs are already in flight. Drop
-                // this utterance with a warning rather than queuing so the
-                // operator sees backpressure instead of silent timeouts.
                 let permit = match asr_inflight.clone().try_acquire_owned() {
                     Ok(p) => p,
                     Err(_) => {
@@ -525,10 +499,7 @@ mod tests {
 
     #[test]
     fn rms_dbfs_full_scale_sine_is_near_minus_three() {
-        // A sine that swings to ±i16::MAX has RMS = peak / sqrt(2),
-        // which in dBFS is -3.01. 320 samples at 16 kHz = 20 ms; one
-        // 440 Hz cycle is ~36 samples so the buffer averages cleanly
-        // to the analytical RMS.
+        // Full-scale sine RMS = peak / sqrt(2) = -3.01 dBFS.
         let mut buf = Vec::with_capacity(320 * 2);
         for i in 0..320 {
             let s = ((i as f32 * 440.0 * 2.0 * std::f32::consts::PI / 16_000.0).sin()
@@ -590,8 +561,4 @@ mod tests {
         let v = parse(&envelope_json(&ev, 16000, Some("AAAA".into())));
         assert_eq!(v["audio_base64"], "AAAA");
     }
-
-    // wav_header_layout — moved to `wav-utils/src/lib.rs::tests` along
-    // with the function it covered. No need for a duplicate assertion
-    // here now that VAD imports the shared crate.
 }

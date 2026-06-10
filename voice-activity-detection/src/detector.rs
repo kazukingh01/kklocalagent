@@ -21,13 +21,9 @@ pub enum Event {
     },
 }
 
-/// Two-state speech segmenter driven by per-frame `is_speech` decisions from a
-/// VAD implementation. The FSM is deliberately decoupled from the VAD itself
-/// so its logic can be unit-tested with plain booleans.
-///
-/// While in `Speaking` state every received frame is appended to an internal
-/// utterance buffer; on `SpeechEnded` that buffer is exposed via
-/// [`SpeechFsm::utterance_buffer`] and reset on the next start.
+/// Two-state speech segmenter driven by per-frame `is_speech` decisions.
+/// While `Speaking`, frames are buffered; on `SpeechEnded` the buffer is
+/// exposed via [`SpeechFsm::utterance_buffer`] and reset on the next start.
 pub struct SpeechFsm {
     state: State,
     voiced_run: u32,
@@ -145,17 +141,14 @@ mod tests {
     #[test]
     fn ends_after_hang_frames_silence() {
         let mut fsm = SpeechFsm::new(2, 3, 1500);
-        // voiced_run=1 — no event yet
         assert!(fsm.push_frame(&frame(), true).is_none());
         // voiced_run=2 → SpeechStarted, utterance_frames=1
         assert!(matches!(
             fsm.push_frame(&frame(), true),
             Some(Event::SpeechStarted { .. })
         ));
-        // Two more voiced frames → frames=3
         fsm.push_frame(&frame(), true);
         fsm.push_frame(&frame(), true);
-        // Two silent frames → silent_run=2, frames=5
         fsm.push_frame(&frame(), false);
         fsm.push_frame(&frame(), false);
         // Third silent frame → silent_run=3 ≥ hang_frames → SpeechEnded
@@ -175,9 +168,7 @@ mod tests {
     #[test]
     fn max_utterance_forces_end() {
         let mut fsm = SpeechFsm::new(1, 100, 5);
-        // SpeechStarted, utterance_frames=1
         fsm.push_frame(&frame(), true);
-        // Feed continuous speech; no natural hang termination can fire.
         let mut ended_at = None;
         for i in 0..10 {
             if let Some(ev) = fsm.push_frame(&frame(), true) {

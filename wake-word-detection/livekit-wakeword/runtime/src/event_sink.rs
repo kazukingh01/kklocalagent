@@ -1,11 +1,6 @@
-//! Detection sink. Two modes (mirroring the openwakeword shim):
-//!   * `orchestrator` — POST `WakeWordDetected` to `WW_ORCHESTRATOR_URL`.
-//!   * `dry-run`      — log the would-be envelope and skip the POST.
-//!
-//! Detection events are best-effort — we log and drop POST failures
-//! rather than retrying. The orchestrator is typically reachable
-//! (compose `service_healthy` chain), and a missed wake event is
-//! recoverable on the next utterance.
+//! Detection sink (orchestrator POST / dry-run log). POSTs are best-effort:
+//! failures are logged and dropped — a missed wake event is recoverable on
+//! the next utterance.
 
 use std::time::Duration;
 
@@ -47,10 +42,9 @@ pub async fn run(cfg: Config, mut rx: mpsc::Receiver<Detection>) -> Result<()> {
                         info!(model = %det.model, "fired event");
                     } else {
                         let body = resp.text().await.unwrap_or_default();
-                        // chars().take() instead of byte slicing — the
-                        // orchestrator can return non-ASCII bodies (日本語
-                        // error messages from upstream FastAPI etc.) and
-                        // a byte index landing mid-codepoint would panic.
+                        // chars().take(), not byte slicing — the orchestrator
+                        // can return non-ASCII bodies and a byte index landing
+                        // mid-codepoint would panic.
                         let trim: String = body.chars().take(200).collect();
                         warn!(%status, body = %trim, "POST /events non-2xx");
                     }

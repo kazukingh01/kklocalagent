@@ -1,20 +1,6 @@
 #!/usr/bin/env python3
-"""Gemma 4 + Ollama の tool-calling サポートを 3 ケースで確認する最小プローブ。
-
-issue #19 (agent 拡充) で LangGraph の `create_react_agent` 路線が成立するかは
-モデルが Ollama の `tools=[...]` を理解して `message.tool_calls` を返せるかに
-依存する。本スクリプトは agent コンテナや langchain を経由せず、Ollama の
-/api/chat を直接叩いて以下を判定する:
-
-  1. 引数なし tool を発火できるか      (`get_current_date`)
-  2. 引数を抽出して tool を発火できるか (`add(a, b)`)
-  3. tool 不要時に発火しないか         ("こんにちは")
-
-実行 (ホスト側):
-    python3 agent/experiments/tool_calling_probe.py
-環境変数で上書き可:
-    OLLAMA_URL=http://localhost:7050  (デフォルト)
-    OLLAMA_MODEL=gemma4:e4b           (デフォルト)
+"""Gemma 4 + Ollama の tool-calling サポートを 3 ケースで確認する最小プローブ
+(issue #19)。agent コンテナや langchain を経由せず Ollama /api/chat を直接叩く。
 """
 
 from __future__ import annotations

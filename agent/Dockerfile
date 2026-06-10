@@ -1,15 +1,9 @@
-# Agent API: ollama-compatible /api/chat backed by LangGraph + SQLite
-# checkpointer. Sits between the orchestrator and ollama so the
-# orchestrator's pipeline.rs::llm_chat_streaming sees a familiar API
-# while conversation memory (and future tool calls / MCP / approval)
-# live here.
+# Agent API: ollama-compatible /api/chat backed by LangGraph.
 FROM python:3.11-slim-bookworm
 
-# curl for the HEALTHCHECK probe. procps (uptime / free / ps) and
-# iproute2 (ip) are required by the run_shell tool's default allowlist
-# (`uptime`, `ip`); without them the LLM's "ネットワーク状況を教えて"
-# turns into a "command not found" loop. coreutils-only commands
-# (date, df, uname, who) are already in python:slim.
+# curl for HEALTHCHECK. procps (uptime) / iproute2 (ip) are required by
+# run_shell's default allowlist — without them the LLM's request turns
+# into a "command not found" loop.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl procps iproute2 \
     && rm -rf /var/lib/apt/lists/*
@@ -20,15 +14,10 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY app.py tools.py sandbox.py /app/
-# Test ハーネスも image に含める。issue #19 step 2 で追加した chat_repl.py を
-# `docker compose exec agent python /app/experiments/chat_repl.py` で叩ける
-# ようにするため。production 実行では import されないので runtime コストは
-# 無し (数 KB の追加レイヤだけ)。
+# テストハーネス (issue #19 step 2) を `docker compose exec` で叩けるように含める。
 COPY experiments /app/experiments
 
-# /data is mounted as a named volume in compose so conversation memory
-# survives `docker compose down && up`. AGENT_DB_PATH defaults to a
-# file inside it; override to relocate (e.g. testing against a tmpfs).
+# /data is a named volume in compose so conversation memory survives down/up.
 ENV AGENT_OLLAMA_URL=http://llm:11434 \
     AGENT_MODEL=gemma4:e4b \
     AGENT_SYSTEM_PROMPT="" \
@@ -38,9 +27,8 @@ ENV AGENT_OLLAMA_URL=http://llm:11434 \
 
 EXPOSE 7080
 
-# /health flips to 200 once the aiohttp server is up; the LangGraph
-# build + SqliteSaver.setup() happen before /health is wired so any
-# 200 response means the agent is fully ready to serve /api/chat.
+# LangGraph build + SqliteSaver.setup() happen before /health is wired,
+# so any 200 means the agent is fully ready to serve /api/chat.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=6 \
     CMD curl -sfS --connect-timeout 2 http://localhost:7080/health || exit 1
 

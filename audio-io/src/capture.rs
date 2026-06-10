@@ -105,14 +105,9 @@ fn run_capture(
         audio.samples_per_frame(),
     )?;
 
-    // Duration of one emitted frame in nanoseconds. Used to back-date
-    // earlier frames when a single cpal callback yields more than one
-    // frame (rare in steady state, possible during catch-up bursts).
     let frame_ns: u64 =
         (audio.samples_per_frame() as u64 * 1_000_000_000) / audio.sample_rate as u64;
 
-    // One generic callback covers every device sample format (cpal converts
-    // T → f32 inside the framer). `framer` is moved into whichever arm runs.
     let stream = match sample_format {
         SampleFormat::F32 => {
             build_input_stream::<f32>(&device, &stream_config, framer, mic_tx.clone(), frame_ns)?
@@ -134,9 +129,6 @@ fn run_capture(
     Ok(())
 }
 
-/// Build a cpal input stream for device sample type `T`. One generic body for
-/// f32/i16/u16: the framer converts `T` → 16 kHz mono internally, replacing
-/// three near-identical per-format callbacks.
 fn build_input_stream<T>(
     device: &cpal::Device,
     config: &StreamConfig,
@@ -159,17 +151,12 @@ where
 }
 
 fn dispatch(frames: Vec<Vec<u8>>, tx: &broadcast::Sender<(u64, Bytes)>, frame_ns: u64) {
-    // Common in steady-state: framer.push_* returns 0 frames when
-    // the cpal callback delivered fewer samples than one emit unit.
-    // Skip the SystemTime call + the empty loop body — also makes the
-    // `(n - 1 - i)` arithmetic below defensively safe (n > 0).
     if frames.is_empty() {
         return;
     }
-    // `now` is captured once after the cpal callback's framer.push_*
-    // returns — i.e. immediately after the *last* emitted frame's tail
-    // sample arrived. Earlier frames in this batch ended `frame_ns`
-    // earlier, so we subtract a per-position offset.
+    // now_ns is the wall clock right after the *last* emitted frame's tail
+    // sample arrived; earlier frames in the batch are back-dated by frame_ns
+    // per position.
     let now_ns = epoch_ns();
     let n = frames.len();
     for (i, frame) in frames.into_iter().enumerate() {

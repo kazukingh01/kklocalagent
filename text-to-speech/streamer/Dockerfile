@@ -1,16 +1,8 @@
-# tts-streamer: HTTP shim that turns a text request from the
-# orchestrator into VOICEVOX synthesis + audio-io playback streaming.
-#
-# Two-stage build: the builder pulls the toolchain + dependencies and
-# emits a single static-ish binary; the runtime stage ships only the
-# binary on top of debian-slim with ca-certificates (rustls roots).
-
 FROM rust:1-slim-bookworm AS builder
 RUN apt-get update \
     && apt-get install -y --no-install-recommends pkg-config build-essential \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-# Two-step copy so editing src/ doesn't bust the (slow) deps build.
 # Cargo.lock is required (not `Cargo.lock*`) so a build that lost the
 # lockfile fails loudly instead of producing a non-reproducible image.
 COPY Cargo.toml Cargo.lock ./
@@ -30,9 +22,8 @@ COPY --from=builder /src/target/release/tts-streamer /usr/local/bin/tts-streamer
 
 EXPOSE 7070
 
-# Liveness only — the dependency chain (VOICEVOX ready, audio-io
-# reachable) varies between production and test, so dependents wait
-# on the more authoritative healthchecks of the engine/stub instead.
+# Liveness only — deliberately does not probe VOICEVOX / audio-io;
+# dependents wait on the engine/stub healthchecks instead.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=6 \
     CMD curl -sfS --connect-timeout 2 http://127.0.0.1:7070/health || exit 1
 

@@ -1,7 +1,6 @@
-//! GET /health on `WW_LISTEN`. Returns 200 + `{"ok":true}` only when
-//! both the model is loaded and the mic WS is currently connected — same
-//! contract the openwakeword shim exposes, so compose's existing
-//! `service_healthy` gate behaves identically across implementations.
+//! GET /health: 200 only when model loaded AND mic WS connected — same
+//! contract as the openwakeword shim, so compose's `service_healthy` gate
+//! behaves identically across implementations.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
