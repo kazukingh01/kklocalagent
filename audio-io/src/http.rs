@@ -43,9 +43,7 @@ fn list_devices() -> anyhow::Result<Devices> {
     let default_in = host.default_input_device().and_then(|d| d.name().ok());
     let default_out = host.default_output_device().and_then(|d| d.name().ok());
 
-    // cpal does not expose stable device IDs, so we match on name. When two
-    // devices share a name (e.g. multiple identical USB mics on Windows) only
-    // the first is flagged as default — there is exactly one default device.
+    // cpal exposes no stable device IDs, so match on name.
     let mut inputs = Vec::new();
     let mut default_in_used = false;
     for dev in host.input_devices()? {
@@ -74,7 +72,6 @@ pub async fn start(State(state): State<AppState>) -> impl IntoResponse {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "status": "started" }))).into_response(),
         Err(e) => {
             error!("start: {e:?}");
-            // Map the typed error to a status by variant (no string matching).
             let status = match &e {
                 AudioError::Busy => StatusCode::CONFLICT,
                 AudioError::DeviceNotFound(_) | AudioError::NoDefaultDevice(_) => {
@@ -102,19 +99,12 @@ pub async fn spk_stop(
     Query(params): Query<HashMap<String, String>>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    // `?track=N` stops just that track; absent = stop all tracks
-    // (treated as a full audio reset — useful as a global barge-in that
-    // takes out any TTS-streamer and any agent-side file playback in
-    // one shot).
     let requested: Option<usize> = params.get("track").and_then(|s| s.parse().ok());
     let tracks = state.spk_tracks.lock().await;
     match requested {
         Some(idx) => match tracks.get(idx) {
             Some(t) => {
                 t.flush.trigger();
-                // Also close this track's active /spk WS so a continuously
-                // streaming client (agent fire-and-forget playback) stops
-                // sending instead of refilling the just-flushed ring.
                 t.close.notify_waiters();
                 info!(track = idx, "spk_stop: flush + ws close signaled");
                 (

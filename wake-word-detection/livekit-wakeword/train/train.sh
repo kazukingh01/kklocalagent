@@ -1,11 +1,4 @@
 #!/usr/bin/env bash
-# Thin wrapper around `livekit-wakeword run`. Exists so the entry
-# point is stable even if the upstream CLI flag set evolves; we
-# re-pin the wrapper, callers don't have to.
-#
-# Runs via `uv run` so the .venv is materialised from uv.lock on
-# demand — no manual `source .venv/bin/activate` step required.
-# GPU recommended; CPU is hours+.
 
 set -euo pipefail
 

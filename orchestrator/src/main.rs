@@ -21,12 +21,8 @@ struct Args {
     #[arg(long, env = "ORCH_ASR_URL")]
     asr_url: Option<String>,
 
-    /// Override `asr.hallucination_blacklist`. Pipe-separated list
-    /// of substrings; if the ASR output contains any of them, the
-    /// turn is dropped (no LLM, no TTS) just like an empty
-    /// transcription. Match is substring + case-sensitive. Pass an
-    /// empty value (`ORCH_ASR_HALLUCINATION_BLACKLIST=`) to disable
-    /// the filter entirely.
+    /// Override `asr.hallucination_blacklist` (pipe-separated substrings;
+    /// empty value disables the filter).
     #[arg(long, env = "ORCH_ASR_HALLUCINATION_BLACKLIST", value_delimiter = '|')]
     asr_hallucination_blacklist: Option<Vec<String>>,
 
@@ -46,11 +42,8 @@ struct Args {
     #[arg(long, env = "ORCH_TTS_URL")]
     tts_url: Option<String>,
 
-    /// Override `tts.append_url`. POSTed for continuation sentences
-    /// within a turn (issue #16 — `/append` reuses the streamer's
-    /// burst budget instead of re-prebuffering 5 s every sentence,
-    /// which used to overflow audio-io's ring). Empty falls back to
-    /// `tts.url` for every sentence.
+    /// Override `tts.append_url`, used for continuation sentences (issue
+    /// #16 — re-bursting via /speak every sentence overflowed audio-io's ring).
     #[arg(long, env = "ORCH_TTS_APPEND_URL")]
     tts_append_url: Option<String>,
 
@@ -58,24 +51,16 @@ struct Args {
     #[arg(long, env = "ORCH_TTS_STOP_URL")]
     tts_stop_url: Option<String>,
 
-    /// Override `tts.finalize_url`. POSTed once per turn after the
-    /// last per-sentence /speak completes; tts-streamer's response
-    /// is the precise speaker-silent moment used to anchor the
-    /// post-TTS VAD quiet window. Empty falls back to a pure
-    /// timeout (less precise; tail_quiet_ms must compensate).
+    /// Override `tts.finalize_url`. Empty falls back to a pure timeout
+    /// (tail_quiet_ms must compensate).
     #[arg(long, env = "ORCH_TTS_FINALIZE_URL")]
     tts_finalize_url: Option<String>,
 
-    /// Override `tts.tail_quiet_ms`. Drop VAD events for this many
-    /// extra milliseconds after each turn's TTS completes — covers
-    /// the audio-io playback-ring tail so the assistant's own voice
-    /// can't fire VAD and dispatch an echo turn. 0 disables.
+    /// Override `tts.tail_quiet_ms` (post-TTS VAD quiet window; 0 disables).
     #[arg(long, env = "ORCH_TTS_TAIL_QUIET_MS")]
     tts_tail_quiet_ms: Option<u64>,
 
-    /// Override `tts.wake_ack_text`. Short phrase spoken via tts-streamer
-    /// /speak the moment a WakeWordDetected is accepted — audible "I heard
-    /// you" feedback. Empty disables it.
+    /// Override `tts.wake_ack_text` (spoken wake ack; empty disables).
     #[arg(long, env = "ORCH_WAKE_ACK_TEXT")]
     wake_ack_text: Option<String>,
 
@@ -83,13 +68,11 @@ struct Args {
     #[arg(long, env = "ORCH_WAKE_REQUIRED")]
     wake_required: Option<bool>,
 
-    /// Override `wake.wake_window_ms` (window for SpeechStarted after
-    /// a WakeWordDetected).
+    /// Override `wake.wake_window_ms`.
     #[arg(long, env = "ORCH_WAKE_WINDOW_MS")]
     wake_window_ms: Option<u64>,
 
-    /// Override `wake.turn_followup_window_ms` (window for the next
-    /// SpeechStarted after a Turn ends).
+    /// Override `wake.turn_followup_window_ms`.
     #[arg(long, env = "ORCH_TURN_FOLLOWUP_WINDOW_MS")]
     turn_followup_window_ms: Option<u64>,
 
@@ -97,10 +80,7 @@ struct Args {
     #[arg(long, env = "ORCH_WAKE_BARGE_IN")]
     wake_barge_in: Option<bool>,
 
-    /// Override `wake.post_wake_se_dropout_ms`. SpeechEnded events
-    /// arriving within this window after a WakeWordDetected are
-    /// dropped (defends against VAD capturing the wake word's own
-    /// audio and re-dispatching it as a turn). 0 disables.
+    /// Override `wake.post_wake_se_dropout_ms` (0 disables).
     #[arg(long, env = "ORCH_POST_WAKE_SE_DROPOUT_MS")]
     post_wake_se_dropout_ms: Option<u64>,
 
@@ -129,10 +109,8 @@ async fn main() -> Result<()> {
         config.asr.url = v;
     }
     if let Some(v) = args.asr_hallucination_blacklist {
-        // Filter out empty strings — `ORCH_ASR_HALLUCINATION_BLACKLIST=`
-        // (deliberately empty to disable) splits to a single empty
-        // entry, which would otherwise match every ASR output via
-        // contains("").
+        // `ORCH_ASR_HALLUCINATION_BLACKLIST=` (deliberately empty) splits to
+        // one empty entry, which would match every ASR output via contains("").
         config.asr.hallucination_blacklist = v.into_iter().filter(|s| !s.is_empty()).collect();
     }
     if let Some(v) = args.llm_url {

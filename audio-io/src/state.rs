@@ -11,53 +11,23 @@ use crate::playback::{PlaybackHandle, PlaybackMessage};
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
-    /// Per-mic-frame broadcast. The `u64` is the wall-clock time of the
-    /// frame's *last* sample as nanoseconds since UNIX epoch, captured at
-    /// `dispatch` (i.e. immediately after the cpal callback finishes
-    /// assembling the frame). Subscribers that don't care about timing
-    /// can ignore the first field; the WS handler exposes it on the wire
-    /// only when the client requests it via `?ts=1`.
+    /// The `u64` is the wall-clock epoch-ns of the frame's *last* sample; on
+    /// the wire only with `?ts=1`.
     pub mic_tx: broadcast::Sender<(u64, Bytes)>,
-    /// Per-playback-track endpoints. Vec index = track id (= `?track=N`
-    /// on the /spk WS). Empty Vec while services are stopped; populated
-    /// at `service::start_services` with `config.runtime.playback_tracks`
-    /// entries, each pointing at an independent cpal output stream that
-    /// the Windows audio engine mixes at the OS layer.
     pub spk_tracks: Arc<Mutex<Vec<PlaybackTrack>>>,
-    /// AEC far-end ingress (issue #20). Each playback track's cpal output
-    /// callback taps its *consumed* PCM here as `(track_id, pcm)` — tapped
-    /// after the playback ring so the reference is on the same wall clock as
-    /// the sound leaving the speaker. The reference mixer task sums the tracks.
-    /// A broadcast with no subscribers (AEC disabled / not started) makes the
-    /// tap a cheap no-op; the playback callback only builds and sends frames
-    /// when AEC is enabled.
     pub ref_in_tx: broadcast::Sender<(usize, Bytes)>,
-    /// Mixed far-end reference (16 kHz mono s16le, gap-free) published by the
-    /// reference mixer task and consumed by the AEC task. The AEC pairs it to
-    /// the mic by count (one far sample per near sample), so no timestamp is
-    /// carried.
     pub ref_tx: broadcast::Sender<Bytes>,
-    /// Echo-cancelled mic, published by the AEC task. When `aec.enabled`,
-    /// the `/mic` WS serves this instead of `mic_tx`; otherwise it has no
-    /// producer and `/mic` serves the raw `mic_tx`.
     pub mic_aec_tx: broadcast::Sender<(u64, Bytes)>,
     pub handles: Arc<Mutex<ServiceHandles>>,
 }
 
-/// One playback track's user-facing handles. The producer task and cpal
-/// thread own clones of these (the sender via the channel, the flush
-/// signal via `Arc::clone`), and so do the `/spk` / `/spk/stop` HTTP
-/// handlers — `spk_tracks` lets them route by track id.
 #[derive(Clone)]
 pub struct PlaybackTrack {
     pub sender: mpsc::Sender<PlaybackMessage>,
     pub flush: Arc<FlushSignals>,
-    /// Notified by `/spk/stop?track=N` to also *close* this track's active
-    /// `/spk` WS, not just flush the ring. Without it, a client streaming
-    /// continuously (e.g. the agent's fire-and-forget file playback) would
-    /// simply refill the ring after a flush and keep playing. `handle_spk`
-    /// selects on this and closes the socket; `notify_waiters()` only wakes
-    /// the currently-connected sender(s), so future connections are unaffected.
+    /// `/spk/stop` must also *close* the track's active `/spk` WS, not just
+    /// flush the ring — a continuously streaming client would otherwise refill
+    /// the ring and keep playing.
     pub close: Arc<tokio::sync::Notify>,
 }
 
@@ -89,11 +59,6 @@ impl Default for FlushSignals {
 #[derive(Default)]
 pub struct ServiceHandles {
     pub capture: Option<CaptureHandle>,
-    /// Vec index = track id. Populated in lockstep with
-    /// `AppState.spk_tracks`; both are emptied on `stop_services`.
     pub playback: Vec<PlaybackHandle>,
-    /// Reference-mixer + AEC tokio tasks (issue #20), present only when
-    /// `aec.enabled`. tokio `JoinHandle`s detach on drop, so `drop_inner`
-    /// aborts these explicitly on stop/restart.
     pub aec_tasks: Vec<tokio::task::JoinHandle<()>>,
 }

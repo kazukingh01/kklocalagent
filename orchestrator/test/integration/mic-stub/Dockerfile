@@ -1,11 +1,3 @@
-# Integration-test variant of the audio-io stub. Built with the repo
-# root as context so we can COPY fixtures from sibling modules
-# (alexa_test.wav from wake-word-detection, jfk.wav from
-# automatic-speech-recognition) without bind mounts.
-#
-#   docker compose build mic-stub
-# is what compose.yaml runs.
-
 FROM python:3.12-slim
 
 RUN apt-get update \
@@ -14,20 +6,15 @@ RUN apt-get update \
 
 RUN pip install --no-cache-dir 'websockets>=12,<14'
 
-# jfk.wav is .gitignored by the asr module's test setup (only fetched
-# on demand by automatic-speech-recognition/test/fetch-sample.sh). Pull
-# it at build time so the integration smoke is self-contained.
+# jfk.wav is .gitignored in the asr module (fetched on demand by its
+# fetch-sample.sh), so it cannot be COPYed; pull it at build time.
 RUN mkdir -p /samples && \
     curl -L --fail \
         -o /samples/jfk.wav \
         https://github.com/ggerganov/whisper.cpp/raw/master/samples/jfk.wav
 
-# alexa_test.wav is committed under wake-word-detection/openwakeword/test/data/.
 COPY wake-word-detection/openwakeword/test/data/alexa_test.wav /samples/alexa.wav
 
-# Reuse the upstream stub.py (which already supports SAMPLE_PATHS for
-# multi-clip playback). One source of truth — the integration smoke
-# benefits from any improvements made for the ASR smoke and vice versa.
 COPY automatic-speech-recognition/test/mic-stub/stub.py /app/stub.py
 
 WORKDIR /app

@@ -1,60 +1,32 @@
-# Wraps the upstream ollama image, baking in a startup-time model
-# pull *and* warm-into-VRAM. Upstream's ENTRYPOINT is `/bin/ollama`;
-# we replace it with init.sh which starts `ollama serve` in the
-# background, waits for the API, pulls ${LLM_MODEL}, fires a no-prompt
-# /api/generate to load the weights into GPU memory, touches a
-# sentinel for the HEALTHCHECK, then waits on the serve PID so
-# container signals propagate.
-#
-# Model cache lives at /root/.ollama — mount a named volume there so
-# the first-boot pull persists across `docker compose down && up`.
-# Pinned to a named release rather than `latest` so the image is
-# reproducible. 0.30.3 is the first stable release that supports the
-# Gemma 4 12B encoder-free multimodal architecture (gemma4:12b); 0.30.4
-# is the current patch (and still bundles the Gemma 4 MTP speculative
-# decoding from the older 0.23.x pin). Bump alongside any newer model
-# that needs updated runtime support. Override at build time with
-# `--build-arg OLLAMA_TAG=…`.
+# 0.30.3 is the first stable release that supports the Gemma 4 12B
+# encoder-free multimodal architecture (gemma4:12b); 0.30.4 still
+# bundles the Gemma 4 MTP speculative decoding from the older 0.23.x
+# pin.
 ARG OLLAMA_TAG=0.30.4
 
 FROM ollama/ollama:${OLLAMA_TAG}
 
-# curl is needed for the HEALTHCHECK probe and for init.sh to poll
-# /api/tags before issuing the pull. python3 + huggingface_hub is
-# only used by the MTP path in init.sh (LLM_MODEL ends in `-mtp`),
-# where the target + drafter safetensors live behind Google's
-# gated Gemma license on HF and need an authenticated download
-# before `ollama create` can ingest them.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl python3 python3-pip \
     && rm -rf /var/lib/apt/lists/* \
     && pip3 install --no-cache-dir --break-system-packages \
         "huggingface_hub[cli]>=0.25,<1.0"
 
-# Standalone default model. Override at runtime via compose
-# `environment:` (production sets it through the LLM_MODEL anchor) — the
-# HEALTHCHECK CMD below is a shell-form command, so ${LLM_MODEL} is
-# expanded in the container at probe time and runtime overrides are
-# honored. gemma4:12b needs Ollama >= 0.30.3 (see OLLAMA_TAG above).
 ENV LLM_MODEL=hf.co/unsloth/gemma-4-12b-it-GGUF:Q4_K_M
 
 COPY init.sh /usr/local/bin/init.sh
 RUN chmod +x /usr/local/bin/init.sh
 
 # Two gates per probe:
-#   1. /tmp/llm-warm sentinel — touched by init.sh after the post-pull
-#      warmup curl finishes (model mmap'd + uploaded to VRAM). Without
-#      this, /api/show would go 200 as soon as `ollama pull` completes
-#      and `depends_on: service_healthy` would race the warmup, leaving
-#      the orchestrator's first /api/chat to pay the cold-load tax.
-#   2. /api/show on the *specific* configured model — verifies the
-#      pull succeeded for the right name (a mismatched LLM_MODEL
-#      between this container and the orchestrator would 404 every
-#      chat).
-#
+#   1. /tmp/llm-warm sentinel — without it, /api/show goes 200 as soon
+#      as `ollama pull` completes and `depends_on: service_healthy`
+#      would race the warmup, leaving the orchestrator's first
+#      /api/chat to pay the cold-load tax.
+#   2. /api/show on the *specific* configured model — a mismatched
+#      LLM_MODEL between this container and the orchestrator would 404
+#      every chat.
 # start_period is generous because cold-pulling gemma4:12b (~9 GB)
-# can take 10+ minutes on a slow link; retries*interval = ~10 min
-# extra grace if the pull stalls.
+# can take 10+ minutes on a slow link.
 HEALTHCHECK --interval=15s --timeout=5s --start-period=12000s --retries=40 \
     CMD test -f /tmp/llm-warm \
         && curl -sfS --connect-timeout 2 -o /dev/null -X POST \

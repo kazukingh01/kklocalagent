@@ -18,18 +18,10 @@ use crate::error::AudioError;
 use crate::framer::{CaptureFramer, PlaybackFramer};
 use crate::state::FlushSignals;
 
-/// One unit of work for the playback producer task.
-///
-/// `Frame` is the existing path: a 20 ms s16le PCM payload to push at
-/// the cpal output ring. `Eos` is the drain-handshake added so the
-/// upstream (tts-streamer over the /spk WS) can know exactly when the
-/// last sample has actually been consumed by the device — instead of
-/// guessing with a tail timeout. The producer task keeps draining the
-/// ring after Eos arrives and then fires `drain_done` so the WS
-/// handler can echo `{"type":"drained"}` back at the client. Frames
-/// queued *after* Eos (e.g. a barge-in starting a new utterance
-/// immediately) are processed normally — Eos is per-message, not a
-/// permanent terminator.
+/// `Eos` is the drain handshake: `drain_done` fires once the cpal ring is
+/// actually empty, so the upstream knows the last sample was consumed instead
+/// of guessing with a tail timeout. Eos is per-message, not a permanent
+/// terminator — frames queued after it are processed normally.
 pub enum PlaybackMessage {
     Frame(Bytes),
     Eos { drain_done: oneshot::Sender<()> },
@@ -66,7 +58,6 @@ impl PlaybackHandle {
 
 impl Drop for PlaybackHandle {
     fn drop(&mut self) {
-        // Cancel producer task first so it stops pushing into the ring buffer.
         if let Some(t) = self.task.take() {
             t.abort();
         }
@@ -80,30 +71,16 @@ impl Drop for PlaybackHandle {
     }
 }
 
-/// Counters incremented by the cpal output callback. The silence-path
-/// counters (`samples`, `callbacks`) feed the periodic underrun logger;
-/// `consumed` and `callbacks_total` track every callback regardless of
-/// underrun and let an external observer (e.g. the /spk WS handler)
-/// measure hardware-vs-system clock drift over a session window.
 pub struct UnderrunStats {
-    /// Total number of zero-sample emissions across all callbacks.
     samples: AtomicU64,
-    /// Number of callbacks that hit the silence path at least once.
     callbacks: AtomicU64,
-    /// Set true by the producer task on every Frame received from the
-    /// /spk WS. The logger task swap-clears this each tick and only
-    /// emits a warn when the flag was true — i.e., when a sender was
-    /// actively pushing audio in the just-elapsed window. Suppresses
-    /// the steady stream of "ring empty" warns that would otherwise
-    /// fire continuously while no client is connected (cpal keeps
-    /// running and pulling 0.0 silence from the empty ring).
+    /// Set by the producer on every Frame; the logger swap-clears it each tick
+    /// and warns only when a sender was actively pushing. Without this gate,
+    /// cpal pulling silence from the empty ring while no client is connected
+    /// would warn continuously.
     audio_seen: AtomicBool,
-    /// Total interleaved samples consumed by the cpal output callback,
-    /// including silence-fallback samples. Driven by the hardware audio
-    /// clock; comparing against system-clock elapsed time exposes
-    /// drift between the DAC and the OS wall clock.
+    /// Total samples consumed (incl. silence fallback), hardware-clock paced.
     consumed: AtomicU64,
-    /// Total cpal output callbacks invoked (hardware-clock paced).
     callbacks_total: AtomicU64,
 }
 
@@ -118,9 +95,6 @@ impl UnderrunStats {
         }
     }
 
-    /// Returns `(callbacks_total, consumed_samples)` snapshot. Both grow
-    /// monotonically from playback start; subtract two snapshots to get
-    /// session-scoped deltas.
     pub fn snapshot(&self) -> (u64, u64) {
         (
             self.callbacks_total.load(Ordering::Relaxed),
@@ -149,8 +123,6 @@ pub fn start_playback(
     let flush_cb = flush.clone();
     let stats = Arc::new(UnderrunStats::new());
     let stats_cb = stats.clone();
-    // The producer task (below) keeps `audio`; the cpal thread gets its own
-    // clone for the consumption-side reference tap.
     let audio_cb = audio.clone();
 
     let thread = std::thread::Builder::new()
@@ -188,9 +160,8 @@ pub fn start_playback(
     let native_rate = ready.native_rate;
     let native_channels = ready.native_channels;
 
-    // 32 frames ≈ 640 ms at 20 ms/frame — a small multiple of the
-    // playback ring so backpressure hits the WebSocket well before a
-    // multi-second backlog can accumulate (important for barge-in).
+    // 32 frames ≈ 640 ms at 20 ms/frame: backpressure hits the WebSocket well
+    // before a multi-second backlog can accumulate (important for barge-in).
     let (spk_tx, spk_rx) = mpsc::channel::<PlaybackMessage>(32);
     let task = tokio::spawn(playback_producer_task(
         spk_rx,
@@ -202,15 +173,8 @@ pub fn start_playback(
         stats.clone(),
     ));
 
-    // Periodic underrun reporter. Polls the atomics every 500 ms and
-    // emits a warn line whenever the sample count grew. Lives on the
-    // tokio runtime alongside the producer task so it gets aborted
-    // automatically when PlaybackHandle is dropped (= /stop or process
-    // exit), and does not slow down the cpal audio thread (which only
-    // pays a single fetch_add per affected callback). Sized at 500 ms
-    // so an operator's stack-trace mental model of "TTS spoke ~5 s
-    // ago, did the ring underrun?" can be answered against ~10 log
-    // lines worth of detail rather than a blow-by-blow.
+    // Periodic underrun reporter: polling atomics here keeps the cpal audio
+    // thread down to a single fetch_add per affected callback.
     let stats_log = stats.clone();
     let logger_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(500));
@@ -219,10 +183,6 @@ pub fn start_playback(
         let mut last_callbacks: u64 = 0;
         loop {
             interval.tick().await;
-            // Swap-clear the activity flag: only emit a warn when a
-            // sender actually pushed audio in the just-elapsed 500 ms.
-            // Without this gate, cpal's normal "ring empty" behavior
-            // during idle (no /spk client) fires the warn continuously.
             let active = stats_log.audio_seen.swap(false, Ordering::Relaxed);
             let s = stats_log.samples.load(Ordering::Relaxed);
             let c = stats_log.callbacks.load(Ordering::Relaxed);
@@ -237,9 +197,8 @@ pub fn start_playback(
                     "playback underrun: cpal got 0.0 fallback (ring drained — sender too slow OR audio-io behind)"
                 );
             }
-            // Always advance the high-water marks so that an idle
-            // window doesn't make the next active window's delta
-            // include the silently-skipped idle underruns.
+            // Always advance the marks so an idle window's skipped underruns
+            // don't leak into the next active window's delta.
             last_samples = s;
             last_callbacks = c;
         }
@@ -272,20 +231,12 @@ fn find_output_device(name: &str) -> Result<cpal::Device> {
     Err(AudioError::DeviceNotFound(name.into()).into())
 }
 
-/// Emit the playback tap's downsampled reference frames to the AEC mixer.
-/// `frames` are 16 kHz mono s16le (one AEC frame each). The AEC pairs far to
-/// near by count, so no play timestamp is carried. Send failures (AEC mixer
-/// not running) are ignored.
 fn emit_ref(tx: &broadcast::Sender<(usize, Bytes)>, track_id: usize, frames: Vec<Vec<u8>>) {
     for frame in frames {
         let _ = tx.send((track_id, Bytes::from(frame)));
     }
 }
 
-/// Build the consumption-side reference resampler (native rate/channels →
-/// 16 kHz mono) — but only when AEC is enabled (`ref_tap` present). When
-/// disabled this is `None` and the output callback skips the tap entirely, so
-/// playback is byte-for-byte identical to the no-AEC path.
 fn build_ref_framer(
     ref_tap: &Option<broadcast::Sender<(usize, Bytes)>>,
     native_rate: u32,
@@ -304,19 +255,17 @@ fn build_ref_framer(
     }
 }
 
-/// Convert a normalized-f32 playback sample to the device sample type `T` using
-/// the *exact* scaling each format used before the callback was made generic,
-/// so the bytes handed to the device stay bit-for-bit identical to the
-/// pre-refactor per-format callbacks. (cpal's `FromSample` would differ subtly —
-/// ×32768 + rounding vs the historical ×32767 + truncation, and it would clamp
-/// the f32 path that previously passed through unclamped.)
+/// Keeps the *exact* historical per-format scaling so device bytes stay
+/// bit-for-bit identical. cpal's `FromSample` would differ subtly: ×32768 +
+/// rounding vs the historical ×32767 + truncation, and it clamps the f32 path
+/// that previously passed through unclamped.
 trait PlaybackSample: SizedSample + Send + 'static {
     fn from_playback_f32(v: f32) -> Self;
 }
 impl PlaybackSample for f32 {
     #[inline]
     fn from_playback_f32(v: f32) -> f32 {
-        v // historical f32 path wrote the ring sample straight through (no clamp)
+        v
     }
 }
 impl PlaybackSample for i16 {
@@ -333,11 +282,6 @@ impl PlaybackSample for u16 {
     }
 }
 
-/// Build a cpal output stream for device sample type `T`. One generic body for
-/// f32/i16/u16: pop f32 from the playback ring, convert to `T` with the exact
-/// per-format scaling ([`PlaybackSample`]), and — when AEC is on — tap the
-/// pre-conversion f32 as the far-end reference. This replaces three
-/// near-identical per-format callbacks while keeping their byte output.
 #[allow(clippy::too_many_arguments)]
 fn build_output_stream<T>(
     device: &cpal::Device,
@@ -353,7 +297,8 @@ where
     T: PlaybackSample,
 {
     let err_fn = |e| error!("cpal output stream error: {e}");
-    // Reused across callbacks (grows once): the f32 samples for the AEC tap.
+    // Reused across callbacks (grows once) — no per-callback allocation on the
+    // audio thread.
     let mut tap_scratch: Vec<f32> = Vec::new();
     let stream = device.build_output_stream(
         config,
@@ -442,14 +387,6 @@ fn run_playback(
         }))
         .map_err(|_| anyhow!("failed to signal playback ready"))?;
 
-    // Far-end reference tap (issue #20). When AEC is enabled, the output
-    // callback converts the native-rate, native-channel PCM the device consumes
-    // down to the AEC's 16 kHz mono and hands it to `emit_ref`. The AEC pairs
-    // far to near by count, so no play timestamp is attached.
-
-    // One generic callback covers every device sample format. `consumer`/`flush`
-    // are moved into whichever arm runs; the others are dead branches, so moving
-    // the same value in each arm is fine.
     let stream = match sample_format {
         SampleFormat::F32 => build_output_stream::<f32>(
             &device,
@@ -508,40 +445,27 @@ async fn playback_producer_task(
         }
     };
     let ring_capacity = producer.capacity().get();
-    // Idle silence keep-alive threshold. When no Frame messages are
-    // arriving, top up the ring with 0.0 samples so the OS-level
-    // audio pipeline (WASAPI prefetch / ALSA period buffer) stays warm
-    // — without this, the first sentence of the second-and-later turns
-    // was head-clipped because the pipeline had gone cold during the
-    // inter-turn idle period. 50ms is enough margin to absorb the
-    // ~10ms cpal callback jitter without delaying real audio (the
-    // top-up only fires while ring_depth < threshold; real audio
-    // pushes the depth far above this).
+    // Idle silence keep-alive: top up the ring with 0.0 so the OS audio
+    // pipeline (WASAPI prefetch / ALSA period buffer) stays warm — without it,
+    // the first sentence of second-and-later turns was head-clipped after the
+    // pipeline went cold during inter-turn idle. 50 ms absorbs the ~10 ms cpal
+    // callback jitter without delaying real audio.
     let keep_alive_threshold = (native_rate as usize) * (native_channels as usize) * 50 / 1000;
     let mut total_dropped: u64 = 0;
     let mut drops_since_log: u32 = 0;
     loop {
         tokio::select! {
-            // Frame / Eos / shutdown gets strictly preferred over the
-            // idle keep-alive: if a Frame is ready, we'd rather push
-            // real audio than synthetic silence. `biased` means tokio
-            // polls the `recv` arm first every iteration before even
-            // looking at the keep-alive sleep.
+            // `biased`: real audio strictly preferred over the keep-alive's silence.
             biased;
             recv = spk_rx.recv() => {
                 let Some(msg) = recv else { break; };
                 if flush.producer.swap(false, Ordering::Relaxed) {
-                    // Cancellation (barge-in) — drain everything queued
-                    // and reset the framer. Any in-flight Eos requests
-                    // get their drain_done fired immediately because
-                    // the cancel itself is the "no more audio is
-                    // coming" signal that the upstream is waiting for.
-                    //
-                    // Diagnostic: count the discarded audio. When this
-                    // fires at the *start* of a new utterance (a turn-start
-                    // /spk/stop racing the new burst), the drained frames
-                    // ARE the clipped head — `approx_ms` is roughly how much
-                    // got cut. Enable with `RUST_LOG=audio_io::playback=debug`.
+                    // Barge-in: drain everything queued. In-flight Eos requests
+                    // get drain_done fired immediately — the cancel itself is
+                    // the "no more audio is coming" signal upstream waits for.
+                    // When this fires at the start of a new utterance (a
+                    // turn-start /spk/stop racing the new burst), the drained
+                    // frames ARE the clipped head; approx_ms is how much.
                     let mut drained_frames: u32 = 0;
                     let mut drained_bytes: usize = 0;
                     if let PlaybackMessage::Frame(ref b) = msg {
@@ -576,10 +500,6 @@ async fn playback_producer_task(
                 }
                 match msg {
                     PlaybackMessage::Frame(bytes) => {
-                        // Mark this tick as "audio flowing" so the
-                        // underrun logger emits warns gated on actual
-                        // sender activity instead of spamming while
-                        // idle.
                         stats.audio_seen.store(true, Ordering::Relaxed);
                         let samples = framer.push_s16le(&bytes);
                         let mut overflow = false;
@@ -597,22 +517,12 @@ async fn playback_producer_task(
                         if dropped_this_batch > 0 {
                             total_dropped =
                                 total_dropped.saturating_add(dropped_this_batch as u64);
-                            // Per-batch debug line so an operator
-                            // running with `RUST_LOG=audio_io::playback=debug`
-                            // (or just =debug) can confirm whether
-                            // their WS sender is overpacing the cpal
-                            // consumer — even a single dropped sample
-                            // shows up here, which the rate-limited
-                            // warn below hides until 50 batches have
-                            // piled up.
                             debug!(
                                 dropped_this_batch,
                                 total_dropped,
                                 "playback ring full; dropping samples (WS arriving faster than cpal consumes)"
                             );
                             drops_since_log += 1;
-                            // Rate-limit: roughly once per ~1s at
-                            // 20ms/frame.
                             if drops_since_log >= 50 {
                                 warn!(
                                     total_dropped,
@@ -623,20 +533,12 @@ async fn playback_producer_task(
                         }
                     }
                     PlaybackMessage::Eos { drain_done } => {
-                        // Wait for the cpal output thread to consume
-                        // every real sample we've pushed. The Eos arm
-                        // runs inside the select; once tokio picks
-                        // this branch it polls *only* this future
-                        // until it returns Poll::Ready — the inner
-                        // `sleep(5ms).await` is a yield point within
-                        // the same future, not a re-entry into the
-                        // select, so the idle keep-alive arm is NOT
-                        // polled and cannot race silence top-ups into
-                        // the ring we're trying to drain to empty.
-                        //
-                        // A flush mid-wait is treated as "drained now"
-                        // — the cancel path drained the ring on our
-                        // behalf.
+                        // Once tokio picks this select branch it polls *only*
+                        // this future until Ready — the inner sleep is a yield
+                        // within the same future, not a re-entry into the
+                        // select, so the idle keep-alive arm cannot race
+                        // silence top-ups into the ring being drained. A flush
+                        // mid-wait counts as drained.
                         let drain_start = Instant::now();
                         while producer.vacant_len() < ring_capacity {
                             if flush.producer.load(Ordering::Relaxed) {
@@ -647,26 +549,14 @@ async fn playback_producer_task(
                         let drain_ms = drain_start.elapsed().as_millis();
                         info!(drain_ms, "playback ring drained, signaling client");
                         let _ = drain_done.send(());
-                        // Note: on the next loop iteration the
-                        // keep-alive arm will see an empty ring and
-                        // refill up to keep_alive_threshold (50 ms of
-                        // silence). The drain handshake has already
-                        // fired so the upstream is unblocked; that 50
-                        // ms tail is harmless filler. The subsequent
-                        // /speak path POSTs /spk/stop, which sets the
-                        // flush flag and erases this filler before the
-                        // next real Frame is pushed — so no head-clip
-                        // risk for the next turn.
+                        // The keep-alive will refill ~50 ms of silence next
+                        // iteration; harmless filler — the next turn's
+                        // /spk/stop flush erases it before real audio, so no
+                        // head-clip risk.
                     }
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                // Idle keep-alive: when the ring drops below
-                // keep_alive_threshold (50 ms), top it up to that
-                // threshold with 0.0 silence. Keeps the OS audio
-                // pipeline pre-fetched so the next real audio doesn't
-                // pay a wake-up latency on the speaker. Cheap no-op
-                // while real audio is flowing (ring depth >> 50 ms).
                 let depth = ring_capacity - producer.vacant_len();
                 if depth < keep_alive_threshold {
                     let need = keep_alive_threshold - depth;

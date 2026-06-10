@@ -1,21 +1,3 @@
-"""Smoke test probe.
-
-Runs three roles in one process:
-
-* Mock ASR at POST :9100/inference — accepts multipart (file +
-  response_format + temperature), returns {"text": "こんにちは"}.
-* Mock LLM at POST :9200/api/chat — accepts ollama-shaped JSON, returns
-  {"model": ..., "message": {"role": "assistant", "content": "OK, 了解しました。"}, "done": true}.
-* Test driver — waits for orchestrator /health to be 200, then POSTs a
-  synthesized SpeechEnded envelope to orchestrator:7000/events with a
-  short PCM s16le mono payload, then waits until both mocks have been
-  hit.
-
-Exits 0 if both mocks were hit within PROBE_TIMEOUT_SEC and the LLM
-received the exact text the ASR returned. Exits 1 on timeout or
-mismatch.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -41,22 +23,15 @@ log = logging.getLogger("probe")
 
 asr_hit = asyncio.Event()
 llm_hit = asyncio.Event()
-# What text the mock LLM saw — we assert it matches the ASR's canned
-# response, proving the orchestrator plumbed ASR→LLM in the right order
-# rather than just firing both in parallel.
 llm_seen_text: list[str] = []
 
 
 async def asr_handler(request: web.Request) -> web.Response:
-    # whisper.cpp server speaks multipart; we don't need to parse the
-    # file bytes — just confirm the call shape and record the hit.
     reader = await request.multipart()
     saw_file = False
     saw_response_format = False
     async for part in reader:
         if part.name == "file":
-            # Drain the part; size isn't asserted (orchestrator wraps
-            # raw PCM in a 44-byte WAV header, so minimum is 44).
             buf = await part.read()
             if len(buf) >= 44 and buf[:4] == b"RIFF":
                 saw_file = True
@@ -119,9 +94,6 @@ async def wait_for_health(session: aiohttp.ClientSession, url: str, deadline: fl
 
 
 def build_speech_ended_envelope() -> dict:
-    # 100 ms of silence at 16kHz s16le mono — enough for the orchestrator
-    # to wrap in WAV and POST. The mock ASR doesn't actually transcribe
-    # it, so the contents don't matter.
     pcm = b"\x00" * (16000 * 2 // 10)
     return {
         "name": "SpeechEnded",
@@ -135,7 +107,6 @@ def build_speech_ended_envelope() -> dict:
 
 
 async def main() -> int:
-    # Boot mock backends before orchestrator tries to reach them.
     asr_runner = await start_mock_server(
         ASR_PORT, [("POST", "/inference", asr_handler)]
     )
@@ -162,7 +133,6 @@ async def main() -> int:
                 log.error("FAIL: /events returned %s: %s", r.status, body[:200])
                 return 1
 
-        # Wait for the pipeline to propagate through both backends.
         try:
             await asyncio.wait_for(
                 asyncio.gather(asr_hit.wait(), llm_hit.wait()),

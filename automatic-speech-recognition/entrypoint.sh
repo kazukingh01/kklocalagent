@@ -1,7 +1,4 @@
 #!/bin/sh
-# Wrapper around the upstream whisper.cpp server image. Resolves the
-# model file from $WHISPER_MODEL and invokes the server binary on
-# 0.0.0.0:8080. Extra args are forwarded to whisper-server.
 
 set -e
 
@@ -13,8 +10,6 @@ if [ ! -f "$MODEL_PATH" ]; then
     exit 1
 fi
 
-# Locate the server binary. Upstream's image bundles all binaries under
-# /app/build/bin; PATH lookups are a fallback for layout changes.
 if [ -x /app/build/bin/whisper-server ]; then
     SERVER=/app/build/bin/whisper-server
 else

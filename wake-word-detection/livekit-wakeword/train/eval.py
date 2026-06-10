@@ -1,26 +1,11 @@
-"""Evaluation harness for a trained wake-word ONNX.
+"""Eval harness for a trained wake-word ONNX (recall / FPPH per threshold).
 
-Walks a directory of recordings, runs each through the same shape the
-Rust runtime uses (16 kHz mono i16, 2 s window, 80 ms hop), and reports
-recall / FPPH / score distribution at a sweep of thresholds.
+Quality gate per design doc issue #12 / M4: a wake word is adopted only if
+recall >= 0.85 and FPPH <= 1.0 against the operator's own voice.
 
-This is the quality gate before publishing a model. Per the design doc
-(issue #12, milestone M4), a Japanese wake word is only adopted if it
-clears recall >= 0.85 and FPPH <= 1.0 against the operator's own voice.
-For English the bar is the same, but it's typically met easily because
-the upstream embedding model is English-trained.
-
-Recording layout
-----------------
-Each WAV file is named ``<label>_<NN>.wav``:
-
-* ``positive_01.wav`` ... ``positive_30.wav`` — operator saying the
-  target phrase, room-natural, distance and prosody varied.
-* ``negative_01.wav`` ... — silence / TV / typing / unrelated speech;
-  used to estimate FPPH (false positives per hour). Concatenate ~20
-  minutes of negatives for stable numbers.
-
-WAVs must be 16 kHz mono s16le. Convert with sox if needed:
+Recordings are ``<label>_<NN>.wav`` with label ``positive`` (operator saying
+the phrase) or ``negative`` (silence/TV/typing; ~20 min for stable FPPH).
+WAVs must be 16 kHz mono s16le:
     sox in.wav -r 16000 -c 1 -b 16 -e signed-integer out.wav
 """
 
@@ -52,8 +37,6 @@ def load_pcm(path: Path) -> np.ndarray:
 
 
 def stride_windows(pcm: np.ndarray) -> Iterable[np.ndarray]:
-    """Yield 2 s windows hopping every 80 ms — the same shape the
-    Rust detector feeds to predict()."""
     win = WINDOW_MS * SAMPLE_RATE // 1000
     hop = HOP_MS * SAMPLE_RATE // 1000
     if len(pcm) < win:
@@ -63,15 +46,9 @@ def stride_windows(pcm: np.ndarray) -> Iterable[np.ndarray]:
 
 
 def max_score(session: ort.InferenceSession, pcm: np.ndarray) -> float:
-    """Run all 80-ms-strided 2 s windows through the ONNX classifier
-    and return the peak score across the recording.
-
-    NOTE: this currently passes raw i16 PCM to the ONNX. The actual
-    livekit-wakeword runtime feeds the bundled mel + embedding pipeline
-    *before* the classifier. For a faithful eval we would either
-    replicate that pipeline in Python or call into the Rust runtime
-    binary; this stub uses raw PCM as a placeholder until M3 lands the
-    pipeline replication or a CLI surface on the runtime."""
+    """NOTE: pre-M3 stub — passes raw i16 PCM to the classifier, skipping the
+    mel + embedding pipeline the runtime applies, so scores are NOT
+    comparable to the runtime's until M3 lands pipeline replication."""
     peak = 0.0
     inp_name = session.get_inputs()[0].name
     for window in stride_windows(pcm):
@@ -126,11 +103,9 @@ def main() -> int:
     for wav in sorted(args.recordings.glob("*.wav")):
         pcm = load_pcm(wav)
         peak = max_score(session, pcm)
-        # Strict label match: anything that isn't exactly "positive" or
-        # "negative" is rejected so a typo (e.g. "postive_03.wav") fails
-        # loud rather than silently being counted as a negative — the
-        # original startswith("pos") check would have skewed FPPH by
-        # treating mislabelled positives as negatives.
+        # Strict label match so a typo fails loud — the original
+        # startswith("pos") check skewed FPPH by counting mislabelled
+        # positives as negatives.
         label = wav.stem.split("_", 1)[0].lower()
         if label not in {"positive", "negative"}:
             print(

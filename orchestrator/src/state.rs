@@ -1,4 +1,4 @@
-//! Wake-gated state machine for the v1.0 pipeline.
+//! Wake-gated state machine.
 //!
 //! ```text
 //!   ┌──────────── (window expires) ───────────┐
@@ -23,39 +23,11 @@
 //!                                          ArmedAfterWake, not Turn)
 //! ```
 //!
-//! "Wake (restart from Listening)" is the case where the operator
-//! says the wake word *while still mid-utterance* (or wake-word
-//! detection mis-fires on their voice). State resets to
-//! ArmedAfterWake so the next SpeechStarted starts a fresh turn.
-//! The VAD's already-buffered audio is discarded by
-//! `post_wake_se_dropout` when its SE eventually arrives within the
-//! dropout window — see `try_dispatch`. Intentional behaviour:
-//! treats the second wake as "scratch that, start over".
-//!
-//! Two distinct windows replace v0.1's single `arm_window_ms`:
-//!   - `wake_window_ms`           — after a wake, how long to wait
-//!                                  for SpeechEnded (default 5 s)
-//!   - `turn_followup_window_ms`  — after a turn ends, how long to
-//!                                  wait for the next SpeechEnded
-//!                                  (default 10 s)
-//!
-//! SpeechStarted is a *phase-only* trigger: ArmedAfter* → Listening,
-//! but the underlying `armed_until` keeps ticking. The timer is only
-//! reset by `complete()` (i.e. an ASR-completed turn) — never by a
-//! bare SS. This stops noise-driven SSs from parking state in
-//! Listening forever when their corresponding SE is filtered upstream
-//! by VAD's RMS gate. SpeechEnded carries the audio for dispatch —
-//! when SE arrives in `Listening` *within the inherited window* we
-//! transition to `Processing` and run the pipeline; out-of-window SE
-//! returns `ListeningWindowExpired` and falls to Idle. SE arriving
-//! directly in an `ArmedAfter*` state without a preceding SS is
-//! accepted leniently (real VAD always sends SS first; this fallback
-//! covers the harness tests that synthesise events without an SS
-//! step).
-//!
-//! Always-listening mode (`required = false`) bypasses the gate
-//! entirely: every SpeechEnded triggers a pipeline run regardless of
-//! state. Barge-in is a strict-only concept.
+//! SpeechStarted is a *phase-only* trigger: ArmedAfter* → Listening, but
+//! `armed_until` keeps ticking and is only reset by `complete()` — never
+//! by a bare SS. This stops noise-driven SSs from parking state in
+//! Listening forever when their SE is filtered upstream by VAD's RMS gate.
+//! Always-listening mode (`required = false`) bypasses the gate entirely.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -65,48 +37,23 @@ use crate::config::WakeConfig;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Idle,
-    /// Wake just received; waiting for SpeechStarted within wake_window.
     ArmedAfterWake,
-    /// A turn just finished; waiting for the next SpeechStarted within
-    /// turn_followup_window. Lets the operator continue a conversation
-    /// without re-saying the wake word.
     ArmedAfterTurn,
-    /// SpeechStarted received; waiting for SpeechEnded. The armed_until
-    /// timer from the *preceding* ArmedAfter* phase keeps ticking — SS
-    /// is just a phase change, not a timer cancel. If SE doesn't arrive
-    /// within the original window, dispatch returns ListeningWindowExpired
-    /// and state falls to Idle. This guards against the failure mode where
-    /// noise-induced SS transitions stash state in Listening forever while
-    /// the corresponding SE is silently dropped by VAD's RMS gate.
     Listening,
-    /// Pipeline (ASR/LLM/TTS) running.
     Processing,
 }
 
 struct Inner {
     phase: Phase,
-    /// Expiry time for the *current* armed window
-    /// (ArmedAfterWake → wake_window, ArmedAfterTurn → turn_followup_window).
-    /// `None` outside Armed* phases.
     armed_until: Option<Instant>,
-    /// Set when a wake event arrives during Processing with
-    /// `barge_in=false` — at the next `complete()`, the state goes to
-    /// `ArmedAfterWake` (5 s) instead of `ArmedAfterTurn` (10 s),
-    /// honouring the wake the operator pressed mid-reply.
     pending_wake_after_turn: bool,
-    /// Monotonic id of the *current* turn — bumped on every transition
-    /// into `Processing`. ProcessingGuard records the id at creation;
-    /// `complete()` no-ops if the id has moved on, so a turn that was
-    /// aborted by barge-in (and whose JoinHandle::abort() runs Drop on
-    /// its guard) can't accidentally roll back the next turn's state
-    /// from Processing → ArmedAfterTurn.
+    /// Monotonic turn id, bumped on every transition into `Processing`.
+    /// `complete()` no-ops on a stale id so a barge-in-aborted turn's
+    /// guard Drop can't roll back the next turn's state.
     turn_generation: u64,
-    /// Wall-clock instant of the most recent WakeWordDetected.
-    /// `try_dispatch()` consults this to drop SE events that arrive
-    /// within `post_wake_se_dropout` — those are VAD reporting the
-    /// silence after the wake word itself rather than a real command.
-    /// Cleared on a successful dispatch so a future SE that legitimately
-    /// arrives long after the wake (e.g. follow-up via ArmedAfterTurn)
+    /// Instant of the most recent WakeWordDetected; `try_dispatch()` drops
+    /// SEs within `post_wake_se_dropout` of it (VAD echoing the wake word
+    /// itself). Cleared on successful dispatch so a legit follow-up SE
     /// isn't gated by a stale timestamp.
     last_wake_at: Option<Instant>,
 }
@@ -116,82 +63,44 @@ pub struct WakeMachine {
     wake_window: Duration,
     turn_followup_window: Duration,
     barge_in: bool,
-    /// `Some` when post-wake SE dropout is active. `None` (set when
-    /// the configured value is 0) disables the check entirely so the
-    /// dispatch path stays straight-through.
     post_wake_se_dropout: Option<Duration>,
     inner: Mutex<Inner>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakeResult {
-    /// Always-listening (`required=false`); no state change.
     Bypass,
-    /// State transitioned (or refreshed) to ArmedAfterWake.
     Armed,
-    /// Wake during Processing with barge_in=true: TTS should be
-    /// cancelled and state has flipped to ArmedAfterWake.
     BargeIn,
-    /// Wake during Processing with barge_in=false: phase stayed
-    /// Processing, but `complete()` will transition to
-    /// ArmedAfterWake (not ArmedAfterTurn) when this turn finishes.
     ArmedBusy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpeechStartedOutcome {
-    /// Always-listening; no state change. SS is informational.
     Bypass,
-    /// Transitioned to Listening; the timer for the previous Armed
-    /// state has been cancelled.
     Listening,
-    /// Phase was Idle; SS dropped (VAD fired without a wake).
     DroppedIdle,
-    /// Phase was Listening already (duplicate SS or VAD glitch).
     DroppedAlreadyListening,
-    /// Phase was Processing; SS dropped (turn in flight).
     DroppedInTurn,
-    /// Phase was ArmedAfterWake but the window had already expired
-    /// by the time SS arrived. State reset to Idle.
     WakeWindowExpired,
-    /// Phase was ArmedAfterTurn but the follow-up window had already
-    /// expired by the time SS arrived. State reset to Idle.
     TurnWindowExpired,
 }
 
 pub enum DispatchOutcome {
-    /// Pipeline should run; caller holds the guard for the turn's life.
     Run(ProcessingGuard),
-    /// State was Idle; SE dropped (no wake, no recent turn).
     NotArmed,
-    /// State was Processing; SE dropped (a previous turn is in flight).
     InTurn,
-    /// State was ArmedAfterWake but the window had expired; SE dropped.
     WakeWindowExpired,
-    /// State was ArmedAfterTurn but the follow-up window had expired;
-    /// SE dropped.
     TurnWindowExpired,
-    /// State was Listening but the armed_until timer (inherited from
-    /// the preceding ArmedAfter* phase) had expired before SE arrived.
-    /// State reset to Idle. Triggers when noise drove an SS but the
-    /// real SE never landed within the original 5 s / 10 s window.
+    /// Listening's inherited armed_until expired before SE arrived (noise
+    /// drove an SS but the real SE never landed). State reset to Idle.
     ListeningWindowExpired,
-    /// SE arrived within `post_wake_se_dropout` of the most recent
-    /// WakeWordDetected — almost certainly VAD echoing the wake word's
-    /// own audio rather than a real command. State is left armed (the
-    /// original wake_window keeps ticking) so the operator's actual
-    /// follow-up utterance still dispatches.
+    /// SE arrived within `post_wake_se_dropout` of the most recent wake —
+    /// almost certainly VAD echoing the wake word's own audio. State is
+    /// left armed so the operator's actual utterance still dispatches.
     DroppedTooSoonAfterWake,
 }
 
-/// Drop-on-completion guard. When dropped, transitions Processing
-/// to one of {ArmedAfterTurn, ArmedAfterWake} so the operator can
-/// follow up without (or with) a fresh wake. Never observed
-/// directly by callers — moved into the spawned pipeline task.
-///
-/// Guards carry the `turn_generation` they were minted under so a
-/// dropped-after-abort guard can detect that a *different* turn now
-/// owns the Processing phase and refuses to mutate state.
 pub struct ProcessingGuard {
     machine: Arc<WakeMachine>,
     generation: u64,
@@ -226,18 +135,15 @@ impl WakeMachine {
         self.barge_in
     }
 
-    /// React to a WakeWordDetected event. Returns `WakeResult` so the
-    /// caller can fire any side-effects (sink forward, tts /stop).
     pub fn on_wake(&self) -> WakeResult {
         if !self.required {
             return WakeResult::Bypass;
         }
         let mut g = self.inner.lock().expect("wake state poisoned");
         let now = Instant::now();
-        // Always stamp last_wake_at, even mid-Processing under
-        // barge_in=false where the phase doesn't move. The dropout
-        // check in try_dispatch keys off this regardless of phase, so
-        // a wake-word echo SE arriving 300 ms later is still gated.
+        // Stamp last_wake_at even mid-Processing under barge_in=false —
+        // the dropout check keys off this regardless of phase, so a
+        // wake-word echo SE arriving 300 ms later is still gated.
         g.last_wake_at = Some(now);
         let until = now + self.wake_window;
         match g.phase {
@@ -248,25 +154,14 @@ impl WakeMachine {
                     g.pending_wake_after_turn = false;
                     WakeResult::BargeIn
                 } else {
-                    // Don't disturb the running pipeline — but ensure
-                    // the *next* state is ArmedAfterWake so the
-                    // operator's wake isn't lost.
                     g.pending_wake_after_turn = true;
                     WakeResult::ArmedBusy
                 }
             }
-            // From any other state, transition to / refresh
-            // ArmedAfterWake. ArmedAfterTurn → ArmedAfterWake matches
-            // the v1.0 spec ("Wake during follow-up window resets
-            // back to a fresh wake state"). Refresh from
-            // ArmedAfterWake same idea. Listening → ArmedAfterWake
-            // means "user said the wake word mid-utterance — treat it
-            // as scratch-that-start-over". The VAD's in-progress
-            // buffer is not cleared by us (we don't own it), but its
-            // eventual SE lands inside `post_wake_se_dropout` and
-            // gets dropped; the operator's fresh utterance after the
-            // restart dispatches normally. See the state diagram at
-            // the top of this file.
+            // Any other state → ArmedAfterWake. Listening → ArmedAfterWake
+            // is "wake word said mid-utterance — scratch that, start over":
+            // we can't clear VAD's in-progress buffer, but its eventual SE
+            // lands inside `post_wake_se_dropout` and gets dropped.
             _ => {
                 g.phase = Phase::ArmedAfterWake;
                 g.armed_until = Some(until);
@@ -276,10 +171,6 @@ impl WakeMachine {
         }
     }
 
-    /// React to a SpeechStarted event. SS is the *cancel* trigger for
-    /// the armed timer — once it arrives, no further timeout applies
-    /// to the in-progress utterance (VAD's max_utterance_frames is
-    /// the upper bound on Listening duration).
     pub fn on_speech_started(&self) -> SpeechStartedOutcome {
         if !self.required {
             return SpeechStartedOutcome::Bypass;
@@ -289,10 +180,8 @@ impl WakeMachine {
         match g.phase {
             Phase::ArmedAfterWake => match g.armed_until {
                 Some(t) if t > now => {
-                    // Preserve armed_until — only ASR-completed turns
-                    // refresh the timer (via complete()). SS is just a
-                    // phase change so noise-driven SSs can't park state
-                    // in Listening past the original window.
+                    // Preserve armed_until — noise-driven SSs must not
+                    // park state in Listening past the original window.
                     g.phase = Phase::Listening;
                     SpeechStartedOutcome::Listening
                 }
@@ -319,18 +208,8 @@ impl WakeMachine {
         }
     }
 
-    /// React to a SpeechEnded event with utterance audio. Returns
-    /// `DispatchOutcome::Run(guard)` if the pipeline should run.
-    /// Lenient: an SE arriving directly in an `ArmedAfter*` state
-    /// (without a preceding SS) is accepted as long as the timer
-    /// hasn't expired — covers test paths that synthesise events
-    /// without a SpeechStarted step. Real VAD always sends SS first.
     pub fn try_dispatch(self: &Arc<Self>) -> DispatchOutcome {
         if !self.required {
-            // Loose mode never bumps generation — there's no Processing
-            // phase to guard against, so the id stays at its initial 0
-            // and complete() is a no-op anyway (early-return on
-            // !self.required). The guard still records 0 for symmetry.
             return DispatchOutcome::Run(ProcessingGuard {
                 machine: self.clone(),
                 generation: 0,
@@ -338,16 +217,6 @@ impl WakeMachine {
         }
         let mut g = self.inner.lock().expect("wake state poisoned");
         let now = Instant::now();
-        // Wake-word echo dropout. VAD captures the wake word's own
-        // audio and fires SE for it ~300 ms later (silence hangover
-        // between "Hey Jarvis" and the operator's actual command, or
-        // the wake word standing alone). Without this, the orchestrator
-        // dispatches a turn whose ASR text *is* the wake word ("Jervis")
-        // and the LLM treats that as a real query. Real continuous
-        // commands push SE well past the dropout (>1 s) so they're
-        // unaffected. Phase is left untouched — the original
-        // wake_window keeps ticking and a follow-up SE within it still
-        // dispatches normally.
         if let Some(dropout) = self.post_wake_se_dropout {
             if let Some(t) = g.last_wake_at {
                 if now.saturating_duration_since(t) < dropout {
@@ -355,16 +224,10 @@ impl WakeMachine {
                 }
             }
         }
-        // Mint a fresh generation on every Processing transition. Any
-        // guard from a previously-aborted turn carries a stale id and
-        // will no-op when its Drop fires after we've already moved on.
         let mint_guard = |g: &mut Inner| {
             g.phase = Phase::Processing;
             g.armed_until = None;
             g.turn_generation = g.turn_generation.wrapping_add(1);
-            // Clear the wake stamp on a successful dispatch so a later
-            // SE in ArmedAfterTurn (legit follow-up) isn't gated by an
-            // ancient wake.
             g.last_wake_at = None;
             ProcessingGuard {
                 machine: self.clone(),
@@ -373,20 +236,12 @@ impl WakeMachine {
         };
         match g.phase {
             Phase::Listening => match g.armed_until {
-                // Window still open: dispatch normally. Inherited from
-                // the preceding ArmedAfter* phase via on_speech_started.
                 Some(t) if t > now => DispatchOutcome::Run(mint_guard(&mut g)),
-                // Window expired while waiting for SE. Drops the
-                // noise-driven-SS-stuck-in-Listening case to Idle so the
-                // operator must re-wake.
                 Some(_) => {
                     g.phase = Phase::Idle;
                     g.armed_until = None;
                     DispatchOutcome::ListeningWindowExpired
                 }
-                // No timer ever set (shouldn't happen in normal flow,
-                // but on_wake/complete always populate armed_until).
-                // Be lenient: dispatch.
                 None => DispatchOutcome::Run(mint_guard(&mut g)),
             },
             Phase::ArmedAfterWake => match g.armed_until {
@@ -410,16 +265,6 @@ impl WakeMachine {
         }
     }
 
-    /// Called from ProcessingGuard::drop. Transitions Processing →
-    /// ArmedAfterTurn (or ArmedAfterWake if a barge_in=false wake
-    /// landed mid-turn). If barge-in already promoted state to
-    /// ArmedAfterWake, complete() is a no-op (the wake's window
-    /// owns the state now).
-    ///
-    /// `gen` is the guard's recorded generation. If barge-in aborted
-    /// the previous turn and a *new* turn has already advanced to
-    /// Processing, `gen` will be stale and we skip — otherwise the
-    /// aborted turn's late drop would clobber the live one's phase.
     fn complete(&self, gen: u64) {
         if !self.required {
             return;
@@ -442,9 +287,6 @@ impl WakeMachine {
         }
     }
 
-    /// Whether the pipeline should continue sending HTTP to
-    /// downstream stages. False after a barge-in flipped state to
-    /// ArmedAfterWake mid-turn. Loose mode always returns true.
     pub fn pipeline_still_active(&self) -> bool {
         if !self.required {
             return true;
@@ -453,9 +295,6 @@ impl WakeMachine {
         g.phase == Phase::Processing
     }
 
-    /// Whether a turn is currently being processed. Used by event
-    /// handlers to log "ignored — turn in progress" with accurate
-    /// reason. Loose mode always returns false.
     pub fn is_in_turn(&self) -> bool {
         if !self.required {
             return false;
@@ -470,11 +309,6 @@ mod tests {
     use super::*;
 
     fn cfg(required: bool, wake_ms: u64, turn_ms: u64, barge: bool) -> WakeConfig {
-        // Tests pre-dating the dropout default a 0-disabled value so
-        // the existing scenarios that fire SE immediately after wake
-        // still dispatch (otherwise every wake_then_se test would
-        // newly drop). Dropout-specific behaviour is covered by its
-        // own dedicated tests below.
         WakeConfig {
             required,
             wake_window_ms: wake_ms,
@@ -527,8 +361,6 @@ mod tests {
 
     #[test]
     fn wake_then_se_lenient_dispatch() {
-        // Real VAD sends SS before SE; tests sometimes skip SS. We
-        // accept SE in ArmedAfterWake as long as the window holds.
         let m = mk(cfg(true, 1000, 1000, true));
         m.on_wake();
         assert!(matches!(m.try_dispatch(), DispatchOutcome::Run(_)));
@@ -547,18 +379,16 @@ mod tests {
         let m = mk(cfg(true, 1000, 1000, true));
         m.on_wake();
         let g = run_guard(m.try_dispatch()).unwrap();
-        drop(g); // turn completes
-        // Now in ArmedAfterTurn — a new SS should be accepted via
-        // the follow-up window without a fresh wake.
+        drop(g);
         assert_eq!(m.on_speech_started(), SpeechStartedOutcome::Listening);
     }
 
     #[test]
     fn turn_followup_window_expires() {
-        let m = mk(cfg(true, 1000, 1, true)); // 1 ms follow-up window
+        let m = mk(cfg(true, 1000, 1, true));
         m.on_wake();
         let g = run_guard(m.try_dispatch()).unwrap();
-        drop(g); // turn completes → ArmedAfterTurn (1 ms window)
+        drop(g);
         std::thread::sleep(Duration::from_millis(10));
         assert!(matches!(
             m.on_speech_started(),
@@ -571,12 +401,8 @@ mod tests {
         let m = mk(cfg(true, 1000, 10_000, true));
         m.on_wake();
         let g = run_guard(m.try_dispatch()).unwrap();
-        drop(g); // ArmedAfterTurn now
-        // Wake during ArmedAfterTurn → transition to ArmedAfterWake
-        // (with the shorter wake_window timer).
+        drop(g);
         assert_eq!(m.on_wake(), WakeResult::Armed);
-        // Confirm: a SpeechStarted within wake_window is accepted via
-        // the wake path (Listening), not a turn-window path.
         assert_eq!(m.on_speech_started(), SpeechStartedOutcome::Listening);
     }
 
@@ -606,19 +432,11 @@ mod tests {
 
     #[test]
     fn no_barge_in_pending_wake_drives_completion_to_armed_after_wake() {
-        // With barge_in=false, a mid-turn wake should *not* cancel
-        // the running turn, but should redirect the post-turn state
-        // from ArmedAfterTurn to ArmedAfterWake.
         let m = mk(cfg(true, 1000, 10_000, false));
         m.on_wake();
         let g = run_guard(m.try_dispatch()).unwrap();
-        // Mid-turn wake (no barge-in).
         assert_eq!(m.on_wake(), WakeResult::ArmedBusy);
-        drop(g); // turn ends
-        // SS now should land in ArmedAfterWake (5 s) not
-        // ArmedAfterTurn (10 s). We can't directly observe "which
-        // window was used" — but we can confirm the state accepts a
-        // SS via Listening (both paths do).
+        drop(g);
         assert_eq!(m.on_speech_started(), SpeechStartedOutcome::Listening);
     }
 
@@ -631,32 +449,23 @@ mod tests {
         let g = run_guard(m.try_dispatch()).unwrap();
         assert!(m.is_in_turn());
         drop(g);
-        assert!(!m.is_in_turn()); // Now ArmedAfterTurn, not Processing
+        assert!(!m.is_in_turn());
     }
 
     #[test]
     fn se_within_post_wake_dropout_is_dropped() {
-        // VAD-captures-the-wake-word echo: SE arrives ~300 ms after
-        // WWD with the wake word audio. With dropout configured, the
-        // dispatch is rejected and state stays armed so the operator's
-        // real follow-up still triggers the pipeline.
         let m = mk(cfg_dropout(5_000, 800));
         m.on_wake();
-        // Immediate SE — well inside the 800 ms dropout.
         assert!(matches!(
             m.try_dispatch(),
             DispatchOutcome::DroppedTooSoonAfterWake
         ));
-        // State remained armed: a SS within the original wake_window
-        // still transitions to Listening.
         assert_eq!(m.on_speech_started(), SpeechStartedOutcome::Listening);
     }
 
     #[test]
     fn se_after_post_wake_dropout_dispatches() {
-        // Real continuous command: VAD's hangover pushes SE past the
-        // dropout window. Must dispatch normally.
-        let m = mk(cfg_dropout(5_000, 50)); // 50 ms — easy to wait past
+        let m = mk(cfg_dropout(5_000, 50));
         m.on_wake();
         std::thread::sleep(Duration::from_millis(60));
         assert!(matches!(m.try_dispatch(), DispatchOutcome::Run(_)));
@@ -664,9 +473,6 @@ mod tests {
 
     #[test]
     fn dropout_zero_disables_check() {
-        // Belt-and-braces for the operator escape hatch: setting
-        // post_wake_se_dropout_ms=0 must keep the legacy "lenient SE
-        // immediately after wake dispatches" behaviour intact.
         let m = mk(cfg_dropout(5_000, 0));
         m.on_wake();
         assert!(matches!(m.try_dispatch(), DispatchOutcome::Run(_)));
@@ -674,53 +480,28 @@ mod tests {
 
     #[test]
     fn dropout_does_not_gate_followup_after_turn() {
-        // Once a real dispatch runs (past the dropout window),
-        // last_wake_at is cleared. A follow-up SE landing in
-        // ArmedAfterTurn must dispatch even when the configured
-        // dropout would otherwise span across both turns.
         let m = mk(cfg_dropout(5_000, 50));
         m.on_wake();
-        std::thread::sleep(Duration::from_millis(60)); // past 50 ms dropout
+        std::thread::sleep(Duration::from_millis(60));
         let g = run_guard(m.try_dispatch()).expect("first dispatch");
-        drop(g); // → ArmedAfterTurn, last_wake_at now cleared
-        // Follow-up SE — no fresh wake, no fresh wake stamp. With the
-        // stamp cleared, dropout has nothing to measure against and
-        // the dispatch proceeds. (Without the clear, every armed-
-        // after-turn dispatch would race the dropout window.)
+        drop(g);
         assert!(matches!(m.try_dispatch(), DispatchOutcome::Run(_)));
     }
 
     #[test]
     fn wake_during_listening_restarts_into_armed_after_wake() {
-        // "Scratch that, start over" path: operator started speaking
-        // (SS arrived → Listening) and then either says the wake word
-        // again mid-utterance, or the wake-word model mis-fires on
-        // their own voice. WakeMachine should reset to
-        // ArmedAfterWake with a fresh wake_window and a refreshed
-        // last_wake_at stamp so the in-progress utterance's
-        // eventual SE gets dropped by post_wake_se_dropout.
         let m = mk(cfg(true, 5_000, 10_000, true));
         m.on_wake();
         assert_eq!(m.on_speech_started(), SpeechStartedOutcome::Listening);
-        // Mid-utterance wake — phase was Listening, expect Armed
-        // (the same outcome as a fresh wake from Idle, on purpose:
-        // callers don't need to distinguish "first wake" from
-        // "restart from Listening").
         assert_eq!(m.on_wake(), WakeResult::Armed);
-        // A fresh SS now must transition through ArmedAfterWake →
-        // Listening normally — confirms the state really did reset.
         assert_eq!(m.on_speech_started(), SpeechStartedOutcome::Listening);
     }
 
     #[test]
     fn listening_inherits_armed_timer_and_expires() {
-        // Regression: noise-driven SS would park state in Listening
-        // and (because armed_until was cleared on SS) Listening had no
-        // timeout. Real SEs were silently dropped upstream by VAD's
-        // RMS gate, so state hung forever and the next gate-passing SE
-        // — even minutes later — dispatched. Now SS preserves the
-        // armed_until inherited from ArmedAfter*; if SE doesn't arrive
-        // before that timer expires, dispatch returns ListeningWindowExpired.
+        // Regression: armed_until used to be cleared on SS, so a
+        // noise-driven SS parked state in Listening with no timeout and a
+        // gate-passing SE minutes later still dispatched.
         let m = mk(cfg(true, 50, 10_000, true));
         m.on_wake();
         assert_eq!(m.on_speech_started(), SpeechStartedOutcome::Listening);
@@ -729,15 +510,11 @@ mod tests {
             m.try_dispatch(),
             DispatchOutcome::ListeningWindowExpired
         ));
-        // State fell to Idle: a follow-up SE without a fresh wake must
-        // be NotArmed, not Run.
         assert!(matches!(m.try_dispatch(), DispatchOutcome::NotArmed));
     }
 
     #[test]
     fn listening_within_window_still_dispatches() {
-        // SS preserves the timer but doesn't shorten it: an SE arriving
-        // well within the original window must dispatch normally.
         let m = mk(cfg(true, 1_000, 10_000, true));
         m.on_wake();
         assert_eq!(m.on_speech_started(), SpeechStartedOutcome::Listening);
@@ -746,13 +523,12 @@ mod tests {
 
     #[test]
     fn turn_followup_listening_expires_when_se_never_arrives() {
-        // Specifically the bug from the field: turn ends → ArmedAfterTurn
-        // → noise SS → Listening. Without a real SE, the original 10 s
-        // turn-followup window must still expire and reset state.
+        // The bug from the field: turn ends → ArmedAfterTurn → noise SS →
+        // Listening; the follow-up window must still expire.
         let m = mk(cfg(true, 1_000, 50, true));
         m.on_wake();
         let g = run_guard(m.try_dispatch()).unwrap();
-        drop(g); // → ArmedAfterTurn (50 ms window)
+        drop(g);
         assert_eq!(m.on_speech_started(), SpeechStartedOutcome::Listening);
         std::thread::sleep(Duration::from_millis(60));
         assert!(matches!(
@@ -763,23 +539,15 @@ mod tests {
 
     #[test]
     fn stale_guard_drop_does_not_disturb_new_turn() {
-        // Regression: barge-in aborts the old turn but its
-        // ProcessingGuard's Drop runs *after* a new turn has already
-        // moved phase back to Processing. Without generation tracking,
-        // the stale Drop would call complete() and roll the new turn's
-        // phase back to ArmedAfterTurn, breaking it. With tracking, the
-        // stale Drop is a no-op.
+        // Regression: a barge-in-aborted turn's guard Drop can land after
+        // a new turn is already Processing; without generation tracking it
+        // would roll the new turn back to ArmedAfterTurn.
         let m = mk(cfg(true, 1000, 1000, true));
         m.on_wake();
         let old_guard = run_guard(m.try_dispatch()).unwrap();
-        // Barge-in: state goes Processing → ArmedAfterWake.
         assert_eq!(m.on_wake(), WakeResult::BargeIn);
-        // New turn dispatched within the wake window — bumps generation.
         let _new_guard = run_guard(m.try_dispatch()).unwrap();
         assert!(m.is_in_turn());
-        // Old turn's late drop fires now (simulating
-        // JoinHandle::abort()'s drop chain landing after the new
-        // dispatch). Must not change phase: the new turn is mid-flight.
         drop(old_guard);
         assert!(m.is_in_turn(), "stale guard's drop must not roll back the live turn");
     }

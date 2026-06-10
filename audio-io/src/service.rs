@@ -26,13 +26,9 @@ pub async fn start_services(state: &AppState) -> Result<(), AudioError> {
     .map_err(AudioError::from_chain)?;
     handles.capture = Some(capture);
 
-    // Open `playback_tracks` independent cpal output streams against the
-    // same device. WASAPI shared mode mixes them at the OS layer, so
-    // callers (TTS-streamer on track 0, agent on track 1, ...) can push
-    // PCM in parallel without per-sample stomping or contention.
+    // Independent cpal output streams against the same device; WASAPI shared
+    // mode mixes them at the OS layer.
     let n_tracks = state.config.runtime.playback_tracks as usize;
-    // Far-end reference tap: hand each playback stream the AEC ingress sender
-    // only when AEC is enabled, so the no-AEC path pays nothing for it.
     let ref_tap = if state.config.aec.enabled {
         Some(state.ref_in_tx.clone())
     } else {
@@ -62,11 +58,6 @@ pub async fn start_services(state: &AppState) -> Result<(), AudioError> {
     *state.spk_tracks.lock().await = new_tracks;
     handles.playback = new_handles;
 
-    // Acoustic echo cancellation (issue #20). When enabled, spin up the
-    // reference mixer (sums the far-end `/spk` tracks) and the AEC task
-    // (cancels that far-end out of the mic; `/mic` then serves it). Both
-    // subscribe to broadcast channels that already exist on AppState, so the
-    // `/spk` tee and `/mic` handler don't depend on these tasks being up.
     if state.config.aec.enabled {
         let spf = state.config.audio.samples_per_frame();
         let mixer = tokio::spawn(reference_mixer_task(
@@ -77,9 +68,6 @@ pub async fn start_services(state: &AppState) -> Result<(), AudioError> {
             n_tracks,
             state.config.audio.frame_ms,
         ));
-        // Select the echo-cancellation backend (`aec.backend`). "nlms" is the
-        // built-in pure-Rust canceller; "speex" wraps Speex DSP and only exists
-        // when compiled with `--features speex`.
         let sr = state.config.audio.sample_rate;
         let flen = state.config.aec.filter_length_ms;
         let canceller: Box<dyn EchoCanceller> = match state.config.aec.backend.as_str() {
@@ -117,9 +105,6 @@ pub async fn stop_services(state: &AppState) -> Result<(), AudioError> {
 
 fn drop_inner(handles: &mut ServiceHandles) {
     handles.capture = None;
-    // Drop in reverse order so a track's logger task doesn't see the
-    // producer task abort mid-Tick (purely defensive — Drop on each is
-    // independent — but keeps log order tidy).
     handles.playback.clear();
     // tokio JoinHandles detach on drop, so abort the AEC tasks explicitly.
     for t in handles.aec_tasks.drain(..) {

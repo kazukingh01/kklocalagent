@@ -1,6 +1,3 @@
-# Smoke-test probe. Self-contained so we don't rely on bind mounts
-# (those break in some Docker-in-Docker / rootless setups where the
-# host paths aren't reachable from the daemon's filesystem view).
 FROM python:3.11-slim-bookworm
 
 WORKDIR /app

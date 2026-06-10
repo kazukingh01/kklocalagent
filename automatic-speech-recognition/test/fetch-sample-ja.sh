@@ -1,21 +1,6 @@
 #!/bin/sh
-# Generate a Japanese test wav by running gTTS (Google Translate's TTS
-# endpoint, accessed by the `gtts` Python package) inside a one-shot
-# python:3.12-slim docker container, then converting to the wire format
-# the mic-stub expects: s16le, 16 kHz, mono.
-#
-# Output: ./samples/test-ja.wav (~270 KB, ~13 s).
-#
-# Why TTS instead of a hosted recording: there is no widely-stable,
-# CC-licensed JP wav at a known URL that whisper-large transcribes
-# meaningfully. gTTS produces clean female JP speech that whisper
-# transcribes nearly verbatim — fine for a smoke test.
-#
-# Implementation note: the docker container writes the wav to a
-# bind-mounted host directory rather than streaming it over stdout.
-# Stdout-piping is fragile — any pip/apt/network noise that escapes the
-# `>/dev/null` redirects would corrupt the wav, producing an empty file
-# that mic-stub fails to parse with EOFError.
+# The container writes via bind mount, not stdout — pip/apt noise escaping
+# the redirects corrupts a piped wav and mic-stub dies with EOFError.
 
 set -e
 
