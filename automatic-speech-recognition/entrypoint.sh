@@ -10,8 +10,6 @@ if [ ! -f "$MODEL_PATH" ]; then
     exit 1
 fi
 
-# Upstream's image bundles binaries under /app/build/bin; PATH lookup is
-# a fallback for layout changes.
 if [ -x /app/build/bin/whisper-server ]; then
     SERVER=/app/build/bin/whisper-server
 else

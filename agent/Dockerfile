@@ -1,4 +1,3 @@
-# Agent API: ollama-compatible /api/chat backed by LangGraph.
 FROM python:3.11-slim-bookworm
 
 # curl for HEALTHCHECK. procps (uptime) / iproute2 (ip) are required by
@@ -14,10 +13,8 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY app.py tools.py sandbox.py /app/
-# テストハーネス (issue #19 step 2) を `docker compose exec` で叩けるように含める。
 COPY experiments /app/experiments
 
-# /data is a named volume in compose so conversation memory survives down/up.
 ENV AGENT_OLLAMA_URL=http://llm:11434 \
     AGENT_MODEL=gemma4:e4b \
     AGENT_SYSTEM_PROMPT="" \

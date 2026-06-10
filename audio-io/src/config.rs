@@ -40,28 +40,14 @@ pub struct RuntimeConfig {
     pub autostart: bool,
     pub playback_buffer_ms: u32,
     pub mic_broadcast_frames: u32,
-    /// Number of parallel playback tracks (each its own cpal output stream;
-    /// WASAPI shared mode mixes them at the OS layer). A value below the
-    /// highest `?track=N` a client requests makes audio-io close that WS
-    /// immediately, silently dropping that channel.
     pub playback_tracks: u32,
 }
 
-/// Acoustic echo cancellation (issue #20). Runs inside audio-io because
-/// near-end and far-end live in the same process on the same clock; when off,
-/// `/mic` serves the raw capture byte-identically to pre-#20.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct AecConfig {
     pub enabled: bool,
-    /// `"nlms"` (built-in, always available) or `"speex"` (aec-rs, only when
-    /// built with `--features speex`; selecting it otherwise is a startup
-    /// error, not a config-load failure).
     pub backend: String,
-    /// Filter length = the reverb *tail* modeled, not the bulk speaker→mic
-    /// delay (that is measured and removed by a pre-delay). Longer captures
-    /// more reverberant rooms at higher CPU/convergence cost; ~100–150 ms
-    /// suits typical rooms.
     pub filter_length_ms: u32,
 }
 

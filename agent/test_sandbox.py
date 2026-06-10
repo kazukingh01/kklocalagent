@@ -1,5 +1,3 @@
-"""sandbox.py の不変条件を pin する単体テスト (stdlib unittest)。"""
-
 from __future__ import annotations
 
 import os
@@ -43,7 +41,6 @@ class EnsureCommandAllowedTests(unittest.TestCase):
         self.assertEqual(ensure_command_allowed("uptime", ALLOW), ["uptime"])
 
     def test_allowed_with_args(self):
-        # 引数は素通し (粒度はコマンド名のみ、issue #19 オープン項目 #2)。
         self.assertEqual(
             ensure_command_allowed("uname -a", ALLOW),
             ["uname", "-a"],
@@ -55,7 +52,6 @@ class EnsureCommandAllowedTests(unittest.TestCase):
         self.assertIn("rm", str(ctx.exception))
 
     def test_denied_path_disguised(self):
-        # 完全一致照合の効用 — prefix マッチだと "date" のせいで通ってしまう。
         with self.assertRaises(CommandNotAllowed):
             ensure_command_allowed("/bin/date", ALLOW)
 
@@ -80,7 +76,6 @@ class EnsurePathInRootTests(unittest.TestCase):
         self.assertEqual(p, self.root / "sub" / "data.txt")
 
     def test_root_self(self):
-        # 空 path 経由で root そのものを返してしまうのを防ぐ。
         with self.assertRaises(PathOutsideRoot):
             ensure_path_in_root("", str(self.root))
 
@@ -97,8 +92,6 @@ class EnsurePathInRootTests(unittest.TestCase):
             ensure_path_in_root("sub/../../etc/passwd", str(self.root))
 
     def test_symlink_jailbreak_denied(self):
-        # root 内の symlink が root 外を指すケース — Path.resolve() を必ず
-        # 通す動機。
         outside = Path(tempfile.mkdtemp())
         try:
             (outside / "secret.txt").write_text("secret")

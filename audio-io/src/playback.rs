@@ -58,7 +58,6 @@ impl PlaybackHandle {
 
 impl Drop for PlaybackHandle {
     fn drop(&mut self) {
-        // Cancel producer task first so it stops pushing into the ring buffer.
         if let Some(t) = self.task.take() {
             t.abort();
         }
@@ -72,12 +71,8 @@ impl Drop for PlaybackHandle {
     }
 }
 
-/// Counters incremented by the cpal output callback; `consumed` /
-/// `callbacks_total` let an observer measure hardware-vs-system clock drift.
 pub struct UnderrunStats {
-    /// Zero-sample emissions across all callbacks.
     samples: AtomicU64,
-    /// Callbacks that hit the silence path at least once.
     callbacks: AtomicU64,
     /// Set by the producer on every Frame; the logger swap-clears it each tick
     /// and warns only when a sender was actively pushing. Without this gate,
@@ -100,7 +95,6 @@ impl UnderrunStats {
         }
     }
 
-    /// `(callbacks_total, consumed_samples)`, both monotonic.
     pub fn snapshot(&self) -> (u64, u64) {
         (
             self.callbacks_total.load(Ordering::Relaxed),
@@ -189,8 +183,6 @@ pub fn start_playback(
         let mut last_callbacks: u64 = 0;
         loop {
             interval.tick().await;
-            // Warn only when a sender pushed audio in the elapsed window; see
-            // `audio_seen`.
             let active = stats_log.audio_seen.swap(false, Ordering::Relaxed);
             let s = stats_log.samples.load(Ordering::Relaxed);
             let c = stats_log.callbacks.load(Ordering::Relaxed);
@@ -245,8 +237,6 @@ fn emit_ref(tx: &broadcast::Sender<(usize, Bytes)>, track_id: usize, frames: Vec
     }
 }
 
-/// `None` when AEC is disabled, so the output callback skips the tap and
-/// playback stays byte-for-byte identical to the no-AEC path.
 fn build_ref_framer(
     ref_tap: &Option<broadcast::Sender<(usize, Bytes)>>,
     native_rate: u32,
@@ -275,7 +265,7 @@ trait PlaybackSample: SizedSample + Send + 'static {
 impl PlaybackSample for f32 {
     #[inline]
     fn from_playback_f32(v: f32) -> f32 {
-        v // historical f32 path: straight through, no clamp
+        v
     }
 }
 impl PlaybackSample for i16 {
@@ -397,8 +387,6 @@ fn run_playback(
         }))
         .map_err(|_| anyhow!("failed to signal playback ready"))?;
 
-    // `consumer`/`flush` are moved into whichever arm runs; the others are dead
-    // branches, so moving the same value in each arm is fine.
     let stream = match sample_format {
         SampleFormat::F32 => build_output_stream::<f32>(
             &device,
@@ -467,8 +455,7 @@ async fn playback_producer_task(
     let mut drops_since_log: u32 = 0;
     loop {
         tokio::select! {
-            // `biased`: real audio is strictly preferred over the idle
-            // keep-alive's synthetic silence.
+            // `biased`: real audio strictly preferred over the keep-alive's silence.
             biased;
             recv = spk_rx.recv() => {
                 let Some(msg) = recv else { break; };
@@ -530,16 +517,12 @@ async fn playback_producer_task(
                         if dropped_this_batch > 0 {
                             total_dropped =
                                 total_dropped.saturating_add(dropped_this_batch as u64);
-                            // debug shows even a single dropped sample, which
-                            // the rate-limited warn below hides until 50
-                            // batches have piled up.
                             debug!(
                                 dropped_this_batch,
                                 total_dropped,
                                 "playback ring full; dropping samples (WS arriving faster than cpal consumes)"
                             );
                             drops_since_log += 1;
-                            // ~once per second at 20 ms/frame.
                             if drops_since_log >= 50 {
                                 warn!(
                                     total_dropped,
@@ -574,8 +557,6 @@ async fn playback_producer_task(
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                // Idle keep-alive (see keep_alive_threshold above); no-op while
-                // real audio is flowing.
                 let depth = ring_capacity - producer.vacant_len();
                 if depth < keep_alive_threshold {
                     let need = keep_alive_threshold - depth;

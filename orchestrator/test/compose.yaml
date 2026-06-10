@@ -1,11 +1,6 @@
-# Orchestrator v0.1 smoke test: SpeechEnded → ASR → LLM wiring with
-# mocked backends (probe plays both mocks and the test driver).
-
 services:
   orch:
     build:
-      # Repo-root context so the orchestrator Dockerfile can COPY the
-      # shared `wav-utils` crate alongside `orchestrator/`.
       context: ../..
       dockerfile: orchestrator/Dockerfile
     container_name: kklocalagent-test-orch
@@ -13,8 +8,6 @@ services:
       ORCH_ASR_URL: http://probe:9100/inference
       ORCH_LLM_URL: http://probe:9200/api/chat
       ORCH_LLM_MODEL: gemma3:4b
-      # Disable wake gating: this smoke posts SpeechEnded with no preceding
-      # WakeWordDetected, which the v1.0 default would (correctly) drop.
       ORCH_WAKE_REQUIRED: "false"
       RUST_LOG: info,orchestrator=debug
 

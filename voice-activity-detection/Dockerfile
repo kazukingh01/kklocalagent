@@ -1,12 +1,8 @@
-# webrtc-vad bundles WebRTC's C source, so the build stage needs a C compiler.
-
 FROM rust:1-slim-bookworm AS builder
 RUN apt-get update \
     && apt-get install -y --no-install-recommends pkg-config build-essential \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-# Build context is the repo root (compose `build.context: .`) so the
-# path-dependency on `../wav-utils` resolves.
 COPY wav-utils ./wav-utils
 COPY voice-activity-detection/Cargo.toml voice-activity-detection/Cargo.lock \
     ./voice-activity-detection/

@@ -1,15 +1,8 @@
-# audio-io is Windows-native and runs OUTSIDE compose — VAD and
-# wake-word-detection subscribe to its WS /mic endpoint over the LAN.
-
-# YAML anchors don't expand env vars themselves, so we route through
-# `${...}` and reuse the resulting string via the anchor.
 x-llm-model: &llm-model "${LLM_MODEL:-gemma4:e4b}"
 x-asr-model: &asr-model "${ASR_MODEL:-ggml-large-v3-turbo-q8_0.bin}"
 
 services:
   asr-models:
-    # Idles (rather than exiting) after the fetch so the dependency
-    # healthcheck stays stable for the lifetime of the stack.
     image: alpine:3
     container_name: kklocalagent-asr-models
     restart: unless-stopped
@@ -48,7 +41,6 @@ services:
         fi
         exec sleep infinity
     healthcheck:
-      # The atomic rename above guarantees file existence ⇒ full file.
       test: ["CMD-SHELL", "[ -f \"/models/$$ASR_MODEL\" ]"]
       interval: 5s
       timeout: 2s
@@ -59,9 +51,6 @@ services:
     build:
       context: ./automatic-speech-recognition
       args:
-        # Upstream publishes one whisper.cpp image per backend (`main`,
-        # `main-cuda`, `main-musa`, `main-intel`); the CPU override
-        # flips this back to `main`.
         WHISPER_VARIANT: main-cuda
     container_name: kklocalagent-asr
     restart: unless-stopped
@@ -97,12 +86,10 @@ services:
     restart: unless-stopped
     environment:
       LLM_MODEL: *llm-model
-      # -1 = pin weights in memory forever (no per-turn cold-load).
       OLLAMA_KEEP_ALIVE: "-1"
       # Required for OLLAMA_KV_CACHE_TYPE != f16. CUDA/Metal only —
       # disabled in the CPU override.
       OLLAMA_FLASH_ATTENTION: "1"
-      # Needs OLLAMA_FLASH_ATTENTION=1.
       OLLAMA_KV_CACHE_TYPE: "q8_0"
       # Bumped from 8 k because tool-using turns (web-search results in
       # the agent's checkpointed history) used to fill 8 k after a few
@@ -113,12 +100,7 @@ services:
       # 16 k gives that trimming comfortable headroom over the system
       # prompt + tool schemas + generation.
       OLLAMA_CONTEXT_LENGTH: "${OLLAMA_CONTEXT_LENGTH:-16384}"
-      # MMQ kernel instead of cuBLAS-on-dequantised: 10-30 % faster
-      # token generation for Q4_K_M on Ada (compute 8.9). Harmless on
-      # GPUs where MMQ isn't a win — ggml falls back gracefully.
       GGML_CUDA_FORCE_MMQ: "1"
-      # Orchestrator already serialises turns at max_inflight=1;
-      # parallel slots would only split the KV cache.
       OLLAMA_NUM_PARALLEL: "1"
       OLLAMA_MAX_LOADED_MODELS: "1"
       # 2 = trace: logs each streamed chunk PRE-parse as "builtin
@@ -127,9 +109,6 @@ services:
       # on models with a builtin parser (gemma4-architecture GGUFs get
       # parser=gemma4 at pull time).
       OLLAMA_DEBUG: "${OLLAMA_DEBUG:-0}"
-      # Only consulted when LLM_MODEL ends in `-mtp` (the MTP build
-      # path pulls gated Gemma safetensors). Plain ollama pull tags
-      # don't need this.
       HF_TOKEN: "${HF_TOKEN:-}"
     volumes:
       - ollama-data:/root/.ollama
@@ -159,7 +138,6 @@ services:
     environment:
       VOICEVOX_URL: http://text-to-speech:50021
       VOICEVOX_SPEAKER: "3"
-      # VOICEVOX speedScale; usable range ~0.5–2.0.
       VOICEVOX_SPEED_SCALE: "${VOICEVOX_SPEED_SCALE:-1.0}"
       SPK_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/spk
       AUDIO_IO_BASE: http://${WINDOWS_HOST:-host.docker.internal}:7010
@@ -173,17 +151,12 @@ services:
 
   voice-activity-detection:
     build:
-      # Repo-root context so the Dockerfile can `COPY wav-utils ./`
-      # (path-dependency one level up).
       context: .
       dockerfile: voice-activity-detection/Dockerfile
     container_name: kklocalagent-vad
     restart: unless-stopped
     environment:
       RUST_LOG: info,voice_activity_detection=info
-      # `/mic` transparently serves audio-io's echo-cancelled stream when the
-      # host's audio-io config has `[aec] enabled = true` (issue #20) — no URL
-      # change needed here.
       VAD_MIC_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/mic
       VAD_SINK_MODE: orchestrator
       VAD_ORCHESTRATOR_URL: http://orchestrator:7000/events
@@ -194,14 +167,10 @@ services:
       VAD_START_FRAMES: "${VAD_START_FRAMES:-3}"
       VAD_AGGRESSIVENESS: "${VAD_AGGRESSIVENESS:-2}"
       VAD_DENOISE: "${VAD_DENOISE:-false}"
-      # Drop SpeechEnded events quieter than this RMS (dBFS). Cuts the
-      # "VAD spuriously armed → empty buffer to ASR → Whisper
-      # hallucinates 'ご視聴ありがとうございました'" loop. 0 disables.
+      # Cuts the "VAD spuriously armed → empty buffer to ASR → Whisper
+      # hallucinates 'ご視聴ありがとうございました'" loop.
       VAD_MIN_UTTERANCE_RMS_DBFS: "${VAD_MIN_UTTERANCE_RMS_DBFS:--45}"
     extra_hosts:
-      # Plain Linux docker (non-Docker-Desktop, non-WSL2) doesn't
-      # resolve `host.docker.internal` by default; host-gateway maps it
-      # to the docker bridge gateway = the host.
       - "host.docker.internal:host-gateway"
     depends_on:
       orchestrator:
@@ -214,31 +183,20 @@ services:
     restart: unless-stopped
     environment:
       # ?ts=1 opts into audio-io's per-frame epoch-ns header. The Rust
-      # runtime auto-appends it, but the alternative Python shim
-      # (openwakeword/) does NOT — keep it explicit so swapping
-      # implementations still gets the header.
-      # As with VAD, `/mic` serves audio-io's echo-cancelled stream when the
-      # host config enables AEC (issue #20) — no URL change needed.
+      # runtime auto-appends it, but the alternative Python shim does
+      # NOT — keep it explicit so swapping implementations still works.
       WW_MIC_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/mic?ts=1
       WW_SINK_MODE: orchestrator
       WW_ORCHESTRATOR_URL: http://orchestrator:7000/events
-      # The models dir must also contain melspectrogram.onnx +
-      # embedding_model.onnx (filenames hardcoded in config.rs).
       WW_MODELS: "${WW_MODELS:-my_phrase.onnx}"
       WW_THRESHOLD: "${WW_THRESHOLD:-0.5}"
-      # Keep it < WW_CONFIRM_WINDOW_MS (see below).
       WW_COOLDOWN_SEC: "${WW_COOLDOWN_SEC:-2.0}"
-      # Anti-false-fire gate: wake forwards only after WW_CONFIRM_COUNT
-      # detections within WW_CONFIRM_WINDOW_MS. REQUIREMENT:
-      # WW_CONFIRM_WINDOW_MS must be > WW_COOLDOWN_SEC×1000, else a
+      # REQUIREMENT: WW_CONFIRM_WINDOW_MS > WW_COOLDOWN_SEC×1000, else a
       # single utterance (deduped by cooldown) can never reach count 2.
       WW_CONFIRM_COUNT: "${WW_CONFIRM_COUNT:-2}"
       WW_CONFIRM_WINDOW_MS: "${WW_CONFIRM_WINDOW_MS:-3000}"
       WW_PEAK_LOG_INTERVAL_SEC: "${WW_PEAK_LOG_INTERVAL_SEC:-0}"
     volumes:
-      # The Dockerfile only bakes hey_livekit.onnx — this bind mount is
-      # the supported way to ship a custom-trained classifier plus the
-      # mel/embedding fixtures it needs.
       - ./wake-word-detection/livekit-wakeword/runtime/models:/opt/models:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -252,13 +210,9 @@ services:
     container_name: kklocalagent-agent
     restart: unless-stopped
     environment:
-      # JST so `run_shell` の `date` が「現在時刻」用 tool として機能する —
-      # python:slim はデフォルト UTC.
       TZ: "${TZ:-Asia/Tokyo}"
       AGENT_OLLAMA_URL: http://llm:11434
       AGENT_MODEL: *llm-model
-      # Prepended at invoke time, not persisted in graph state — a
-      # prompt change + restart takes effect on existing sessions.
       AGENT_SYSTEM_PROMPT: "${AGENT_SYSTEM_PROMPT:-You are a voice assistant; your replies are spoken aloud, so write the way people speak — no markdown, no lists, no code blocks. Keep every response to one or two short sentences. Default to Japanese (日本語) unless the user clearly speaks another language. Maintain a brisk, natural conversational rhythm. Keep wording as simple and minimal as possible — fewer words is better. Skip honorifics (敬語); use casual / plain-form Japanese (タメ口). Input text is produced by ASR (speech-to-text); read it with that in mind — expect transcription noise, dropped particles, and homophone mistakes. If the input doesn't seem to make sense, assume the user's speech may have been only partially or incorrectly transcribed, and respond accordingly (briefly confirm or pick the most plausible meaning).}"
       AGENT_SESSION_IDLE_SEC: "${AGENT_SESSION_IDLE_SEC:-600}"
       # ESTIMATED-token budget for chat history. System prompt + tool
@@ -268,23 +222,10 @@ services:
       # schemas), which silently breaks tool calling. The estimator
       # counts CJK at ~1 token/char.
       AGENT_MAX_HISTORY_TOKENS: "${AGENT_MAX_HISTORY_TOKENS:-2048}"
-      # Feature flag for tool-calling (issue #19). false = legacy
-      # single-node chat graph (bit-for-bit pre-#19 behaviour).
       AGENT_TOOLS_ENABLED: "${AGENT_TOOLS_ENABLED:-true}"
-      # Caps the agent_node → tools loop per turn — prevents an
-      # infinite retry loop on a tool that always fails.
       AGENT_TOOL_RECURSION_LIMIT: "${AGENT_TOOL_RECURSION_LIMIT:-6}"
-      # Thinking MODE 0/1/2 (see .env.example). 0 sends think=false
-      # EXPLICITLY — omitting it lets a thinking-capable backend
-      # default thinking ON. 1 = native think=true: an imported GGUF
-      # without native think returns HTTP 400 and the whole turn fails.
-      # 2 = prepend AGENT_THINK_TOKEN + think=false, for GGUFs that
-      # reject native think. Default 0: modes 1 & 2 add latency and
-      # suppress tool calls on gemma4 12B.
       AGENT_REASONING: "${AGENT_REASONING:-0}"
       AGENT_THINK_TOKEN: "${AGENT_THINK_TOKEN:-<|think|>}"
-      # Empty (default) = the long built-in tool policy in agent/app.py,
-      # not "no policy".
       AGENT_TOOL_SYSTEM_SUFFIX: "${AGENT_TOOL_SYSTEM_SUFFIX:-}"
       # Default OFF: gemma4 12B reads the few-shot fake history as
       # conversation *facts* — on a similar live question it copied the
@@ -294,12 +235,7 @@ services:
       # grammar).
       AGENT_TOOL_FEWSHOT: "${AGENT_TOOL_FEWSHOT:-off}"
       AGENT_TOOL_FEWSHOT_FILE: "${AGENT_TOOL_FEWSHOT_FILE:-}"
-      # argv[0] exact-match allowlist; empty = run_shell disabled.
-      # `shell=True` is never used, so pipes / redirects / `&&` are
-      # structurally impossible regardless of this list. The value is
-      # injected into the tool description at agent startup.
       AGENT_SHELL_ALLOWLIST: "${AGENT_SHELL_ALLOWLIST:-ls,date,pwd}"
-      # Sandbox root for read_file; also used as run_shell's cwd.
       AGENT_FILE_ROOT: "${AGENT_FILE_ROOT:-/workspace}"
       AGENT_SHARE_DIR: "${AGENT_SHARE_DIR:-./share}"
       AGENT_CONTEXT_SHARE: "${AGENT_CONTEXT_SHARE:-on}"
@@ -307,27 +243,17 @@ services:
       AGENT_CONTEXT_SHARE_REFRESH_SEC: "${AGENT_CONTEXT_SHARE_REFRESH_SEC:-300}"
       AGENT_CONTEXT_SHARE_MAX_DIRS: "${AGENT_CONTEXT_SHARE_MAX_DIRS:-20}"
       AGENT_TOOL_ACK_WEB_SEARCH: "${AGENT_TOOL_ACK_WEB_SEARCH:-ちょっと検索してみるね。}"
-      # `?track=N` puts agent playback on a parallel cpal stream so it
-      # never stomps on tts-streamer's TTS stream. audio-io must run
-      # with `runtime.playback_tracks >= 2`. Empty disables the tool
-      # (the tool description then tells the LLM it's unavailable).
+      # `?track=N` needs audio-io running with `runtime.playback_tracks
+      # >= 2`; track 1 keeps agent playback off tts-streamer's stream.
       AGENT_AUDIO_IO_SPK_URL: "${AGENT_AUDIO_IO_SPK_URL:-ws://${WINDOWS_HOST:-host.docker.internal}:7010/spk?track=1}"
-      # Must match the wire format audio-io expects on /spk.
       AGENT_AUDIO_IO_WIRE_RATE: "${AGENT_AUDIO_IO_WIRE_RATE:-16000}"
       AGENT_AUDIO_IO_WIRE_CHANNELS: "${AGENT_AUDIO_IO_WIRE_CHANNELS:-1}"
       AGENT_AUDIO_PLAY_MAX_S: "${AGENT_AUDIO_PLAY_MAX_S:-300}"
       AGENT_TOOL_ACK_PLAY_AUDIO: "${AGENT_TOOL_ACK_PLAY_AUDIO:-音声を再生するね。}"
-      # Advanced overrides not surfaced here: AGENT_HEALTH_TIMEOUT_S
-      # (per-probe timeout, default 2.5) and AGENT_HEALTH_TARGETS (JSON
-      # array of {name,url,kind} replacing the built-in probe list).
       AGENT_TOOL_ACK_SYSTEM_HEALTH: "${AGENT_TOOL_ACK_SYSTEM_HEALTH:-確認するね。}"
-      # Timer alarms stream on their OWN track (default 2, derived from
-      # AGENT_AUDIO_IO_SPK_URL by swapping ?track=) so they mix OVER
-      # TTS (track 0) and play_audio_file (track 1). REQUIREMENT:
-      # audio-io must run with `runtime.playback_tracks >= 3` —
-      # otherwise it rejects the track and the alarm silently doesn't
-      # sound. AGENT_TIMER_MAX_S guards against an ASR misread like
-      # 「3分」→「300分」.
+      # Timer alarms stream on their own track (default 2). REQUIREMENT:
+      # audio-io must run with `runtime.playback_tracks >= 3` — otherwise
+      # it rejects the track and the alarm silently doesn't sound.
       AGENT_TIMER_ALARM_WAV: "${AGENT_TIMER_ALARM_WAV:-}"
       AGENT_TIMER_MAX_S: "${AGENT_TIMER_MAX_S:-86400}"
     volumes:
@@ -344,8 +270,6 @@ services:
 
   orchestrator:
     build:
-      # Repo-root context so the Dockerfile can `COPY wav-utils ./`
-      # (path-dependency one level up).
       context: .
       dockerfile: orchestrator/Dockerfile
     container_name: kklocalagent-orch
@@ -356,20 +280,13 @@ services:
       ORCH_ASR_URL: http://automatic-speech-recognition:8080/inference
       ORCH_LLM_URL: http://agent:7080/api/chat
       ORCH_LLM_MODEL: *llm-model
-      # System prompt lives in AGENT_SYSTEM_PROMPT on the agent
-      # service — kept empty here so the orchestrator doesn't
-      # double-inject one.
       ORCH_LLM_SYSTEM_PROMPT: ""
       ORCH_TTS_URL: http://tts-streamer:7070/speak
-      # /append — used for the 2nd-and-later sentences of each turn so
-      # the streamer reuses its burst budget instead of re-prebuffering
-      # 5 s every sentence (which overflows audio-io's ring; issue #16).
-      # Empty falls back to /speak for every sentence.
+      # Used for the 2nd-and-later sentences of each turn so the streamer
+      # reuses its burst budget instead of re-prebuffering 5 s every
+      # sentence, which overflowed audio-io's ring (issue #16).
       ORCH_TTS_APPEND_URL: http://tts-streamer:7070/append
       ORCH_TTS_STOP_URL: http://tts-streamer:7070/stop
-      # Called once per turn after the last /speak — tts-streamer's
-      # response is the precise speaker-silent moment used to anchor
-      # the post-TTS VAD quiet window.
       ORCH_TTS_FINALIZE_URL: http://tts-streamer:7070/finalize
       ORCH_WAKE_REQUIRED: "${ORCH_WAKE_REQUIRED:-true}"
       ORCH_WAKE_WINDOW_MS: "${ORCH_WAKE_WINDOW_MS:-5000}"
@@ -388,11 +305,8 @@ services:
       # assistant's reply. Bump if you raise VAD_HANG_FRAMES.
       ORCH_TTS_TAIL_QUIET_MS: "${ORCH_TTS_TAIL_QUIET_MS:-400}"
       # Keep SHORT — it plays during the post-wake listen window, so
-      # its own audio can reach the mic and self-fire VAD; rely on
-      # audio-io AEC or brevity.
+      # its own audio can reach the mic and self-fire VAD.
       ORCH_WAKE_ACK_TEXT: "${ORCH_WAKE_ACK_TEXT:-はい}"
-      # Whisper fills ambiguous near-silence with stock YouTube
-      # boilerplate; matching ASR outputs are treated as empty.
       ORCH_ASR_HALLUCINATION_BLACKLIST: "${ORCH_ASR_HALLUCINATION_BLACKLIST:-ご視聴ありがとう|(拍手)|(笑)|Thanks for watching|Subscribe to my channel}"
     ports:
       - "7000:7000"

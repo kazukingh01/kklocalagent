@@ -6,7 +6,6 @@
 //! `include_bytes!` — Rust crate 0.1.3 and the Python pkg 0.2.0 the
 //! classifier was trained against ship different binaries, and reading the
 //! train-side files is the only way to guarantee feature parity.
-//! Upstream's resampler is dropped — audio-io always emits 16 kHz.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -17,24 +16,18 @@ use ort::session::Session;
 use ort::value::Tensor;
 
 const SAMPLE_RATE: usize = 16_000;
-const MEL_BINS: usize = 32; // openWakeWord melspectrogram output bins
-const EMBEDDING_WINDOW: usize = 76; // mel frames per embedding
-const EMBEDDING_STRIDE: usize = 8; // mel frames between embeddings
+const MEL_BINS: usize = 32;
+const EMBEDDING_WINDOW: usize = 76;
+const EMBEDDING_STRIDE: usize = 8;
 const EMBEDDING_DIM: usize = 96;
-const MIN_EMBEDDINGS: usize = 16; // classifier input length
+const MIN_EMBEDDINGS: usize = 16;
 
-/// i16 → [-1.0, 1.0] normalisation; the training pipeline does the same,
-/// so this constant is load-bearing for score parity.
 const I16_TO_F32: f32 = 1.0 / 32768.0;
 
 const _: () = {
-    // Compile-time anchor for the 16 kHz contract the embedding stride assumes.
     assert!(SAMPLE_RATE == 16_000);
 };
 
-/// Input: f32 PCM `(1, num_samples)` in [-1, 1]; output: mel features
-/// `(time_frames, MEL_BINS)` after the `x/10 + 2` post-processing that
-/// openWakeWord's `melspec_transform` applies.
 struct MelspectrogramModel {
     session: Session,
 }
@@ -52,8 +45,6 @@ impl MelspectrogramModel {
 
         let outputs = self.session.run(ort::inputs![audio_tensor])?;
         let raw = outputs["output"].try_extract_array::<f32>()?;
-        // Upstream returns (1, 1, time_frames, mel_bins); drop the two
-        // leading singletons.
         let rows = raw.shape()[2];
         let cols = raw.shape()[3];
         let mut output = raw.into_owned().into_shape_with_order((rows, cols))?;
@@ -62,9 +53,8 @@ impl MelspectrogramModel {
     }
 }
 
-/// 76-frame mel window `(1, 76, MEL_BINS, 1)` → 96-dim embedding
-/// `(1, 1, 1, 96)`. Output tensor name `conv2d_19` is specific to this
-/// upstream ONNX export — a future rebuild renaming it breaks here first.
+/// Output tensor name `conv2d_19` is specific to this upstream ONNX
+/// export — a future rebuild renaming it breaks here first.
 struct EmbeddingModel {
     session: Session,
 }
@@ -86,7 +76,6 @@ impl EmbeddingModel {
     }
 }
 
-/// Wake-word inference pipeline: PCM → mel → embeddings → classifier.
 pub struct WakeWordModel {
     mel_model: MelspectrogramModel,
     emb_model: EmbeddingModel,
@@ -133,16 +122,13 @@ impl WakeWordModel {
         Ok(())
     }
 
-    /// Run inference on ~2 s of i16 PCM at 16 kHz. Windows shorter than
-    /// `MIN_EMBEDDINGS * EMBEDDING_STRIDE + EMBEDDING_WINDOW` mel frames
-    /// return zeros (warm-up).
+    /// Windows shorter than `MIN_EMBEDDINGS * EMBEDDING_STRIDE +
+    /// EMBEDDING_WINDOW` mel frames return zeros (warm-up).
     pub fn predict(&mut self, audio_chunk: &[i16]) -> Result<BTreeMap<String, f32>> {
         if self.classifiers.is_empty() {
             return Ok(BTreeMap::new());
         }
 
-        // Pass the f32 Vec by value so detect() moves it into the input
-        // tensor without a second copy.
         let samples_f32: Vec<f32> = audio_chunk
             .iter()
             .map(|&x| x as f32 * I16_TO_F32)
@@ -174,14 +160,10 @@ impl WakeWordModel {
         let emb_sequence = ndarray::stack(Axis(0), &views)?;
         let emb_input = emb_sequence.insert_axis(Axis(0));
 
-        // BTreeMap: sorted-key iteration keeps the "best score on tie"
-        // decision reproducible across runs.
         let mut predictions: BTreeMap<String, f32> = BTreeMap::new();
         let n_classifiers = self.classifiers.len();
         let mut emb_input = Some(emb_input);
         for (idx, (name, session)) in (&mut self.classifiers).into_iter().enumerate() {
-            // Move the array into the last (usually only) classifier; clone
-            // for the rest.
             let tensor_in = if idx + 1 == n_classifiers {
                 emb_input.take().unwrap()
             } else {
@@ -216,8 +198,6 @@ impl WakeWordModel {
 }
 
 fn build_session_from_file(path: &Path) -> Result<Session> {
-    // commit_from_file lets onnxruntime mmap the model instead of
-    // double-buffering through a Vec<u8>.
     let session = Session::builder()?
         .commit_from_file(path)
         .with_context(|| format!("load ONNX file: {}", path.display()))?;

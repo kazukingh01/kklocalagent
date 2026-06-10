@@ -1,7 +1,3 @@
-//! HTTP server: `POST /events` + `GET /health`. Events dispatch by `name`;
-//! unknown names are logged and acknowledged (forward-compat). Wake-gated
-//! dispatch lives in `state::WakeMachine`.
-
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -26,10 +22,6 @@ use crate::state::{DispatchOutcome, SpeechStartedOutcome, WakeMachine, WakeResul
 struct AppState {
     backends: Arc<Backends>,
     wake: Arc<WakeMachine>,
-    /// In-flight `run_turn` task handle. `WakeResult::BargeIn` aborts it
-    /// so every await inside run_turn tears down immediately. Set on
-    /// dispatch; taken-and-cleared by barge-in or by the task itself on
-    /// natural completion.
     inflight_turn: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
@@ -70,7 +62,6 @@ pub async fn run(config: Config) -> Result<()> {
 }
 
 async fn health() -> impl IntoResponse {
-    // Liveness only — backends down = degrade (log + drop), not refuse.
     (StatusCode::OK, Json(json!({"ok": true})))
 }
 
@@ -78,7 +69,6 @@ async fn events(
     State(state): State<AppState>,
     Json(ev): Json<EventEnvelope>,
 ) -> impl IntoResponse {
-    // Never log the full audio_base64 blob.
     info!(
         target: "orch::events",
         name = %ev.name,
@@ -106,8 +96,6 @@ async fn events(
                 );
                 return (StatusCode::OK, Json(json!({"ok": true})));
             }
-            // Drop logs share `event=` / `reason=` fields with the
-            // SpeechEnded drops below — `grep 'reason='` finds them all.
             match state.wake.on_speech_started() {
                 SpeechStartedOutcome::Bypass => {
                     info!(
@@ -173,8 +161,6 @@ async fn events(
             }
         }
         "SpeechEnded" => {
-            // Same echo pre-gate as SpeechStarted, before the wake machine
-            // sees it so neither phase nor permits move.
             if state.backends.in_tts_quiet_window() {
                 info!(
                     target: "orch::events",
@@ -258,7 +244,6 @@ async fn events(
             }
         }
         "WakeWordDetected" => {
-            // Forwarded to result_sink regardless of wake state.
             let payload = json!({
                 "name": "WakeWordDetected",
                 "model": ev.model,
@@ -314,9 +299,6 @@ async fn events(
                     if let Some(h) = state.inflight_turn.lock().expect("inflight poisoned").take() {
                         h.abort();
                     }
-                    // tts_stop cancels the streamer's speak and drains
-                    // audio-io's playback ring; spawned so the handler
-                    // returns 200 quickly even if the streamer is slow.
                     let backends_for_stop = state.backends.clone();
                     tokio::spawn(async move {
                         tts_stop(&backends_for_stop).await;
@@ -350,7 +332,6 @@ fn dispatch_utterance(
     ev: &EventEnvelope,
     guard: crate::state::ProcessingGuard,
 ) -> Result<()> {
-    // has_utterance_audio() has already established these.
     let b64 = ev
         .audio_base64
         .as_deref()
@@ -372,9 +353,6 @@ fn dispatch_utterance(
         // None, which is correct.
         let _ = inflight_slot.lock().expect("inflight poisoned").take();
     });
-    // try_dispatch returns Run only when no turn is Processing, so this
-    // slot must be empty; aborting an unexpected old handle is the safe
-    // fallback.
     if let Some(old) = state
         .inflight_turn
         .lock()

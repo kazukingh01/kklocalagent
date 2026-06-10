@@ -58,8 +58,6 @@ pub async fn start_services(state: &AppState) -> Result<(), AudioError> {
     *state.spk_tracks.lock().await = new_tracks;
     handles.playback = new_handles;
 
-    // AEC (issue #20). Both tasks subscribe to channels that already exist on
-    // AppState, so the `/spk` tee and `/mic` handler don't depend on them.
     if state.config.aec.enabled {
         let spf = state.config.audio.samples_per_frame();
         let mixer = tokio::spawn(reference_mixer_task(

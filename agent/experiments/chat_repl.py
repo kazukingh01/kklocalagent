@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""agent /api/chat を叩く最小 CLI REPL (issue #19 step 2 のテストハーネス).
-
-wire format と接続経路は orchestrator が叩くものと同一なので、
-ここで動けば voice 経由でも動く (はず)。依存は stdlib のみ。
-"""
+"""agent /api/chat を叩く最小 CLI REPL (issue #19 step 2 のテストハーネス)."""
 
 from __future__ import annotations
 
@@ -25,10 +21,9 @@ def session_info(url: str) -> dict:
 
 
 def chat_once(url: str, message: str) -> None:
-    """1 ターン分の往復。stdout に token を逐次 flush しながら書き出す。"""
     body = json.dumps(
         {
-            "model": "agent",  # agent 側は body.model を見ない
+            "model": "agent",
             "messages": [{"role": "user", "content": message}],
             "stream": True,
         }

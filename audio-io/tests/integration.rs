@@ -16,7 +16,6 @@ async fn spawn_test_server() -> SocketAddr {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    // Poll readiness instead of a fixed sleep — prevents CI flake.
     let client = reqwest::Client::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     loop {

@@ -1,26 +1,14 @@
-# Online (live-mic) test: subscribes to the Windows-native audio-io binary
-# so your microphone drives detection; dry-run sink, no orchestrator needed.
-# Prerequisites: audio-io.exe on Windows with `[server] host = "0.0.0.0"`
-# port 7010, and WINDOWS_HOST reachable from the WSL2 docker network
-# (default host.docker.internal; override in test/.env).
-# Run:  sudo docker compose -f compose.online.yaml up --build
-# then speak "alexa" and expect "[dry-run] would POST WakeWordDetected".
-
 services:
   wwd:
     build:
       context: ..
     container_name: kklocalagent-test-wwd-online
     environment:
-      # ?ts=1 opts into audio-io's per-frame epoch-ns header so the shim
-      # can log e2e_lag_ms (set WW_LOG_LEVEL=DEBUG to see it).
       WW_MIC_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/mic?ts=1
       WW_SINK_MODE: dry-run
       WW_MODELS: alexa
       WW_THRESHOLD: "0.5"
       WW_COOLDOWN_SEC: "2.0"
       WW_INFERENCE_FRAMEWORK: tflite
-    # Plain Linux docker doesn't resolve host.docker.internal by default;
-    # host-gateway maps it to the bridge gateway (harmless elsewhere).
     extra_hosts:
       - "host.docker.internal:host-gateway"

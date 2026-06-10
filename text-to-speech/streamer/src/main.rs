@@ -32,12 +32,8 @@ use tokio::time::{sleep, timeout, Instant};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
-/// 499 Client Closed Request — non-standard nginx code we use to
-/// distinguish a barge-in cancel from a network/synth error.
 const STATUS_CLIENT_CLOSED: u16 = 499;
 
-// audio-io wire format — must match audio-io README:
-//   s16le, 16 kHz, mono, 20 ms / frame = 640 bytes / frame.
 const SAMPLE_RATE: u32 = 16_000;
 const FRAME_MS: u64 = 20;
 const BYTES_PER_FRAME: usize = (SAMPLE_RATE as usize / 1000) * FRAME_MS as usize * 2;
@@ -49,12 +45,6 @@ struct Config {
     voicevox_speed_scale: f32,
     spk_url: Option<String>,
     audio_io_base: Option<String>,
-    /// Wall-clock interval (ms) between consecutive WS sends after the
-    /// initial prebuffer burst. 500 = per-batch audio length (realtime).
-    /// Lower overrates the wire to compensate for environment drift
-    /// (e.g. WSL2 hosts where audio-io's cpal hardware clock outpaces
-    /// our wall-clock by ~10 % — WS_PACING_MS=450 keeps the ring topped
-    /// up). Higher underrates → ring drains and underruns.
     ws_pacing_ms: u64,
 }
 
@@ -103,7 +93,6 @@ struct AppState {
     // /spk. `/append` shares it, so a continuation queues behind an
     // in-flight `/speak` rather than racing onto the WS.
     speak_permit: Arc<Semaphore>,
-    // Shared burst budget (issue #16); see `BurstBudget` below.
     burst_budget: Arc<Mutex<BurstBudget>>,
 }
 
@@ -120,12 +109,8 @@ struct AppState {
 /// seconds. A burst of S seconds adds S to the depth; a paced span
 /// maintains `depth_s` (feed = consume rate), so it only advances `at`.
 struct BurstBudget {
-    /// Seconds of audio in audio-io's ring as of `at`.
     depth_s: f32,
-    /// Reference instant for `depth_s`.
     at: Instant,
-    /// Maximum ring depth we'll push to — burst stops here. 5 s matches
-    /// the prebuffer the old single-`/speak` path unconditionally sent.
     capacity_s: f32,
 }
 
@@ -138,21 +123,15 @@ impl BurstBudget {
         }
     }
 
-    /// Expected ring depth right now, accounting for realtime drain
-    /// since `at`. Saturates at 0.
     fn current_depth_s(&self) -> f32 {
         let elapsed = self.at.elapsed().as_secs_f32();
         (self.depth_s - elapsed).max(0.0)
     }
 
-    /// How many more seconds can be burst-pushed before the ring is at
-    /// capacity.
     fn available_burst_s(&self) -> f32 {
         (self.capacity_s - self.current_depth_s()).max(0.0)
     }
 
-    /// Record a burst send of `secs` seconds, treated as instantaneous
-    /// on the wire: the entire `secs` lands in the ring immediately.
     fn record_burst(&mut self, secs: f32) {
         self.depth_s = self.current_depth_s() + secs;
         self.at = Instant::now();
@@ -166,16 +145,12 @@ impl BurstBudget {
         self.at = Instant::now();
     }
 
-    /// Forced reset (`/speak` after `/spk/stop` — the ring was dropped).
     fn reset(&mut self) {
         self.depth_s = 0.0;
         self.at = Instant::now();
     }
 }
 
-/// Burst capacity in seconds. Must match the audio length the old code
-/// unconditionally bursted (PREBUFFER_BATCHES × BATCH_MS = 10 × 500 ms
-/// = 5 s). If you tune this, audit `push_to_spk`'s pacing math too.
 const BURST_CAPACITY_S: f32 = 5.0;
 
 #[derive(Deserialize)]
@@ -244,21 +219,18 @@ async fn health() -> Json<Value> {
     Json(json!({"ok": true}))
 }
 
-/// api① — start of turn or barge-in: cancel + ring drop + budget reset.
 async fn speak(State(state): State<AppState>, Json(body): Json<SpeakBody>) -> Response {
     enter_speak(state, body.text, ApiMode::Speak).await
 }
 
-/// api② — continuation within the same turn: no cancel/reset, consumes
-/// the remaining burst headroom (issue #16).
 async fn append(State(state): State<AppState>, Json(body): Json<SpeakBody>) -> Response {
     enter_speak(state, body.text, ApiMode::Append).await
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ApiMode {
-    Speak,  // api① — reset budget + cancel previous
-    Append, // api② — keep current budget + no cancel
+    Speak,
+    Append,
 }
 
 async fn enter_speak(state: AppState, text: String, mode: ApiMode) -> Response {
@@ -411,8 +383,6 @@ async fn stop(State(state): State<AppState>) -> Json<Value> {
         }
         any_live
     };
-    // The abort above stops further WS pushes, but audio-io still has
-    // ring contents — /spk/stop drains it for a clean cut.
     if let Some(base) = state.cfg.audio_io_base.as_deref() {
         match state
             .http
@@ -425,19 +395,11 @@ async fn stop(State(state): State<AppState>) -> Json<Value> {
             Err(e) => warn!("POST /spk/stop failed: {}", e),
         }
     }
-    // Without this reset, /append-after-/stop would think the ring
-    // still holds the cancelled audio and refuse to burst.
     state.burst_budget.lock().await.reset();
     Json(json!({"ok": true, "cancelled": cancelled}))
 }
 
 async fn speak_one(state: AppState, text: String, prime: bool) -> Result<Value> {
-    // Abort only takes effect at .await boundaries — a task blocked in
-    // `reqwest::send().await` finishes the in-flight HTTP call before
-    // observing the cancel. Holding a permit for the whole
-    // synthesise→push pipeline guarantees the old task has fully
-    // released VOICEVOX and the /spk WS before the new one starts,
-    // even under barge-in races.
     let _permit = state
         .speak_permit
         .clone()
@@ -467,8 +429,6 @@ async fn speak_one(state: AppState, text: String, prime: bool) -> Result<Value> 
     // ~200 ms silence head-clip ("聞こえるよ" started mid-word).
     // audio-io is expected to be running via `autostart = true`.
 
-    // enter_speak bails before spawn if spk_url is None; surface a
-    // clean error rather than panicking if that invariant changes.
     let spk_url = state
         .cfg
         .spk_url
@@ -499,12 +459,6 @@ async fn speak_one(state: AppState, text: String, prime: bool) -> Result<Value> 
 }
 
 async fn synthesize(state: &AppState, text: &str, speaker: u32) -> Result<Vec<u8>> {
-    // /audio_query's response is the canonical input to /synthesis.
-    // Mutate only speedScale / outputSamplingRate / outputStereoToMono
-    // and leave every other key untouched so a future VOICEVOX schema
-    // change doesn't trip us up. Rendering at 16 kHz mono directly
-    // eliminates the prior ffmpeg pipe stage — we just strip the WAV
-    // header.
     let q = state
         .http
         .post(format!("{}/audio_query", state.cfg.voicevox_url))
@@ -539,10 +493,6 @@ async fn synthesize(state: &AppState, text: &str, speaker: u32) -> Result<Vec<u8
     Ok(r.bytes().await.context("read /synthesis body")?.to_vec())
 }
 
-/// Validate the WAV header against (16 kHz, mono, s16le) and return
-/// the data chunk's raw PCM bytes. Walks RIFF chunks rather than
-/// assuming the canonical 44-byte header so a VOICEVOX upgrade that
-/// adds an INFO chunk doesn't trip us up.
 fn parse_wav_pcm(bytes: &[u8]) -> Result<Vec<u8>> {
     if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         let head = String::from_utf8_lossy(&bytes[..bytes.len().min(200)]);
@@ -582,7 +532,6 @@ fn parse_wav_pcm(bytes: &[u8]) -> Result<Vec<u8>> {
             }
             _ => {}
         }
-        // RIFF chunks are word-aligned: skip a pad byte if size is odd.
         i = body_end + (chunk_size & 1);
     }
     let (format, channels, sample_rate, bits) =
@@ -602,9 +551,6 @@ fn parse_wav_pcm(bytes: &[u8]) -> Result<Vec<u8>> {
     data.ok_or_else(|| anyhow!("WAV has no data chunk"))
 }
 
-/// Stream `pcm` to audio-io's /spk WS, with pacing and WS send running
-/// as concurrent halves of this task.
-///
 /// Two concerns drive the structure:
 ///
 ///   1. **Batching to 500 ms / message** — amortises per-send overhead
@@ -624,10 +570,6 @@ fn parse_wav_pcm(bytes: &[u8]) -> Result<Vec<u8>> {
 /// share its cancellation (barge-in via speak_one's abort tears down
 /// the WS write immediately — a detached `tokio::spawn` would leak
 /// queued batches past /spk/stop).
-///
-/// Burst budget (issue #16): the first N batches are queued back-to-
-/// back, the rest paced at realtime; N comes from
-/// `burst_budget.available_burst_s()`.
 ///
 /// Returns when the last batch has been sent — does NOT wait for
 /// audio-io's ring to drain (that's /finalize's job).
@@ -651,7 +593,7 @@ async fn push_to_spk(
     // silence rather than the real head of this burst. A plain delay can't do
     // this — audio-io consumes that flush on the *first frame* it sees, so the
     // first frame must be a sacrificial one.
-    const PRIME_FRAMES: usize = 2; // 40 ms of silence
+    const PRIME_FRAMES: usize = 2;
     const PRIME_SETTLE_MS: u64 = 50;
 
     let connect_t = Instant::now();
@@ -666,9 +608,7 @@ async fn push_to_spk(
     let mut iter = pcm.chunks_exact(BYTES_PER_BATCH);
     let mut batches: Vec<Vec<u8>> = iter.by_ref().map(|c| c.to_vec()).collect();
     // Pad the trailing partial batch with zeros so audio-io's
-    // even-length parser accepts it and the tail isn't truncated. At
-    // most ~99 ms of trailing silence; /finalize's drain handshake
-    // makes the orchestrator's timing independent of this padding.
+    // even-length parser accepts it and the tail isn't truncated.
     let rem = iter.remainder();
     if !rem.is_empty() {
         let mut tail = Vec::with_capacity(BYTES_PER_BATCH);
@@ -677,10 +617,6 @@ async fn push_to_spk(
         batches.push(tail);
     }
 
-    // Burst-phase batch count from the ring headroom left (issue #16):
-    // full capacity right after /speak's reset, whatever drain has
-    // freed back at /append time. Capped at total_batches so a short
-    // utterance bursts entirely with no paced tail.
     let total_batches = batches.len();
     let available_s = burst_budget.lock().await.available_burst_s();
     let burst_batches = ((available_s * 1000.0 / BATCH_MS as f32) as usize).min(total_batches);
@@ -700,9 +636,6 @@ async fn push_to_spk(
     let pacing = async move {
         let mut batches_iter = batches.into_iter();
 
-        // Plan B: absorb a just-fired /spk/stop's producer-side flush on a
-        // throwaway silent frame so it doesn't eat the real head, then settle
-        // so audio-io's producer clears the flush before the real burst lands.
         if prime {
             let silent = vec![0u8; PRIME_FRAMES * BYTES_PER_FRAME];
             if tx.send(silent).await.is_ok() {
@@ -710,7 +643,6 @@ async fn push_to_spk(
             }
         }
 
-        // Burst phase: queue the first `burst_batches` back-to-back.
         for i in 0..burst_batches {
             let Some(batch) = batches_iter.next() else {
                 break;
@@ -802,8 +734,6 @@ async fn push_to_spk(
                 let remaining_wall = target
                     .duration_since(now_wall)
                     .unwrap_or(Duration::ZERO);
-                // Monotonic floor: protect against an unbounded burst
-                // if SystemTime stepped forward (NTP / VM resume).
                 let monotonic_remaining =
                     min_inter_send.saturating_sub(last_send_inst.elapsed());
                 let remaining = remaining_wall.max(monotonic_remaining);
@@ -850,10 +780,6 @@ async fn push_to_spk(
         if paced_batches > 0 {
             bb_for_pacing.lock().await.record_paced();
         }
-        // Both clocks reported so the operator can confirm the WSL2
-        // wall-vs-monotonic skew: a healthy run has both within a few
-        // ms; total_inst_ms << total_wall_ms is the smoking gun for
-        // the underrun pattern this whole construction is fixing.
         let total_inst = start_inst.elapsed();
         let total_wall = start_wall.elapsed().unwrap_or_default();
         info!(
@@ -865,17 +791,11 @@ async fn push_to_spk(
             wall_jumps,
             "pacing summary"
         );
-        // tx dropped on scope exit → rx.recv() returns None → writer
-        // drains remaining queued batches and closes the WS cleanly.
     };
 
     let writer = async move {
         let mut ws = ws;
         let mut sent = 0usize;
-        // Per-batch ws.send() timing: if the channel ever saturates,
-        // pacing's `tx.send().await` blocks and the decoupling
-        // effectively unwinds — the summary log makes that diagnosable
-        // post-hoc.
         let mut batch_idx = 0usize;
         let mut total_send: Duration = Duration::ZERO;
         let mut max_send: Duration = Duration::ZERO;
@@ -986,30 +906,22 @@ mod tests {
     ///   2. api②  available 3 s → burst 2 s.
     ///   3. api②  available 1 s → burst 1 s, pace 1 s.
     ///   4. api②  available 0 s → burst 0 s, pace 2 s.
-    ///
-    /// We can't sleep through realtime in a unit test, so this
-    /// exercises only the budget arithmetic (`record_burst` /
-    /// `available_burst_s`). The paced-span side effect is the time-
-    /// advancing `record_paced` — covered separately below.
     #[test]
     fn issue_16_worked_example_burst_amounts() {
         let mut b = BurstBudget::new(5.0);
         b.reset();
 
-        // Call 1 (api①): audio 2 s, all fits in fresh 5 s budget.
         assert!((b.available_burst_s() - 5.0).abs() < 1e-3);
         let burst1 = 2.0f32.min(b.available_burst_s());
         assert!((burst1 - 2.0).abs() < 1e-3);
         b.record_burst(burst1);
 
-        // Call 2 (api②): immediate. depth = 2 → 3 s headroom.
         let avail2 = b.available_burst_s();
         assert!(avail2 > 2.9 && avail2 < 3.05, "avail2={avail2}");
         let burst2 = 2.0f32.min(avail2);
         assert!((burst2 - 2.0).abs() < 1e-3);
         b.record_burst(burst2);
 
-        // Call 3 (api②): immediate. depth = 4 → 1 s headroom, paces 1 s.
         let avail3 = b.available_burst_s();
         assert!(avail3 > 0.9 && avail3 < 1.05, "avail3={avail3}");
         let burst3 = 2.0f32.min(avail3);
@@ -1017,19 +929,15 @@ mod tests {
         b.record_burst(burst3);
         b.record_paced();
 
-        // Call 4 (api②): immediate after pacing kept depth at 5 →
-        // 0 headroom, full 2 s is paced.
         let avail4 = b.available_burst_s();
         assert!(avail4 < 0.05, "avail4={avail4}");
     }
 
     #[test]
     fn budget_decays_with_realtime_drain() {
-        // Manually fast-forward `at` to simulate elapsed wall-clock.
         let mut b = BurstBudget::new(5.0);
         b.record_burst(5.0);
         assert!(b.available_burst_s() < 0.05);
-        // 3 s later, audio-io has drained 3 s of the burst → 3 s headroom.
         b.at = Instant::now() - Duration::from_secs(3);
         let avail = b.available_burst_s();
         assert!(avail > 2.9 && avail < 3.05, "avail={avail}");

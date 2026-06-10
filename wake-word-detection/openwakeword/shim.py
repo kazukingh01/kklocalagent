@@ -1,9 +1,3 @@
-"""Wake-word detection shim: audio-io /mic PCM → openWakeWord →
-WakeWordDetected POST to the orchestrator; serves /health for compose.
-Sink modes: ``orchestrator`` (real POST) or ``dry-run`` (log only — lets the
-online manual test run without an orchestrator stack).
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -23,13 +17,9 @@ from openwakeword.model import Model
 
 VALID_SINK_MODES = ("orchestrator", "dry-run")
 
-# openWakeWord wants chunks that are multiples of 80 ms
-# (1280 samples = 2560 bytes) for best efficiency.
 FRAME_BYTES = 2560
 SAMPLE_RATE_HZ = 16000
 
-# With ?ts=1, audio-io prepends a u64 LE epoch-ns of each frame's *last*
-# sample (see audio-io/src/ws.rs).
 TS_HEADER_BYTES = 8
 
 log = logging.getLogger("wwd")
@@ -56,11 +46,7 @@ class Shim:
         ]
         self.threshold = env_float("WW_THRESHOLD", 0.5)
         self.cooldown = env_float("WW_COOLDOWN_SEC", 2.0)
-        # > 0: periodically log the peak score per window for WW_THRESHOLD
-        # tuning; 0 (default) keeps the production event-driven cadence.
         self.peak_log_interval = env_float("WW_PEAK_LOG_INTERVAL_SEC", 0.0)
-        # Suppress peak logs below this — openWakeWord's tflite alexa model
-        # has a ~0.0–0.05 background-noise floor.
         self.peak_log_floor = env_float("WW_PEAK_LOG_FLOOR", 0.05)
         self.framework = os.environ.get("WW_INFERENCE_FRAMEWORK", "tflite")
         listen_str = os.environ.get("WW_LISTEN", "0.0.0.0:7030")
@@ -75,8 +61,6 @@ class Shim:
                 f"WW_SINK_MODE must be one of {VALID_SINK_MODES}, got {self.sink_mode!r}"
             )
 
-        # Detect ?ts=1 from the URL; no auto-append, so the offline smoke
-        # probe (raw PCM, no header) keeps working.
         try:
             qs = parse_qs(urlparse(self.mic_url).query)
             self.with_ts = qs.get("ts", [""])[0] == "1"
@@ -88,8 +72,6 @@ class Shim:
         self.ws_connected = False
         self.last_fire_ts = 0.0
         self.buffer = bytearray()
-        # epoch-ns of the newest PCM byte in `self.buffer`; with the bytes
-        # still buffered after a drain it yields per-predict end-to-end lag.
         self.last_frame_end_ns = 0
         self.peak_score = 0.0
         self.peak_model = ""
@@ -131,9 +113,6 @@ class Shim:
                 self.ws_connected = False
 
     async def process(self, msg: bytes) -> None:
-        # With ?ts=1 each frame is [8B u64 LE epoch-ns][s16le PCM]. The
-        # buffer accumulates because audio-io emits 20 ms frames but
-        # openWakeWord wants 80 ms chunks — four frames per predict.
         if self.with_ts:
             if len(msg) < TS_HEADER_BYTES:
                 log.warning("mic ws: dropping short frame (no ts header), len=%d", len(msg))
@@ -146,9 +125,6 @@ class Shim:
         while len(self.buffer) >= FRAME_BYTES:
             chunk = bytes(self.buffer[:FRAME_BYTES])
             del self.buffer[:FRAME_BYTES]
-            # The drained window's last-sample time is last_frame_end_ns
-            # minus the duration of whatever is still buffered (which is
-            # all newer than the window).
             window_end_ns = 0
             if self.with_ts:
                 remaining_samples = len(self.buffer) // 2
@@ -163,8 +139,6 @@ class Shim:
             scores = await asyncio.to_thread(self.model.predict, frame)
             now = time.time()
             if self.with_ts and window_end_ns > 0:
-                # capture→predict lag; the headline number for the 1 s
-                # wake-word latency budget (mirrors the runtime's e2e_lag_ms).
                 e2e_lag_ms = int(now * 1_000) - (window_end_ns // 1_000_000)
                 log.debug("predict done e2e_lag_ms=%d", e2e_lag_ms)
             if (now - self.last_fire_ts) < self.cooldown:
@@ -219,8 +193,6 @@ class Shim:
     async def start_http(self) -> None:
         app = web.Application()
         app.router.add_get("/health", self.health)
-        # access_log=None: the HEALTHCHECK pings /health every 10 s and
-        # aiohttp's per-request INFO line is too chatty for production.
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
         site = web.TCPSite(runner, self.listen_host, self.listen_port)
@@ -240,8 +212,6 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    # The compose stacks document WW_LOG_LEVEL=DEBUG as the way to surface
-    # e2e_lag_ms etc.
     raw_level = os.environ.get("WW_LOG_LEVEL", "INFO").upper()
     level = logging.getLevelName(raw_level)
     if not isinstance(level, int):

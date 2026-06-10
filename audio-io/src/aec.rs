@@ -21,25 +21,16 @@ use crate::pcm::{bytes_to_i16, i16_to_bytes};
 pub use mixer::ReferenceMixer;
 pub use nlms::Aec;
 
-/// Per-frame diagnostics for the `aec stats` log line; backends that don't
-/// expose a field leave it at 0.
 #[derive(Default, Clone, Copy)]
 pub struct CancellerStats {
-    /// Applied bulk pre-delay (ms).
     pub delay_ms: u32,
-    /// Total estimated echo delay (ms).
     pub peak_ms: u32,
-    /// Measured residual-echo ratio.
     pub erl: f32,
-    /// Residual-suppressor gain (1.0 = none).
     pub nlp_gain: f32,
-    /// L2 norm of the adaptive weights (convergence indicator).
     pub w_l2: f32,
 }
 
-/// A pluggable acoustic echo canceller, selected by `aec.backend`.
 pub trait EchoCanceller: Send {
-    /// Cancel the echo of `far` from `near` (one frame each, equal length).
     fn process_frame(&mut self, near: &[i16], far: &[i16]) -> Vec<i16>;
     fn stats(&self) -> CancellerStats {
         CancellerStats::default()
@@ -50,8 +41,6 @@ fn sum_sq(samples: &[i16]) -> f64 {
     samples.iter().map(|&s| (s as f64) * (s as f64)).sum()
 }
 
-/// Drains per-track far-end frames into the [`ReferenceMixer`] and publishes
-/// one mixed frame every `frame_ms` on `ref_tx`.
 pub async fn reference_mixer_task(
     mut ref_in_rx: broadcast::Receiver<(usize, Bytes)>,
     ref_tx: broadcast::Sender<Bytes>,
@@ -62,8 +51,6 @@ pub async fn reference_mixer_task(
 ) {
     let mut mixer = ReferenceMixer::new(sample_rate, samples_per_frame, n_tracks);
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(frame_ms as u64));
-    // Report backlog drops ~once per second so a playback clock outrunning the
-    // mix timer is visible rather than silent.
     let warn_every = (1000 / frame_ms.max(1)).max(1) as u64;
     let mut ticks: u64 = 0;
     let mut last_dropped: u64 = 0;
@@ -120,7 +107,7 @@ pub async fn aec_task(
     let max_backlog = (sample_rate as usize / 4).max(1);
     let mut far_pending: VecDeque<i16> = VecDeque::new();
 
-    let log_every = (sample_rate as usize / 2).max(1); // ~0.5 s of samples
+    let log_every = (sample_rate as usize / 2).max(1);
     let mut near_sq = 0.0f64;
     let mut far_sq = 0.0f64;
     let mut resid_sq = 0.0f64;
@@ -171,10 +158,7 @@ pub async fn aec_task(
                         let near_rms = (near_sq / denom).sqrt();
                         let far_rms = (far_sq / denom).sqrt();
                         let resid_rms = (resid_sq / denom).sqrt();
-                        // Diagnostics: enable with RUST_LOG=audio_io::aec=debug;
-                        // gated on actual playback/speech so idle is silent.
                         if near_rms > 30.0 || far_rms > 30.0 {
-                            // erle_db is the backend-agnostic comparison metric.
                             let erle_db = 20.0 * (near_rms / resid_rms.max(1.0)).log10();
                             let s = canceller.stats();
                             debug!(

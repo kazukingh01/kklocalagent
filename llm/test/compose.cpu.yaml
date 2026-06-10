@@ -1,5 +1,3 @@
-# CPU-only LLM smoke test.
-
 x-model: &model "gemma3:1b"
 
 services:
@@ -20,8 +18,6 @@ services:
     container_name: kklocalagent-test-llm-probe
     depends_on:
       llm:
-        # Gated on the HEALTHCHECK in ../Dockerfile so this fires only
-        # after the model pull completes.
         condition: service_healthy
     environment:
       MODEL: *model

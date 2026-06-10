@@ -1,8 +1,3 @@
-# Offline smoke test — no audio-io needed; the probe fakes both the mic WS
-# and the orchestrator /events sink. Run from this directory:
-#   sudo docker compose -f compose.offline.yaml up --build \
-#       --abort-on-container-exit --exit-code-from probe
-
 services:
   probe:
     build:
@@ -24,8 +19,6 @@ services:
       WW_MIC_URL: ws://probe:9100
       WW_ORCHESTRATOR_URL: http://probe:9200/events
       WW_MODELS: alexa
-      # alexa_test.wav is from openWakeWord's own test suite, so a
-      # conservative threshold is fine.
       WW_THRESHOLD: "0.5"
       WW_COOLDOWN_SEC: "2.0"
       WW_INFERENCE_FRAMEWORK: tflite

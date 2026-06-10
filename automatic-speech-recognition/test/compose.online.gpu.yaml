@@ -1,7 +1,3 @@
-# GPU override on top of compose.online.yaml (needs nvidia-container-toolkit):
-#   sudo WINDOWS_HOST=$(ip route show | awk '/default/ {print $3; exit}') \
-#       docker compose -f compose.online.yaml -f compose.online.gpu.yaml up --build
-
 services:
   automatic-speech-recognition:
     build:

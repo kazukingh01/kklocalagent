@@ -19,8 +19,6 @@ pub async fn ws_mic(
     Query(params): Query<HashMap<String, String>>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    // `?ts=1` prepends an 8-byte LE u64 (epoch ns of the frame's *last*
-    // sample) to each PCM frame.
     let with_ts = matches!(params.get("ts").map(String::as_str), Some("1"));
     ws.on_upgrade(move |socket| handle_mic(socket, state, with_ts))
 }
@@ -166,10 +164,6 @@ async fn handle_spk(mut socket: WebSocket, state: AppState, track_id: usize) {
                 pcm_frames_received = pcm_frames_received.saturating_add(1);
             }
             Ok(Message::Text(text)) => {
-                // EOS/drain handshake: client sends `{"type":"eos"}` after the
-                // last PCM frame; we reply `{"type":"drained"}` once the cpal
-                // ring is confirmed empty, so the speaker has *actually*
-                // finished. Unknown types are ignored for forward compat.
                 let parsed: Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
                     Err(e) => {

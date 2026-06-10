@@ -1,6 +1,3 @@
-# Integration-test variant of the audio-io stub. Repo-root build
-# context so fixtures COPY from sibling modules without bind mounts.
-
 FROM python:3.12-slim
 
 RUN apt-get update \
@@ -10,7 +7,7 @@ RUN apt-get update \
 RUN pip install --no-cache-dir 'websockets>=12,<14'
 
 # jfk.wav is .gitignored in the asr module (fetched on demand by its
-# fetch-sample.sh), so pull it at build time to stay self-contained.
+# fetch-sample.sh), so it cannot be COPYed; pull it at build time.
 RUN mkdir -p /samples && \
     curl -L --fail \
         -o /samples/jfk.wav \
@@ -18,8 +15,6 @@ RUN mkdir -p /samples && \
 
 COPY wake-word-detection/openwakeword/test/data/alexa_test.wav /samples/alexa.wav
 
-# Reuse the ASR smoke's stub.py (already supports SAMPLE_PATHS multi-clip
-# playback) — one source of truth.
 COPY automatic-speech-recognition/test/mic-stub/stub.py /app/stub.py
 
 WORKDIR /app

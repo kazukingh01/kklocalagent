@@ -14,14 +14,11 @@ use crate::config::{Config, DiagConfig, SinkMode};
 use crate::detector::{Event, SpeechFsm};
 use wav_utils::wav_from_pcm_s16le_mono;
 
-/// Accumulates RMS + speech_ratio over a frame window and logs a summary.
 struct Diag {
     enabled: bool,
     window_frames: u32,
     frames: u32,
     voiced: u32,
-    /// Running sum of per-frame mean-square values across the current window.
-    /// Window RMS = sqrt(this / frames).
     sum_of_frame_mean_sq: u64,
 }
 
@@ -40,8 +37,6 @@ impl Diag {
         if !self.enabled {
             return;
         }
-        // Summing squares of i16 into u64 can't overflow for any reasonable
-        // frame length (320 * 32768^2 ≈ 3.4e11 ≪ u64 max).
         let sumsq: u64 = samples
             .iter()
             .map(|s| {
@@ -58,8 +53,6 @@ impl Diag {
             let mean_sq = self.sum_of_frame_mean_sq as f64 / self.frames as f64;
             let rms = mean_sq.sqrt() as u32;
             let ratio = self.voiced as f32 / self.frames as f32;
-            // Debug-level: too chatty for production INFO. Re-enable via
-            // `RUST_LOG=info,vad::diag=debug` when investigating false triggers.
             debug!(
                 target: "vad::diag",
                 "[diag] rms={rms} speech_ratio={ratio:.2} ({}/{} voiced)",
@@ -76,15 +69,10 @@ impl Diag {
 pub async fn run(config: Config) -> Result<()> {
     let cfg = Arc::new(config);
     let http = Arc::new(
-        // No global timeout: asr_timeout_ms / orchestrator_timeout_ms are
-        // applied per-POST so the two stages have independent budgets.
         reqwest::Client::builder()
             .build()
             .context("build reqwest client")?,
     );
-    // Bound in-flight POSTs; excess utterances are dropped with a warning so
-    // backpressure is visible instead of presenting as silent timeouts.
-    // Created outside the reconnect loop so a WS flap doesn't reset state.
     let asr_inflight = Arc::new(Semaphore::new(cfg.sink.asr_max_inflight as usize));
     let orchestrator_inflight =
         Arc::new(Semaphore::new(cfg.sink.orchestrator_max_inflight as usize));
@@ -141,8 +129,6 @@ async fn connect_and_run(
 
     let bytes_per_frame = cfg.detector.bytes_per_frame();
     let samples_per_frame = cfg.detector.samples_per_frame();
-    // Built once per session so RNNoise state and rubato FFT plans amortise;
-    // None keeps the audio path byte-identical to the pre-denoise build.
     let mut denoiser = if cfg.detector.denoise {
         if cfg.detector.sample_rate != 16_000 {
             anyhow::bail!(
@@ -167,8 +153,6 @@ async fn connect_and_run(
     // us because tokio-tungstenite doesn't auto-respond to Pings — the write
     // half has to echo them. Today we rely on the reconnect loop to recover.
     let (_write, mut read) = ws.split();
-    // Carry-over buffer: audio-io sends 20 ms frames but the WebSocket layer
-    // may merge or split them, so we re-slice at bytes_per_frame boundaries.
     let mut scratch: Vec<u8> = Vec::with_capacity(bytes_per_frame * 4);
     let mut samples: Vec<i16> = Vec::with_capacity(samples_per_frame);
 
@@ -249,8 +233,6 @@ async fn connect_and_run(
     Ok(())
 }
 
-/// RMS dBFS of an s16le PCM buffer (0 dBFS = full-scale i16). Returns
-/// `f32::NEG_INFINITY` on empty input or digital silence.
 fn rms_dbfs_i16le(buf: &[u8]) -> f32 {
     let n = buf.len() / 2;
     if n == 0 {
@@ -335,8 +317,6 @@ fn handle_event(
         SinkMode::Orchestrator => {
             info!(target: "vad::sink", "[orchestrator <-] {} bytes",
                   json.len());
-            // Separate semaphore from asr-direct so a slow ASR doesn't
-            // starve VAD-event delivery; drop instead of queue when full.
             let permit = match orchestrator_inflight.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
@@ -377,7 +357,7 @@ fn handle_event(
                 let url = asr_url.to_string();
                 let timeout_ms = asr_timeout_ms;
                 tokio::spawn(async move {
-                    let _permit = permit; // released on drop after the POST
+                    let _permit = permit;
                     match post_wav_to_asr(&client, &url, wav, timeout_ms).await {
                         Ok(text) => info!(
                             target: "vad::asr",
@@ -417,7 +397,6 @@ async fn post_wav_to_asr(
     if !status.is_success() {
         anyhow::bail!("ASR responded {status}: {body}");
     }
-    // whisper-server with response_format=json returns {"text": "..."}.
     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
     let text = parsed
         .get("text")
@@ -499,7 +478,6 @@ mod tests {
 
     #[test]
     fn rms_dbfs_full_scale_sine_is_near_minus_three() {
-        // Full-scale sine RMS = peak / sqrt(2) = -3.01 dBFS.
         let mut buf = Vec::with_capacity(320 * 2);
         for i in 0..320 {
             let s = ((i as f32 * 440.0 * 2.0 * std::f32::consts::PI / 16_000.0).sin()
@@ -515,7 +493,6 @@ mod tests {
 
     #[test]
     fn rms_dbfs_quiet_noise_below_minus_forty() {
-        // ±100 LSB pseudo-random "ambient noise". -100/32768 ≈ -50 dBFS.
         let mut buf = Vec::with_capacity(320 * 2);
         for i in 0..320 {
             let s = (((i * 73) % 200) as i16) - 100;

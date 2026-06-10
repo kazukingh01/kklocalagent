@@ -1,14 +1,9 @@
-//! Offline AEC harness for human A/B listening (issue #20): runs the
-//! production [`audio_io::aec::Aec`] over WAV files and writes before/after
-//! WAVs — the verification that automated ERLE asserts can't fully capture.
-//! Run with `--help` for usage; inputs must be 16 kHz 16-bit PCM WAV.
-
 use std::path::Path;
 
 use audio_io::aec::Aec;
 
 const RATE: u32 = 16000;
-const FRAME: usize = 320; // 20 ms @ 16 kHz
+const FRAME: usize = 320;
 
 fn read_wav_mono_i16(path: &str) -> Result<Vec<i16>, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
@@ -74,8 +69,8 @@ fn write_wav_mono_i16(path: &Path, samples: &[i16]) -> Result<(), String> {
     wav.extend_from_slice(b"WAVE");
     wav.extend_from_slice(b"fmt ");
     wav.extend_from_slice(&16u32.to_le_bytes());
-    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
     wav.extend_from_slice(&RATE.to_le_bytes());
     wav.extend_from_slice(&(RATE * 2).to_le_bytes());
     wav.extend_from_slice(&2u16.to_le_bytes());
@@ -169,16 +164,12 @@ fn main() -> Result<(), String> {
             .collect()
     };
 
-    // Frame-by-frame as the live path; the bulk delay is auto-estimated inside
-    // the AEC, no hint is passed.
     let mut aec = Aec::new(RATE, filter_ms);
     let mut residual = Vec::with_capacity(near.len());
     let mut i = 0;
     while i < near.len() {
         let end = (i + FRAME).min(near.len());
         let near_f = &near[i..end];
-        // Far reference aligned index-for-index with near (undelayed — the
-        // AEC's internal delay line models the transport delay).
         let far_f: Vec<i16> = (i..end)
             .map(|j| far_mix.get(j).copied().unwrap_or(0))
             .collect();

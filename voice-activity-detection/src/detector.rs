@@ -6,8 +6,6 @@ enum State {
     Speaking,
 }
 
-/// Events emitted by [`SpeechFsm`]. Serialized with `{"name": "...", ...}`
-/// shape so the envelope is flat on the wire.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "name")]
 pub enum Event {
@@ -21,9 +19,6 @@ pub enum Event {
     },
 }
 
-/// Two-state speech segmenter driven by per-frame `is_speech` decisions.
-/// While `Speaking`, frames are buffered; on `SpeechEnded` the buffer is
-/// exposed via [`SpeechFsm::utterance_buffer`] and reset on the next start.
 pub struct SpeechFsm {
     state: State,
     voiced_run: u32,
@@ -129,7 +124,7 @@ mod tests {
         let mut fsm = SpeechFsm::new(3, 20, 1500);
         fsm.push_frame(&frame(), true);
         fsm.push_frame(&frame(), true);
-        fsm.push_frame(&frame(), false); // reset
+        fsm.push_frame(&frame(), false);
         assert!(fsm.push_frame(&frame(), true).is_none());
         assert!(fsm.push_frame(&frame(), true).is_none());
         assert!(matches!(
@@ -142,7 +137,6 @@ mod tests {
     fn ends_after_hang_frames_silence() {
         let mut fsm = SpeechFsm::new(2, 3, 1500);
         assert!(fsm.push_frame(&frame(), true).is_none());
-        // voiced_run=2 → SpeechStarted, utterance_frames=1
         assert!(matches!(
             fsm.push_frame(&frame(), true),
             Some(Event::SpeechStarted { .. })
@@ -151,7 +145,6 @@ mod tests {
         fsm.push_frame(&frame(), true);
         fsm.push_frame(&frame(), false);
         fsm.push_frame(&frame(), false);
-        // Third silent frame → silent_run=3 ≥ hang_frames → SpeechEnded
         let ev = fsm.push_frame(&frame(), false);
         let Some(Event::SpeechEnded {
             duration_frames,
@@ -179,7 +172,6 @@ mod tests {
         let Some((i, Event::SpeechEnded { duration_frames, .. })) = ended_at else {
             panic!("expected forced end, got {ended_at:?}");
         };
-        // 1 start frame + 4 loop iterations → frames=5, cap reached
         assert_eq!(i, 3);
         assert_eq!(duration_frames, 5);
     }
@@ -187,9 +179,9 @@ mod tests {
     #[test]
     fn restart_after_end_works() {
         let mut fsm = SpeechFsm::new(1, 2, 1500);
-        fsm.push_frame(&frame(), true); // start #1
+        fsm.push_frame(&frame(), true);
         fsm.push_frame(&frame(), false);
-        fsm.push_frame(&frame(), false); // end #1
+        fsm.push_frame(&frame(), false);
         assert!(!fsm.is_speaking());
         let ev = fsm.push_frame(&frame(), true);
         assert!(matches!(ev, Some(Event::SpeechStarted { .. })));

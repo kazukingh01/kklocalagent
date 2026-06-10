@@ -1,7 +1,3 @@
-"""Smoke test probe: WS server (:9100) streams alexa_test.wav as audio-io
-style 20 ms PCM frames; HTTP server (:9200) receives POST /events and exits
-0 on the first WakeWordDetected (1 after PROBE_TIMEOUT_SEC)."""
-
 from __future__ import annotations
 
 import asyncio
@@ -19,13 +15,12 @@ WS_PORT = int(os.environ.get("PROBE_WS_PORT", "9100"))
 HTTP_PORT = int(os.environ.get("PROBE_HTTP_PORT", "9200"))
 TIMEOUT_SEC = float(os.environ.get("PROBE_TIMEOUT_SEC", "60"))
 
-# 20ms frame at 16kHz s16le mono = 320 samples × 2 bytes
 FRAME_BYTES = 640
 SILENCE_FRAME = b"\x00" * FRAME_BYTES
 # predict_clip in openWakeWord defaults to 1s padding; mirror that so
 # short WAVs (alexa_test.wav is 0.625s) have enough context.
-LEAD_SILENCE_FRAMES = 50   # 1s
-TAIL_SILENCE_FRAMES = 50   # 1s
+LEAD_SILENCE_FRAMES = 50
+TAIL_SILENCE_FRAMES = 50
 LOOP_COUNT = 3
 
 log = logging.getLogger("probe")
@@ -46,8 +41,6 @@ async def ws_handler(ws: websockets.WebSocketServerProtocol) -> None:
     log.info("ws client connected")
     pcm = load_pcm(WAV_PATH)
     try:
-        # Feed real-time at 20 ms/frame — openWakeWord's sliding window
-        # expects live-mic cadence.
         async def send_frames(frames_iter):
             for frame in frames_iter:
                 if detected.is_set():

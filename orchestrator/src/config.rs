@@ -14,7 +14,6 @@ pub struct Config {
     pub result_sink: ResultSinkConfig,
 }
 
-/// Optional outbound event forwarder; empty `url` disables it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ResultSinkConfig {
@@ -25,8 +24,6 @@ pub struct ResultSinkConfig {
 impl Default for ResultSinkConfig {
     fn default() -> Self {
         Self {
-            // timeout_ms >= 1 here matters: the env-override path uses
-            // Config::default(), which bypasses serde defaults.
             url: String::new(),
             timeout_ms: 5_000,
         }
@@ -44,8 +41,6 @@ pub struct ServerConfig {
 pub struct AsrConfig {
     pub url: String,
     pub timeout_ms: u64,
-    /// 1 mirrors whisper-server's own single-request behaviour; raise only
-    /// if the backend was compiled with request batching.
     pub max_inflight: u32,
     /// Substring blacklist for known Whisper hallucinations on near-silence
     /// (Whisper fills ambiguous quiet input with stock YouTube end-of-video
@@ -57,21 +52,15 @@ pub struct AsrConfig {
 #[serde(default)]
 pub struct LlmConfig {
     pub url: String,
-    /// Must exist in the LLM container's model cache.
     pub model: String,
-    /// Empty (the default) sends no system message at all.
     pub system_prompt: String,
     pub timeout_ms: u64,
     pub max_inflight: u32,
 }
 
-/// TTS speak channel; empty `url` skips the TTS stage entirely.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct TtsConfig {
-    /// `tts-streamer` `/speak` URL, used for the **first** sentence of a
-    /// turn. `/speak` cancels any in-flight utterance, drops audio-io's
-    /// ring, and starts with a full 5 s burst budget.
     pub url: String,
     /// `tts-streamer` `/append` URL, used for the **second and later**
     /// sentences. Unlike `/speak` it doesn't cancel or re-burst — this
@@ -81,8 +70,6 @@ pub struct TtsConfig {
     /// because `/speak` FIFO-aborts the previous task, cutting sentence
     /// N mid-stream when sentence N+1 arrives.
     pub append_url: String,
-    /// `tts-streamer` `/stop` URL, POSTed on barge-in to cancel in-flight
-    /// TTS. Empty disables the cancel side-effect.
     pub stop_url: String,
     /// `tts-streamer` `/finalize` URL. tts-streamer sends EOS and awaits
     /// audio-io's drained reply, so the HTTP response is the precise
@@ -90,10 +77,7 @@ pub struct TtsConfig {
     /// `tail_quiet_ms` must cover audio-io's playback ring drain time
     /// *and* VAD's hangover, not just the latter.
     pub finalize_url: String,
-    /// Generous: the upstream call covers VOICEVOX synthesis + realtime
-    /// WS streaming — a 5-second utterance physically takes 5 s to push.
     pub timeout_ms: u64,
-    /// 1 mirrors the streamer's own single-flight lock.
     pub max_inflight: u32,
     /// After each turn's TTS completes, drop all VAD events for this many
     /// extra ms. Even with the finalize drain handshake, VAD's silence
@@ -102,31 +86,15 @@ pub struct TtsConfig {
     /// margin. 400 ms covers hang_frames up to ~15; 0 disables (only
     /// safe with upstream AEC).
     pub tail_quiet_ms: u64,
-    /// Short ack phrase spoken via `/speak` when a wake is accepted; empty
-    /// disables. NOTE: it plays during the post-wake listen window, so its
-    /// own audio can reach the mic — rely on audio-io AEC (or keep it very
-    /// short) to avoid self-firing VAD.
     pub wake_ack_text: String,
 }
 
-/// Wake-word gating state machine:
-///   - Wake arms a `wake_window_ms` window for SpeechStarted.
-///   - SpeechStarted within the window → Listening (no timeout) →
-///     SpeechEnded → run pipeline.
-///   - Pipeline finish opens a `turn_followup_window_ms` window for the
-///     next SpeechStarted (follow-up without re-saying the wake word).
-///   - Either window expiring → back to Idle (re-wake required).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct WakeConfig {
-    /// False = always-listening mode (every SpeechEnded runs the pipeline).
     pub required: bool,
     pub wake_window_ms: u64,
     pub turn_followup_window_ms: u64,
-    /// When true, a WakeWordDetected during `Processing` cancels in-flight
-    /// TTS via `tts.stop_url` and transitions to `ArmedAfterWake`. When
-    /// false, mid-turn wakes defer: the current reply finishes, then the
-    /// next state becomes `ArmedAfterWake`.
     pub barge_in: bool,
     /// SpeechEnded events within this many ms of the most recent wake are
     /// dropped. Guards against VAD firing SE for the wake word's own audio
@@ -264,20 +232,12 @@ impl Config {
         if !self.result_sink.url.is_empty() && self.result_sink.timeout_ms == 0 {
             anyhow::bail!("result_sink.timeout_ms must be >= 1 when url is set");
         }
-        // Without stop_url, a barge-in mid-TTS can't make the in-flight
-        // /speak return early and blocks until its HTTP timeout (default
-        // 60 s) before the next turn can take the TTS permit — refuse the
-        // mis-config at startup. Moot when tts.url is empty.
         if self.wake.barge_in && !self.tts.url.is_empty() && self.tts.stop_url.is_empty() {
             anyhow::bail!(
                 "wake.barge_in=true requires tts.stop_url when tts.url is set \
                  (without it, mid-TTS barge-in blocks until the /speak HTTP timeout)"
             );
         }
-        // With finalize_url empty, tail_quiet_ms must absorb audio-io's
-        // playback-ring drain time *and* VAD hangover — the default 400 ms
-        // is no longer enough. Warn rather than bail because the test path
-        // deliberately runs without finalize_url.
         if !self.tts.url.is_empty() && self.tts.finalize_url.is_empty() {
             warn!(
                 target: "orch::config",
@@ -344,7 +304,6 @@ mod tests {
 
     #[test]
     fn tts_url_without_append_url_is_rejected() {
-        // issue #16: url を入れた以上 append_url も必須。
         let mut cfg = Config::default();
         cfg.tts.url = "http://tts:7070/speak".into();
         cfg.tts.append_url = String::new();

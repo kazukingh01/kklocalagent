@@ -1,5 +1,4 @@
 #!/bin/sh
-# whisper.cpp's bundled JFK clip: ~11 s, 16 kHz mono, public domain.
 
 set -e
 

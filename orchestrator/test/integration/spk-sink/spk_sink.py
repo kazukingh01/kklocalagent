@@ -1,6 +1,3 @@
-"""spk-sink: integration-test stub for audio-io's /spk endpoint — counts
-received WS frames and exposes the counters at GET /stats."""
-
 from __future__ import annotations
 
 import asyncio
@@ -16,7 +13,6 @@ WS_PORT = int(os.environ.get("WS_PORT", "7010"))
 HTTP_HOST = os.environ.get("HTTP_HOST", "0.0.0.0")
 HTTP_PORT = int(os.environ.get("HTTP_PORT", "7011"))
 
-# audio-io wire format (must match): 16 kHz s16le mono, 20 ms = 640 B
 EXPECTED_FRAME_BYTES = 640
 
 log = logging.getLogger("spk-sink")
@@ -40,7 +36,6 @@ async def ws_handler(ws) -> None:
                 if any(b != 0 for b in msg):
                     stats["non_silent_bytes"] += len(msg)
             else:
-                # Text frames aren't part of the audio-io wire format.
                 pass
     except websockets.ConnectionClosed:
         pass

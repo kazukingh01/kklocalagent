@@ -1,9 +1,3 @@
-//! Ingester/predictor task split: the ingester keeps a shared ring of the
-//! latest audio window so a slow predict never stalls the WS drain; the
-//! predictor ticks on wallclock (ticks coalesce via MissedTickBehavior::Skip)
-//! and runs the sync model via spawn_blocking. The model mutex is
-//! single-locker, existing only to satisfy `Send`/`'static` for the spawn.
-
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,11 +12,8 @@ use crate::config::Config;
 use crate::wakeword::WakeWordModel;
 use crate::{Detection, MicFrame};
 
-/// audio-io always emits at this rate; the model is configured to match.
 const SAMPLE_RATE_HZ: u32 = 16_000;
 
-/// `latest_end_epoch_ns` mirrors the newest frame's stamp so the predictor
-/// can compute lag off a snapshot without holding the lock.
 struct Ring {
     samples: VecDeque<i16>,
     capacity: usize,
@@ -35,8 +26,6 @@ pub async fn run(
     tx: mpsc::Sender<Detection>,
     model_loaded: Arc<AtomicBool>,
 ) -> Result<()> {
-    // ONNX init parses several MB and takes hundreds of ms — keep it off
-    // the runtime worker.
     let classifier_paths = cfg.model_paths.clone();
     let mel_path = cfg.mel_onnx_path.clone();
     let emb_path = cfg.embedding_onnx_path.clone();
@@ -98,9 +87,6 @@ pub async fn run(
     }
 }
 
-/// Drain the ws_client mpsc into the ring; mutex is never held across
-/// `.await`. On `PoisonError` we recover via `into_inner()` — panicking here
-/// would tear down `run()`'s select! including the ws_client reconnect loop.
 async fn ingest(mut rx: mpsc::Receiver<MicFrame>, ring: Arc<std::sync::Mutex<Ring>>) {
     while let Some(frame) = rx.recv().await {
         let n = frame.samples.len();
@@ -152,8 +138,6 @@ impl ConfirmGate {
         }
     }
 
-    /// Returns `(confirmed, have)`; `have` counts in-window detections
-    /// INCLUDING this one, taken before the on-confirm history clear.
     fn record(&mut self, now: Instant) -> (bool, usize) {
         self.times.push_back(now);
         while self
@@ -173,8 +157,6 @@ impl ConfirmGate {
     }
 }
 
-/// A slow predict only delays its own next tick (`MissedTickBehavior::Skip`);
-/// the ingester keeps draining the WS the whole time.
 async fn predict_loop(
     cfg: Config,
     ring: Arc<std::sync::Mutex<Ring>>,
@@ -191,7 +173,7 @@ async fn predict_loop(
     let mut last_peak_log = Instant::now();
 
     // Snapshot buffer round-trips through spawn_blocking each tick so the
-    // allocation is reused (~64 KB at 10 Hz → avoids ~640 KB/s of churn).
+    // allocation is reused.
     let cap = (cfg.predict_window_ms as usize) * (SAMPLE_RATE_HZ as usize) / 1000;
     let mut snapshot_buf: Vec<i16> = Vec::with_capacity(cap);
 
@@ -229,9 +211,6 @@ async fn predict_loop(
         let model_clone = Arc::clone(&model);
         let join = tokio::task::spawn_blocking(move || {
             let result = {
-                // Recover from PoisonError — the mutex is single-locker, so
-                // poison can only come from a prior predict() panic; retrying
-                // is safe and recurring failures hit the warn! path below.
                 let mut m = match model_clone.lock() {
                     Ok(g) => g,
                     Err(poisoned) => poisoned.into_inner(),
@@ -278,8 +257,6 @@ async fn predict_loop(
         if let Some((name, &score)) = best {
             if !in_cooldown && score >= cfg.threshold {
                 last_fire = Some(now);
-                // A false positive rarely repeats within a few seconds, so
-                // e.g. 2-within-3s suppresses spurious fires.
                 let (confirmed, have) = confirm.record(now);
                 info!(
                     model = %name,
@@ -332,8 +309,6 @@ fn epoch_ns_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Signed `a - b` in ms; negative means the frame timestamp is ahead of the
-/// local clock (cross-host skew, expected small in compose).
 fn ns_diff_ms(a: u64, b: u64) -> i64 {
     if a >= b {
         ((a - b) / 1_000_000) as i64
@@ -394,8 +369,6 @@ mod tests {
         let t0 = Instant::now();
         assert_eq!(gate.record(t0), (false, 1));
         assert_eq!(gate.record(t0 + Duration::from_millis(2000)), (true, 2));
-        // Confirm cleared history → lone detection does not re-confirm,
-        // and a follow-up outside the window still leaves only one in-window.
         assert_eq!(gate.record(t0 + Duration::from_millis(5000)), (false, 1));
         assert_eq!(gate.record(t0 + Duration::from_millis(9000)), (false, 1));
     }

@@ -1,8 +1,6 @@
 #!/bin/sh
-# Generate ./samples/test-ja.wav (s16le, 16 kHz, mono) via gTTS. TTS because
-# no stable CC-licensed JP wav exists at a known URL that whisper transcribes
-# meaningfully. The container writes via bind mount, not stdout — pip/apt
-# noise escaping the redirects corrupts a piped wav and mic-stub dies with EOFError.
+# The container writes via bind mount, not stdout — pip/apt noise escaping
+# the redirects corrupts a piped wav and mic-stub dies with EOFError.
 
 set -e
 

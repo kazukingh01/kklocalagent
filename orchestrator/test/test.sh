@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# Orchestrator scenario tests: one orchestrator container per config
-# flavor (strict / loose / no-barge) + a long-lived harness container
-# hosting mock backends and driving /events.
-
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -20,8 +16,6 @@ ORCH_BASE_ENV=(
   -e "ORCH_ASR_URL=http://${HARNESS_NAME}:9100/inference"
   -e "ORCH_LLM_URL=http://${HARNESS_NAME}:9200/api/chat"
   -e "ORCH_LLM_MODEL=mock"
-  # The `system_prompt_prepended` scenario only checks that some non-empty
-  # system content reaches the LLM before the user turn; exact text is moot.
   -e "ORCH_LLM_SYSTEM_PROMPT=You are a test assistant."
   -e "ORCH_TTS_URL=http://${HARNESS_NAME}:9300/speak"
   -e "ORCH_TTS_STOP_URL=http://${HARNESS_NAME}:9300/stop"
@@ -38,8 +32,6 @@ ORCH_BASE_ENV=(
 )
 
 cleanup() {
-  # `set +e` so a missing container doesn't fail the trap and mask the
-  # real exit code.
   set +e
   docker rm -f "$ORCH_NAME" >/dev/null 2>&1
   docker rm -f "$HARNESS_NAME" >/dev/null 2>&1
@@ -72,8 +64,6 @@ run_phase() {
       "${ORCH_BASE_ENV[@]}" "${extra_env[@]}" \
       "$ORCH_IMAGE" >/dev/null
 
-  # The orch comes up in ~1 s but the Dockerfile HEALTHCHECK has a 15 s
-  # start_period, so give it 30 s of slack.
   local status="starting"
   local i
   for i in $(seq 1 30); do
@@ -88,31 +78,22 @@ run_phase() {
     return 1
   fi
 
-  # `sed -u` (unbuffered) and `python -u` are required — without them
-  # stdio block-buffering when piped delays the interleaved output by
-  # hundreds of ms.
   (docker logs -f "$ORCH_NAME" 2>&1 | sed -u 's/^/[orch]    /') &
   local log_pid=$!
 
   local exit_code=0
-  # `set -o pipefail` makes the pipe exit non-zero when docker exec fails
-  # even though sed succeeds; `|| exit_code=$?` captures that without
-  # tripping `set -e`.
   docker exec "$HARNESS_NAME" python -u /app/harness.py \
       --orch-url "http://${ORCH_NAME}:7000" \
       --flavor "$flavor" 2>&1 \
       | sed -u 's/^/[harness] /' \
       || exit_code=$?
 
-  # Stop the log follower before the next phase replaces the container —
-  # otherwise the bg sed keeps tailing the new container's logs.
   kill "$log_pid" 2>/dev/null || true
   wait "$log_pid" 2>/dev/null || true
 
   return $exit_code
 }
 
-# Short windows so the "window expires" scenarios complete in seconds.
 run_phase strict \
     -e "ORCH_WAKE_REQUIRED=true" \
     -e "ORCH_WAKE_WINDOW_MS=2000" \

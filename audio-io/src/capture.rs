@@ -154,9 +154,6 @@ fn dispatch(frames: Vec<Vec<u8>>, tx: &broadcast::Sender<(u64, Bytes)>, frame_ns
     if frames.is_empty() {
         return;
     }
-    // now_ns is the wall clock right after the *last* emitted frame's tail
-    // sample arrived; earlier frames in the batch are back-dated by frame_ns
-    // per position.
     let now_ns = epoch_ns();
     let n = frames.len();
     for (i, frame) in frames.into_iter().enumerate() {

@@ -39,8 +39,6 @@ enum Phase {
     Idle,
     ArmedAfterWake,
     ArmedAfterTurn,
-    /// Waiting for SpeechEnded. The armed_until timer from the preceding
-    /// ArmedAfter* phase keeps ticking — see the module doc.
     Listening,
     Processing,
 }
@@ -48,9 +46,6 @@ enum Phase {
 struct Inner {
     phase: Phase,
     armed_until: Option<Instant>,
-    /// Set on a mid-Processing wake with `barge_in=false`: the next
-    /// `complete()` goes to ArmedAfterWake instead of ArmedAfterTurn,
-    /// honouring the wake the operator pressed mid-reply.
     pending_wake_after_turn: bool,
     /// Monotonic turn id, bumped on every transition into `Processing`.
     /// `complete()` no-ops on a stale id so a barge-in-aborted turn's
@@ -68,22 +63,15 @@ pub struct WakeMachine {
     wake_window: Duration,
     turn_followup_window: Duration,
     barge_in: bool,
-    /// `None` (configured 0) disables the post-wake SE dropout check.
     post_wake_se_dropout: Option<Duration>,
     inner: Mutex<Inner>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakeResult {
-    /// Always-listening (`required=false`); no state change.
     Bypass,
-    /// Transitioned (or refreshed) to ArmedAfterWake.
     Armed,
-    /// Mid-Processing wake with barge_in=true: caller must cancel TTS;
-    /// state already flipped to ArmedAfterWake.
     BargeIn,
-    /// Mid-Processing wake with barge_in=false: phase stays Processing;
-    /// `complete()` will go to ArmedAfterWake instead of ArmedAfterTurn.
     ArmedBusy,
 }
 
@@ -99,7 +87,6 @@ pub enum SpeechStartedOutcome {
 }
 
 pub enum DispatchOutcome {
-    /// Pipeline should run; caller holds the guard for the turn's life.
     Run(ProcessingGuard),
     NotArmed,
     InTurn,
@@ -114,10 +101,6 @@ pub enum DispatchOutcome {
     DroppedTooSoonAfterWake,
 }
 
-/// Drop-on-completion guard: dropping it transitions Processing →
-/// ArmedAfter{Turn,Wake}. Carries the `turn_generation` it was minted
-/// under so a dropped-after-abort guard detects that a different turn now
-/// owns Processing and refuses to mutate state.
 pub struct ProcessingGuard {
     machine: Arc<WakeMachine>,
     generation: u64,
@@ -152,7 +135,6 @@ impl WakeMachine {
         self.barge_in
     }
 
-    /// React to a WakeWordDetected event.
     pub fn on_wake(&self) -> WakeResult {
         if !self.required {
             return WakeResult::Bypass;
@@ -172,8 +154,6 @@ impl WakeMachine {
                     g.pending_wake_after_turn = false;
                     WakeResult::BargeIn
                 } else {
-                    // Don't disturb the running pipeline, but make sure
-                    // the operator's wake isn't lost.
                     g.pending_wake_after_turn = true;
                     WakeResult::ArmedBusy
                 }
@@ -191,7 +171,6 @@ impl WakeMachine {
         }
     }
 
-    /// React to a SpeechStarted event (phase-only transition; see module doc).
     pub fn on_speech_started(&self) -> SpeechStartedOutcome {
         if !self.required {
             return SpeechStartedOutcome::Bypass;
@@ -229,14 +208,8 @@ impl WakeMachine {
         }
     }
 
-    /// React to a SpeechEnded event with utterance audio. Lenient: an SE
-    /// arriving directly in `ArmedAfter*` without a preceding SS is
-    /// accepted while the timer holds — real VAD always sends SS first,
-    /// but harness tests synthesise events without one.
     pub fn try_dispatch(self: &Arc<Self>) -> DispatchOutcome {
         if !self.required {
-            // Loose mode never bumps generation; complete() is a no-op
-            // anyway, so the guard just records 0.
             return DispatchOutcome::Run(ProcessingGuard {
                 machine: self.clone(),
                 generation: 0,
@@ -244,10 +217,6 @@ impl WakeMachine {
         }
         let mut g = self.inner.lock().expect("wake state poisoned");
         let now = Instant::now();
-        // Wake-word echo dropout: VAD fires SE ~300 ms after the wake for
-        // the wake word's own audio; without this gate that SE becomes a
-        // turn whose ASR text *is* the wake word. Phase is left untouched
-        // so a follow-up SE within the wake window still dispatches.
         if let Some(dropout) = self.post_wake_se_dropout {
             if let Some(t) = g.last_wake_at {
                 if now.saturating_duration_since(t) < dropout {
@@ -255,14 +224,10 @@ impl WakeMachine {
                 }
             }
         }
-        // Fresh generation per Processing transition: a previously-aborted
-        // turn's guard carries a stale id and no-ops on Drop.
         let mint_guard = |g: &mut Inner| {
             g.phase = Phase::Processing;
             g.armed_until = None;
             g.turn_generation = g.turn_generation.wrapping_add(1);
-            // Clear the wake stamp so a later follow-up SE isn't gated by
-            // an ancient wake.
             g.last_wake_at = None;
             ProcessingGuard {
                 machine: self.clone(),
@@ -272,14 +237,11 @@ impl WakeMachine {
         match g.phase {
             Phase::Listening => match g.armed_until {
                 Some(t) if t > now => DispatchOutcome::Run(mint_guard(&mut g)),
-                // Inherited window expired while waiting for SE — the
-                // noise-driven-SS case falls to Idle.
                 Some(_) => {
                     g.phase = Phase::Idle;
                     g.armed_until = None;
                     DispatchOutcome::ListeningWindowExpired
                 }
-                // No timer set shouldn't happen in normal flow; be lenient.
                 None => DispatchOutcome::Run(mint_guard(&mut g)),
             },
             Phase::ArmedAfterWake => match g.armed_until {
@@ -303,11 +265,6 @@ impl WakeMachine {
         }
     }
 
-    /// Called from ProcessingGuard::drop: Processing → ArmedAfterTurn (or
-    /// ArmedAfterWake if a barge_in=false wake landed mid-turn). A stale
-    /// `gen` (barge-in aborted this turn and a new one already owns
-    /// Processing) skips — otherwise the aborted turn's late drop would
-    /// clobber the live one's phase.
     fn complete(&self, gen: u64) {
         if !self.required {
             return;
@@ -330,8 +287,6 @@ impl WakeMachine {
         }
     }
 
-    /// Whether the pipeline should keep sending HTTP downstream; false
-    /// after a barge-in flipped state mid-turn. Loose mode: always true.
     pub fn pipeline_still_active(&self) -> bool {
         if !self.required {
             return true;
@@ -340,7 +295,6 @@ impl WakeMachine {
         g.phase == Phase::Processing
     }
 
-    /// Whether a turn is currently Processing. Loose mode: always false.
     pub fn is_in_turn(&self) -> bool {
         if !self.required {
             return false;
@@ -355,8 +309,6 @@ mod tests {
     use super::*;
 
     fn cfg(required: bool, wake_ms: u64, turn_ms: u64, barge: bool) -> WakeConfig {
-        // Dropout disabled (0) so scenarios that fire SE immediately
-        // after wake still dispatch; dropout has its own tests below.
         WakeConfig {
             required,
             wake_window_ms: wake_ms,
@@ -409,7 +361,6 @@ mod tests {
 
     #[test]
     fn wake_then_se_lenient_dispatch() {
-        // SE without a preceding SS is accepted while the window holds.
         let m = mk(cfg(true, 1000, 1000, true));
         m.on_wake();
         assert!(matches!(m.try_dispatch(), DispatchOutcome::Run(_)));
@@ -428,16 +379,16 @@ mod tests {
         let m = mk(cfg(true, 1000, 1000, true));
         m.on_wake();
         let g = run_guard(m.try_dispatch()).unwrap();
-        drop(g); // turn completes → ArmedAfterTurn
+        drop(g);
         assert_eq!(m.on_speech_started(), SpeechStartedOutcome::Listening);
     }
 
     #[test]
     fn turn_followup_window_expires() {
-        let m = mk(cfg(true, 1000, 1, true)); // 1 ms follow-up window
+        let m = mk(cfg(true, 1000, 1, true));
         m.on_wake();
         let g = run_guard(m.try_dispatch()).unwrap();
-        drop(g); // turn completes → ArmedAfterTurn (1 ms window)
+        drop(g);
         std::thread::sleep(Duration::from_millis(10));
         assert!(matches!(
             m.on_speech_started(),
@@ -450,7 +401,7 @@ mod tests {
         let m = mk(cfg(true, 1000, 10_000, true));
         m.on_wake();
         let g = run_guard(m.try_dispatch()).unwrap();
-        drop(g); // ArmedAfterTurn now
+        drop(g);
         assert_eq!(m.on_wake(), WakeResult::Armed);
         assert_eq!(m.on_speech_started(), SpeechStartedOutcome::Listening);
     }
@@ -485,7 +436,7 @@ mod tests {
         m.on_wake();
         let g = run_guard(m.try_dispatch()).unwrap();
         assert_eq!(m.on_wake(), WakeResult::ArmedBusy);
-        drop(g); // turn ends → ArmedAfterWake (pending wake), not ArmedAfterTurn
+        drop(g);
         assert_eq!(m.on_speech_started(), SpeechStartedOutcome::Listening);
     }
 
@@ -498,7 +449,7 @@ mod tests {
         let g = run_guard(m.try_dispatch()).unwrap();
         assert!(m.is_in_turn());
         drop(g);
-        assert!(!m.is_in_turn()); // Now ArmedAfterTurn, not Processing
+        assert!(!m.is_in_turn());
     }
 
     #[test]
@@ -509,7 +460,6 @@ mod tests {
             m.try_dispatch(),
             DispatchOutcome::DroppedTooSoonAfterWake
         ));
-        // State must remain armed for the operator's real follow-up.
         assert_eq!(m.on_speech_started(), SpeechStartedOutcome::Listening);
     }
 
@@ -530,21 +480,16 @@ mod tests {
 
     #[test]
     fn dropout_does_not_gate_followup_after_turn() {
-        // Dispatch clears last_wake_at; without the clear, every
-        // armed-after-turn dispatch would race the dropout window.
         let m = mk(cfg_dropout(5_000, 50));
         m.on_wake();
-        std::thread::sleep(Duration::from_millis(60)); // past 50 ms dropout
+        std::thread::sleep(Duration::from_millis(60));
         let g = run_guard(m.try_dispatch()).expect("first dispatch");
-        drop(g); // → ArmedAfterTurn, last_wake_at now cleared
+        drop(g);
         assert!(matches!(m.try_dispatch(), DispatchOutcome::Run(_)));
     }
 
     #[test]
     fn wake_during_listening_restarts_into_armed_after_wake() {
-        // "Scratch that, start over": a wake mid-utterance resets to
-        // ArmedAfterWake; the in-progress utterance's eventual SE gets
-        // dropped by post_wake_se_dropout.
         let m = mk(cfg(true, 5_000, 10_000, true));
         m.on_wake();
         assert_eq!(m.on_speech_started(), SpeechStartedOutcome::Listening);
@@ -583,7 +528,7 @@ mod tests {
         let m = mk(cfg(true, 1_000, 50, true));
         m.on_wake();
         let g = run_guard(m.try_dispatch()).unwrap();
-        drop(g); // → ArmedAfterTurn (50 ms window)
+        drop(g);
         assert_eq!(m.on_speech_started(), SpeechStartedOutcome::Listening);
         std::thread::sleep(Duration::from_millis(60));
         assert!(matches!(

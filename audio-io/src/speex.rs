@@ -49,8 +49,6 @@ impl EchoCanceller for SpeexAec {
     }
 
     fn stats(&self) -> CancellerStats {
-        // Speex doesn't expose its internal filter/ERL state; nlp_gain = 1.0
-        // signals "n/a, not the nlms path".
         CancellerStats {
             nlp_gain: 1.0,
             ..CancellerStats::default()

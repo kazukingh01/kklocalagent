@@ -116,8 +116,6 @@ async fn main() -> Result<()> {
     if let Some(mode) = args.sink_mode {
         config.sink.mode = mode;
     } else if args.live {
-        // --live predates the multi-mode sink and meant "anything but
-        // dry-run". The only live mode wired up today is asr-direct.
         config.sink.mode = SinkMode::AsrDirect;
     }
 

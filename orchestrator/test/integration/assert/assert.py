@@ -1,7 +1,3 @@
-"""Integration test driver / sink: exits 0 once WakeWordDetected,
-TurnCompleted (non-empty user/assistant), and non-silent spk-sink bytes
-are all observed within ASSERT_TIMEOUT_SEC; exits 1 on timeout."""
-
 from __future__ import annotations
 
 import asyncio
@@ -18,7 +14,7 @@ PORT = int(os.environ.get("ASSERT_PORT", "9300"))
 TIMEOUT_SEC = float(os.environ.get("ASSERT_TIMEOUT_SEC", "240"))
 SPK_SINK_URL = os.environ.get("SPK_SINK_URL", "http://spk-sink:7011/stats")
 SPK_POLL_SEC = float(os.environ.get("SPK_POLL_SEC", "1.0"))
-SPK_MIN_BYTES = int(os.environ.get("SPK_MIN_BYTES", "640"))  # at least one frame
+SPK_MIN_BYTES = int(os.environ.get("SPK_MIN_BYTES", "640"))
 
 log = logging.getLogger("assert")
 
@@ -51,7 +47,6 @@ async def sink_handler(request: web.Request) -> web.Response:
 
 
 async def poll_spk_sink() -> None:
-    """Poll spk-sink /stats; set `tts_received` once non-silent frames arrive."""
     global last_spk_stats
     last_logged_bytes = -1
     async with aiohttp.ClientSession() as sess:
@@ -71,7 +66,6 @@ async def poll_spk_sink() -> None:
                             )
                             tts_received.set()
             except Exception as e:  # noqa: BLE001
-                # First few polls may race the sink coming up.
                 log.debug("spk-sink poll failed: %s", e)
             await asyncio.sleep(SPK_POLL_SEC)
 

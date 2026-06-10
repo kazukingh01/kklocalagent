@@ -1,7 +1,3 @@
-//! Detection sink (orchestrator POST / dry-run log). POSTs are best-effort:
-//! failures are logged and dropped — a missed wake event is recoverable on
-//! the next utterance.
-
 use std::time::Duration;
 
 use anyhow::Result;
@@ -42,9 +38,6 @@ pub async fn run(cfg: Config, mut rx: mpsc::Receiver<Detection>) -> Result<()> {
                         info!(model = %det.model, "fired event");
                     } else {
                         let body = resp.text().await.unwrap_or_default();
-                        // chars().take(), not byte slicing — the orchestrator
-                        // can return non-ASCII bodies and a byte index landing
-                        // mid-codepoint would panic.
                         let trim: String = body.chars().take(200).collect();
                         warn!(%status, body = %trim, "POST /events non-2xx");
                     }

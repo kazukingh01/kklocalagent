@@ -1,10 +1,3 @@
-//! Env-var config. Names mirror the openwakeword Python shim so swapping
-//! compose's `build.context` needs no env renames; unlike the shim,
-//! `WW_MODELS` is comma-separated filenames resolved under `WW_MODELS_DIR`,
-//! which must also hold the upstream `melspectrogram.onnx` +
-//! `embedding_model.onnx` (same artefacts as training, so feature
-//! extraction can't silently drift across upstream version bumps).
-
 use anyhow::{anyhow, Context, Result};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -25,8 +18,6 @@ pub struct Config {
     pub embedding_onnx_path: PathBuf,
     pub threshold: f32,
     pub cooldown: Duration,
-    /// Threshold crossings (cooldown-deduplicated) required within
-    /// `confirm_window` before a Detection is forwarded; 1 = immediate.
     pub confirm_count: u32,
     pub confirm_window: Duration,
     pub predict_window_ms: u32,
@@ -37,8 +28,6 @@ pub struct Config {
     pub peak_log_floor: f32,
 }
 
-/// Filenames match what upstream `livekit-wakeword` ships under
-/// `livekit/wakeword/resources/`, so a bind-mount works without renaming.
 const MEL_ONNX_FILENAME: &str = "melspectrogram.onnx";
 const EMBEDDING_ONNX_FILENAME: &str = "embedding_model.onnx";
 const DEFAULT_MODELS_DIR: &str = "/opt/models";
@@ -57,8 +46,6 @@ impl Config {
 
         let raw_models = std::env::var("WW_MODELS")
             .unwrap_or_else(|_| DEFAULT_CLASSIFIER_FILENAME.to_string());
-        // Reject path separators / `..` so WW_MODELS entries can't escape
-        // the bind-mounted models dir.
         let names: Vec<&str> = raw_models
             .split(',')
             .map(str::trim)

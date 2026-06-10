@@ -1,16 +1,6 @@
-# Live-mic stack: audio-io (Windows native, OUTSIDE compose) → vad → asr.
-# Needs audio-io.exe on Windows with `[server] host = "0.0.0.0"` (port 7010)
-# and WINDOWS_HOST reachable from the docker network (default
-# `host.docker.internal`; override in test/.env).
-# Run from this directory:
-#   ../fetch-models.sh ggml-small-q8_0.bin
-#   docker compose -f compose.online.yaml up --build
-
 services:
   voice-activity-detection:
     build:
-      # Repo-root context so the VAD Dockerfile can resolve its
-      # path-dependency on the shared `wav-utils` crate.
       context: ../..
       dockerfile: voice-activity-detection/Dockerfile
     container_name: kklocalagent-test-vad-online
@@ -20,8 +10,6 @@ services:
     volumes:
       - ./vad-config.toml:/etc/vad/config.toml:ro
     command: ["--config", "/etc/vad/config.toml"]
-    # Plain Linux docker doesn't resolve `host.docker.internal`; host-gateway
-    # maps it to the bridge gateway. Harmless on Docker Desktop / WSL2.
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -44,6 +32,5 @@ services:
     environment:
       WHISPER_MODEL: ggml-small-q8_0.bin
       WHISPER_LANGUAGE: ja
-      # WHISPER_THREADS: "8"   # see compose.offline.yaml for tuning notes
     ports:
       - "7040:8080"

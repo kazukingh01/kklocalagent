@@ -1,8 +1,5 @@
-//! audio-io `/mic?ts=1` client. Each binary frame is an 8-byte LE u64
-//! header (epoch-ns of the frame's *last* sample) followed by s16le mono
-//! 16 kHz PCM. `?ts=1` is auto-appended; older audio-io revisions ignore
-//! the param but also won't prepend the header, so this client only works
-//! against a header-aware audio-io.
+//! Older audio-io revisions ignore `?ts=1` and won't prepend the epoch-ns
+//! frame header, so this client only works against a header-aware audio-io.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,9 +15,6 @@ use crate::MicFrame;
 
 const HEADER_LEN: usize = 8;
 
-/// Only reset reconnect backoff once a connection lived this long —
-/// otherwise a 100 ms flap resets to 1 s every handshake and the loop
-/// hammers the server at 1 Hz indefinitely.
 const STABLE_RESET_AFTER: Duration = Duration::from_secs(10);
 
 pub async fn run(
@@ -54,8 +48,6 @@ pub async fn run(
                             let mut hdr = [0u8; HEADER_LEN];
                             hdr.copy_from_slice(&bytes[..HEADER_LEN]);
                             let end_epoch_ns = u64::from_le_bytes(hdr);
-                            // audio-io rejects odd-length frames upstream,
-                            // so chunks_exact drops nothing.
                             let samples: Vec<i16> = bytes[HEADER_LEN..]
                                 .chunks_exact(2)
                                 .map(|c| i16::from_le_bytes([c[0], c[1]]))
@@ -65,8 +57,6 @@ pub async fn run(
                                 samples,
                             };
                             if tx.send(frame).await.is_err() {
-                                // detector dropped (shutdown) — clear the flag
-                                // so /health stops claiming the WS is up.
                                 connected.store(false, Ordering::Relaxed);
                                 return Ok(());
                             }
@@ -75,8 +65,6 @@ pub async fn run(
                             warn!("mic ws closed by peer");
                             break;
                         }
-                        // audio-io's server doesn't ping today; add explicit
-                        // pong handling here if a future revision starts.
                         Ok(_) => {}
                         Err(e) => {
                             warn!("mic ws read error: {e}");
@@ -105,9 +93,6 @@ pub async fn run(
 }
 
 fn ensure_ts_query(url: &str) -> String {
-    // Match ts=1 as an actual query parameter — a naive contains("ts=1")
-    // matches `?footsie=1` and would silently skip the auto-append, losing
-    // the per-frame epoch-ns header.
     if let Some((_, query)) = url.split_once('?') {
         for pair in query.split('&') {
             if pair == "ts=1" || pair.starts_with("ts=1#") {

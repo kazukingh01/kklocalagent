@@ -6,21 +6,16 @@ use anyhow::{Context, Result};
 use nnnoiseless::DenoiseState;
 use rubato::{FftFixedInOut, Resampler};
 
-/// Sample count nnnoiseless wants per `process_frame` call (480 @ 48 kHz = 10 ms).
 const RNNOISE_FRAME: usize = 480;
 
 const SRC_RATE: usize = 16_000;
 const DST_RATE: usize = 48_000;
 
-/// Stateful per-stream denoiser; feed every 20 ms i16 frame through
-/// `process`. All scratch buffers are allocated once and reused.
 pub struct Denoiser {
     upsampler: FftFixedInOut<f32>,
     downsampler: FftFixedInOut<f32>,
-    /// `DenoiseState::new()` returns it pre-boxed (large internal buffers).
     rnnoise: Box<DenoiseState<'static>>,
     in_16k: Vec<Vec<f32>>,
-    /// Doubles as the upsampler's output and the downsampler's input.
     mid_48k: Vec<Vec<f32>>,
     out_16k: Vec<Vec<f32>>,
     rnn_in: Vec<f32>,
@@ -28,11 +23,7 @@ pub struct Denoiser {
 }
 
 impl Denoiser {
-    /// Build a denoiser sized for `frame_samples` 16 kHz mono samples per
-    /// call (typically 320 = 20 ms).
     pub fn new(frame_samples: usize) -> Result<Self> {
-        // FftFixedInOut derives the output chunk size (frame_samples * 3)
-        // from the rate ratio; only the input chunk is specified.
         let upsampler = FftFixedInOut::<f32>::new(SRC_RATE, DST_RATE, frame_samples, 1)
             .context("build upsampler 16k→48k")?;
         let downsampler =
@@ -50,7 +41,6 @@ impl Denoiser {
         })
     }
 
-    /// Denoise one VAD frame in-place; input/output length must match.
     pub fn process(&mut self, samples: &mut [i16]) -> Result<()> {
         // nnnoiseless wants f32 in ±32768 (raw i16 cast to float), rubato
         // wants normalised f32; keep the normalised representation
@@ -71,8 +61,6 @@ impl Denoiser {
             for (i, s) in mid[off..off + RNNOISE_FRAME].iter().enumerate() {
                 self.rnn_in[i] = s * 32768.0;
             }
-            // process_frame's return value is the model's own voice-activity
-            // probability; webrtc-vad downstream is the source of truth, so ignore it.
             self.rnnoise.process_frame(&mut self.rnn_out, &self.rnn_in);
             for (i, s) in self.rnn_out.iter().enumerate() {
                 mid[off + i] = s / 32768.0;
@@ -83,8 +71,6 @@ impl Denoiser {
             .process_into_buffer(&self.mid_48k, &mut self.out_16k, None)
             .context("downsample 48→16")?;
 
-        // Saturate the i16 cast: RNNoise gain can clip very loud input,
-        // and cast wraparound would manifest as a loud click.
         let out = &self.out_16k[0];
         for (dst, src) in samples.iter_mut().zip(out.iter()) {
             *dst = (src * 32768.0).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
@@ -99,8 +85,6 @@ mod tests {
 
     #[test]
     fn process_silence_returns_silence_shaped_output() {
-        // RNNoise on silence may emit near-zero values from FFT-roundtrip
-        // artefacts — only shape stability is asserted.
         let mut d = Denoiser::new(320).unwrap();
         let mut frame = vec![0i16; 320];
         d.process(&mut frame).unwrap();
@@ -109,8 +93,6 @@ mod tests {
 
     #[test]
     fn process_synthetic_tone_preserves_length() {
-        // Amplitude isn't checked — RNNoise is ML-based and applies gain,
-        // not a pure passthrough.
         let mut d = Denoiser::new(320).unwrap();
         let mut frame: Vec<i16> = (0..320)
             .map(|i| {

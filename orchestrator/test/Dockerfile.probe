@@ -1,5 +1,3 @@
-# Self-contained (no bind mounts) — bind mounts break in some
-# Docker-in-Docker / rootless setups.
 FROM python:3.11-slim-bookworm
 
 WORKDIR /app

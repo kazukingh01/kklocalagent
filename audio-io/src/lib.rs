@@ -51,8 +51,6 @@ pub async fn run(config: Config) -> Result<()> {
 pub fn build_state(config: Config) -> AppState {
     let cap = config.runtime.mic_broadcast_frames.max(1) as usize;
     let (mic_tx, _) = broadcast::channel(cap);
-    // AEC channels exist even when aec.enabled=false so producers need no runtime
-    // branch; ref_in is sized larger because multiple playback tracks feed it.
     let (ref_in_tx, _) = broadcast::channel(cap * 2);
     let (ref_tx, _) = broadcast::channel(cap);
     let (mic_aec_tx, _) = broadcast::channel(cap);

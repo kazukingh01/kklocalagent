@@ -1,13 +1,7 @@
-//! Far-end reference mixer: sums the per-track playback PCM into one gap-free
-//! 16 kHz mono timeline.
-
 use std::collections::VecDeque;
 
 use crate::pcm::{bytes_to_i16, i16_to_bytes};
 
-/// Missing samples contribute silence, so the output is gap-free even when
-/// nothing plays — the adaptive filter relies on a continuous far-end timeline.
-///
 /// Each track buffer is capped: the mix timer drains at wall-clock rate while
 /// the playback tap fills at the audio-hardware rate, so a device clock running
 /// faster than the timer would otherwise grow a buffer without bound.
@@ -22,8 +16,6 @@ impl ReferenceMixer {
     pub fn new(sample_rate: u32, samples_per_frame: usize, n_tracks: usize) -> Self {
         Self {
             samples_per_frame,
-            // ~250 ms, matching aec_task's far-backlog cap. Floored at one
-            // frame so a freshly pushed frame is never dropped on arrival.
             max_track_samples: (sample_rate as usize / 4).max(samples_per_frame),
             tracks: (0..n_tracks).map(|_| VecDeque::new()).collect(),
             dropped: 0,
@@ -43,7 +35,6 @@ impl ReferenceMixer {
         self.dropped += dropped as u64;
     }
 
-    /// Emit one mixed frame; missing samples = silence, summed with saturation.
     pub fn tick(&mut self) -> Vec<u8> {
         let n = self.samples_per_frame;
         let mut acc = vec![0i32; n];
@@ -110,7 +101,6 @@ mod tests {
 
     #[test]
     fn mixer_caps_track_backlog_and_counts_drops() {
-        // Cap is sample_rate/4 = 4 here; pushing 6 samples drops the oldest 2.
         let mut m = ReferenceMixer::new(16, 2, 1);
         m.push(0, &i16_to_bytes(&[1, 2, 3, 4, 5, 6]));
         assert_eq!(m.dropped(), 2);

@@ -43,8 +43,7 @@ fn list_devices() -> anyhow::Result<Devices> {
     let default_in = host.default_input_device().and_then(|d| d.name().ok());
     let default_out = host.default_output_device().and_then(|d| d.name().ok());
 
-    // cpal exposes no stable device IDs, so match on name; when two devices
-    // share a name only the first is flagged as default.
+    // cpal exposes no stable device IDs, so match on name.
     let mut inputs = Vec::new();
     let mut default_in_used = false;
     for dev in host.input_devices()? {

@@ -1,5 +1,3 @@
-# CPU-only override on top of compose.yaml.
-
 services:
   asr-models:
     environment:
@@ -11,16 +9,12 @@ services:
       args:
         WHISPER_VARIANT: main
     environment:
-      # Must agree with `asr-models.environment.ASR_MODEL` above — a
-      # mismatch fails to mmap (or loads the wrong weights).
       WHISPER_MODEL: "${ASR_MODEL:-ggml-small-q8_0.bin}"
     deploy: !reset null
 
   llm:
     environment:
       LLM_MODEL: "${LLM_MODEL:-gemma3:1b}"
-      # OLLAMA_FLASH_ATTENTION + OLLAMA_KV_CACHE_TYPE both require a
-      # CUDA / Metal backend — no-ops (or warn) on the CPU build.
       OLLAMA_FLASH_ATTENTION: ""
       OLLAMA_KV_CACHE_TYPE: ""
     # Compose-spec `!reset` clears the entire `deploy` block from the
@@ -32,9 +26,6 @@ services:
 
   agent:
     environment:
-      # Must match `llm.environment.LLM_MODEL` above — a mismatch
-      # produces a 404 "model '<name>' not found" because the llm
-      # container only pulled the CPU model.
       AGENT_MODEL: "${LLM_MODEL:-gemma3:1b}"
 
   orchestrator:

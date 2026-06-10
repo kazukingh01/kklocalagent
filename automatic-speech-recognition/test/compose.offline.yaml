@@ -1,9 +1,3 @@
-# End-to-end smoke test: mic-stub → voice-activity-detection → ASR.
-# Run from this directory:
-#   ./fetch-sample.sh
-#   ../fetch-models.sh
-#   docker compose up --build
-
 services:
   mic-stub:
     build: ./mic-stub
@@ -13,13 +7,10 @@ services:
     environment:
       SAMPLE_PATH: /samples/test-ja.wav
       LOOP_DELAY_MS: "2000"
-      # Replay LOOP_COUNT times then idle with silence; 0 = infinite.
       LOOP_COUNT: "1"
 
   voice-activity-detection:
     build:
-      # Repo-root context so the VAD Dockerfile can resolve its
-      # path-dependency on the shared `wav-utils` crate.
       context: ../..
       dockerfile: voice-activity-detection/Dockerfile
     container_name: kklocalagent-test-vad
@@ -48,15 +39,7 @@ services:
     volumes:
       - ../models:/models:ro
     environment:
-      # small q8_0: ~3–5 s per 8 s utterance on CPU (vs ~14 s for turbo-q8_0),
-      # one quality tier below turbo for Japanese. Use
-      # large-v3-turbo-{q5_0,q8_0,*}.bin for higher accuracy.
       WHISPER_MODEL: ggml-small-q8_0.bin
-      # Pin to ja so whisper-server skips language detection; "en" for the
-      # JFK smoke test.
       WHISPER_LANGUAGE: ja
-      # Past the *physical* core count, more threads usually hurt
-      # (Hyperthreading cache contention).
-      # WHISPER_THREADS: "8"
     ports:
       - "7040:8080"

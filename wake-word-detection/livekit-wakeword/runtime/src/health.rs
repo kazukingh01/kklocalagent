@@ -1,7 +1,3 @@
-//! GET /health: 200 only when model loaded AND mic WS connected — same
-//! contract as the openwakeword shim, so compose's `service_healthy` gate
-//! behaves identically across implementations.
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

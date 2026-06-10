@@ -1,13 +1,8 @@
-# Full-pipeline integration smoke: mic-stub → VAD + wake-word →
-# orchestrator → real ASR/LLM/TTS → spk-sink, asserted by `assert`.
-
 services:
   asr-models:
-    # Fetches the whisper model into a shared volume, then idles —
-    # exiting would trip `--abort-on-container-exit` (implied by
-    # --exit-code-from) and tear the smoke down before assert finishes.
-    # Downstream waits via the healthcheck, which flips healthy the
-    # moment the model file exists.
+    # Idles after the fetch — exiting would trip `--abort-on-container-exit`
+    # (implied by --exit-code-from) and tear the smoke down before assert
+    # finishes.
     image: alpine:3
     container_name: kklocalagent-test-int-asr-models
     volumes:
@@ -45,7 +40,6 @@ services:
       - asr-models:/models:ro
     environment:
       WHISPER_MODEL: ggml-small-q8_0.bin
-      # Overrides the asr-test default of "ja" — fixtures here are English.
       WHISPER_LANGUAGE: en
 
   llm:
@@ -54,7 +48,6 @@ services:
     container_name: kklocalagent-test-int-llm
     environment:
       LLM_MODEL: gemma3:1b
-      # Pin weights so the assert window doesn't overlap with a re-load.
       OLLAMA_KEEP_ALIVE: "-1"
     volumes:
       - ollama-data:/root/.ollama
@@ -81,8 +74,6 @@ services:
 
   mic-stub:
     build:
-      # Repo-root context so the Dockerfile can COPY fixtures from
-      # sibling modules.
       context: ../../..
       dockerfile: orchestrator/test/integration/mic-stub/Dockerfile
     container_name: kklocalagent-test-int-mic-stub
@@ -94,20 +85,16 @@ services:
 
   voice-activity-detection:
     build:
-      # Repo-root context so the VAD Dockerfile can resolve its
-      # path-dependency on the shared `wav-utils` crate.
       context: ../../..
       dockerfile: voice-activity-detection/Dockerfile
     container_name: kklocalagent-test-int-vad
     environment:
       RUST_LOG: info,voice_activity_detection=info
-      # Env overrides only — no TOML config mount (bind mounts are
-      # unreliable across Docker-in-Docker setups).
       VAD_MIC_URL: ws://mic-stub:7010/mic
       VAD_SINK_MODE: orchestrator
       VAD_ORCHESTRATOR_URL: http://orchestrator:7000/events
-      # Off by default (dry-run/asr-direct); the orchestrator can't run
-      # ASR without the utterance PCM.
+      # Default is off; the orchestrator can't run ASR without the
+      # utterance PCM in the event.
       VAD_LOG_AUDIO_IN_EVENT: "true"
     depends_on:
       mic-stub:
@@ -132,8 +119,6 @@ services:
 
   orchestrator:
     build:
-      # Repo-root context so the orchestrator Dockerfile can COPY the
-      # shared `wav-utils` crate alongside `orchestrator/`.
       context: ../../..
       dockerfile: orchestrator/Dockerfile
     container_name: kklocalagent-test-int-orch
@@ -145,9 +130,6 @@ services:
       ORCH_TTS_URL: http://tts-streamer:7070/speak
       ORCH_TTS_STOP_URL: http://tts-streamer:7070/stop
       ORCH_WAKE_REQUIRED: "true"
-      # Long windows: cold whisper / gemma3 load can take ~30 s, so a
-      # short wake_window would expire between the alexa wake event and
-      # the JFK SpeechEnded.
       ORCH_WAKE_WINDOW_MS: "30000"
       ORCH_TURN_FOLLOWUP_WINDOW_MS: "30000"
       ORCH_WAKE_BARGE_IN: "true"
@@ -168,8 +150,6 @@ services:
     container_name: kklocalagent-test-int-assert
     environment:
       ASSERT_PORT: "9300"
-      # Upper bound only (assert exits 0 as soon as all signals arrive):
-      # cold whisper + gemma3 + VOICEVOX loads can take minutes on CPU.
       ASSERT_TIMEOUT_SEC: "300"
       SPK_SINK_URL: http://spk-sink:7011/stats
     depends_on:

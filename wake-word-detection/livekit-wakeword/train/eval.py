@@ -37,7 +37,6 @@ def load_pcm(path: Path) -> np.ndarray:
 
 
 def stride_windows(pcm: np.ndarray) -> Iterable[np.ndarray]:
-    """2 s windows, 80 ms hop — same shape the Rust detector feeds predict()."""
     win = WINDOW_MS * SAMPLE_RATE // 1000
     hop = HOP_MS * SAMPLE_RATE // 1000
     if len(pcm) < win:
@@ -47,9 +46,7 @@ def stride_windows(pcm: np.ndarray) -> Iterable[np.ndarray]:
 
 
 def max_score(session: ort.InferenceSession, pcm: np.ndarray) -> float:
-    """Peak score across all windows of the recording.
-
-    NOTE: pre-M3 stub — passes raw i16 PCM to the classifier, skipping the
+    """NOTE: pre-M3 stub — passes raw i16 PCM to the classifier, skipping the
     mel + embedding pipeline the runtime applies, so scores are NOT
     comparable to the runtime's until M3 lands pipeline replication."""
     peak = 0.0

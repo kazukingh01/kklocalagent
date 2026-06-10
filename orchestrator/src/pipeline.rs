@@ -1,8 +1,3 @@
-//! SpeechEnded → ASR → LLM (streaming) → TTS pipeline. Per-stage
-//! concurrency is bounded by a `Semaphore` (drop with warning, never queue
-//! unboundedly); the TTS permit is held for the *whole turn* so two
-//! consecutive sentences from the same turn don't race for the same slot.
-
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -31,7 +26,6 @@ struct ChatMessage<'a> {
     content: &'a str,
 }
 
-/// Per-stage HTTP client + backpressure permit.
 pub struct Backends {
     pub http: reqwest::Client,
     pub asr: AsrConfig,
@@ -41,9 +35,6 @@ pub struct Backends {
     pub asr_inflight: Arc<Semaphore>,
     pub llm_inflight: Arc<Semaphore>,
     pub tts_inflight: Arc<Semaphore>,
-    /// Deadline before which all VAD events (SS *and* SE) are dropped at
-    /// the service.rs boundary — otherwise the assistant's own voice in
-    /// the audio-io playback tail fires a new turn. `None` = inactive.
     pub tts_quiet_until: Arc<Mutex<Option<Instant>>>,
 }
 
@@ -54,15 +45,11 @@ impl Backends {
         tts: TtsConfig,
         result_sink: ResultSinkConfig,
     ) -> Result<Self> {
-        // No client-level timeout; each POST sets its own so the stages
-        // have independent budgets.
         let http = reqwest::Client::builder()
             .build()
             .context("building reqwest client")?;
         let asr_inflight = Arc::new(Semaphore::new(asr.max_inflight as usize));
         let llm_inflight = Arc::new(Semaphore::new(llm.max_inflight as usize));
-        // max_inflight can be 0 when tts is disabled; max(1) keeps the
-        // Semaphore well-formed (try_acquire is gated on tts.url anyway).
         let tts_inflight = Arc::new(Semaphore::new(tts.max_inflight.max(1) as usize));
         Ok(Self {
             http,
@@ -77,7 +64,6 @@ impl Backends {
         })
     }
 
-    /// True while the post-TTS `tail_quiet_ms` echo-suppression window is active.
     pub fn in_tts_quiet_window(&self) -> bool {
         match *self.tts_quiet_until.lock().expect("tts_quiet poisoned") {
             Some(t) => t > Instant::now(),
@@ -86,7 +72,6 @@ impl Backends {
     }
 }
 
-/// Best-effort POST to `result_sink.url`; failures never propagate.
 pub async fn forward_to_result_sink(backends: &Backends, payload: &serde_json::Value) {
     if backends.result_sink.url.is_empty() {
         return;
@@ -117,9 +102,6 @@ pub async fn forward_to_result_sink(backends: &Backends, payload: &serde_json::V
     }
 }
 
-/// Run one full SpeechEnded → ASR → LLM → sink → TTS turn; errors at each
-/// stage are logged and swallowed.
-///
 /// Barge-in is driven from `service.rs` via `JoinHandle::abort()` on this
 /// task: every await below cancels, the in-flight HTTP responses drop
 /// (closing connections so upstreams stop producing), the mpsc sentence
@@ -189,8 +171,6 @@ pub async fn run_turn(
         info!(target: "orch::pipeline", "ASR returned empty text; skipping LLM");
         return;
     }
-    // Whisper fills ambiguous near-silence with stock YouTube end-of-video
-    // phrases; treat those as an empty transcription.
     if let Some(matched) = backends
         .asr
         .hallucination_blacklist
@@ -207,10 +187,6 @@ pub async fn run_turn(
     }
     info!(target: "orch::pipeline", text = %text, "transcribed");
 
-    // Streaming LLM stage, pipelined sentence-by-sentence: while the LLM
-    // generates sentence N+1 the TTS consumer is already speaking sentence
-    // N, so first audio lands at the first sentence boundary instead of
-    // the last token.
     let llm_permit = match backends.llm_inflight.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
@@ -223,12 +199,8 @@ pub async fn run_turn(
         }
     };
 
-    // 8-sentence buffer absorbs a slow TTS step without back-pressuring
-    // the LLM read loop, but stays bounded so runaway generation can't OOM.
     let (sentence_tx, sentence_rx) = mpsc::channel::<String>(8);
 
-    // TTS permit is per-turn. None (capacity / TTS disabled) still drains
-    // the channel — the LLM read loop must never wedge — but skips /speak.
     let tts_permit = if !backends.tts.url.is_empty() {
         match backends.tts_inflight.clone().try_acquire_owned() {
             Ok(p) => Some(p),
@@ -258,16 +230,10 @@ pub async fn run_turn(
     let _ = consumer.await;
     drop(llm_permit);
 
-    // /finalize does the EOS/drained handshake against audio-io; its
-    // response is the precise speaker-silent moment. Skipped when empty
-    // (tail_quiet_ms must then absorb the playback-ring drain too).
     if !backends.tts.finalize_url.is_empty() {
         tts_finalize(&backends).await;
     }
 
-    // Open the post-TTS VAD quiet window: VAD's silence hangover fires SE
-    // ~200 ms after audio actually ended, and that SE would otherwise
-    // dispatch an echo turn.
     if !backends.tts.url.is_empty() && backends.tts.tail_quiet_ms > 0 {
         let until = Instant::now() + Duration::from_millis(backends.tts.tail_quiet_ms);
         *backends.tts_quiet_until.lock().expect("tts_quiet poisoned") = Some(until);
@@ -346,8 +312,6 @@ fn spawn_tts_consumer(
     })
 }
 
-/// Inner POST; permit management is the caller's responsibility. `api` is
-/// only a log label — dispatch is by `url`.
 async fn tts_speak_inner(backends: &Backends, api: &str, url: &str, text: &str) {
     info!(
         target: "orch::pipeline",
@@ -387,7 +351,6 @@ async fn tts_speak_inner(backends: &Backends, api: &str, url: &str, text: &str) 
     }
 }
 
-/// Speak the wake-ack phrase via `/speak`; best-effort no-op when unconfigured.
 pub async fn tts_wake_ack(backends: &Backends) {
     let text = backends.tts.wake_ack_text.trim();
     if text.is_empty() || backends.tts.url.is_empty() {
@@ -396,9 +359,6 @@ pub async fn tts_wake_ack(backends: &Backends) {
     tts_speak_inner(backends, "wake-ack", &backends.tts.url, text).await;
 }
 
-/// POST `tts.finalize_url`; returns when audio-io reports its playback
-/// ring empty (= speaker silent). Caller must have drained every
-/// per-sentence /speak first. Failures never propagate.
 pub async fn tts_finalize(backends: &Backends) {
     if backends.tts.finalize_url.is_empty() {
         return;
@@ -439,8 +399,6 @@ pub async fn tts_finalize(backends: &Backends) {
     }
 }
 
-/// POST `tts.stop_url` to cancel an in-flight `/speak` (barge-in).
-/// Failures never propagate — the wake state has already transitioned.
 pub async fn tts_stop(backends: &Backends) {
     if backends.tts.stop_url.is_empty() {
         return;
@@ -491,7 +449,6 @@ async fn asr_transcribe(backends: &Backends, wav: Vec<u8>) -> Result<String> {
     if !status.is_success() {
         anyhow::bail!("ASR responded {status}: {body}");
     }
-    // whisper-server with response_format=json returns {"text": "..."}.
     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
     let text = parsed
         .get("text")
@@ -501,18 +458,12 @@ async fn asr_transcribe(backends: &Backends, wav: Vec<u8>) -> Result<String> {
     Ok(text)
 }
 
-/// Streaming /api/chat: parses ollama's ndjson, accumulates content
-/// deltas, and emits each completed sentence into `sentence_tx`; returns
-/// the full reply. On barge-in it returns early, dropping the response
-/// stream (closing the connection so ollama stops generating).
 async fn llm_chat_streaming(
     backends: &Backends,
     wake: &WakeMachine,
     user_text: &str,
     sentence_tx: mpsc::Sender<String>,
 ) -> Result<String> {
-    // ollama's /api/chat normalises {role:"system"} into the model's chat
-    // template regardless of which model is loaded.
     let mut messages = Vec::with_capacity(2);
     if !backends.llm.system_prompt.is_empty() {
         messages.push(ChatMessage {
@@ -549,13 +500,10 @@ async fn llm_chat_streaming(
     // valid string boundary. Hard cap so a malformed upstream that never
     // emits `\n` can't grow unboundedly — ollama emits one ndjson line
     // per delta token, so real replies stay far under it.
-    const LLM_STREAM_BUF_MAX: usize = 1 << 20; // 1 MiB
+    const LLM_STREAM_BUF_MAX: usize = 1 << 20;
     let mut byte_buf: Vec<u8> = Vec::new();
     let mut sentence_buf = String::new();
     let mut full_reply = String::new();
-    // TTFB = first body chunk (prompt eval); TTFS = first sentence
-    // boundary — together they separate model warm-up from verbose
-    // preamble when diagnosing slow turns.
     let mut first_chunk_logged = false;
     let mut first_sentence_logged = false;
     // Pending `<...` span (including the `<`), buffered until its `>`
@@ -575,7 +523,7 @@ async fn llm_chat_streaming(
             .context("read /api/chat stream")?;
         let chunk = match chunk {
             Some(c) => c,
-            None => break, // EOF without explicit done:true — flush below.
+            None => break,
         };
         if !first_chunk_logged {
             info!(
@@ -617,8 +565,6 @@ async fn llm_chat_streaming(
                 .and_then(|c| c.as_str())
                 .unwrap_or("");
             if !delta.is_empty() {
-                // Drop <...> spans per the angle_buf policy above; text
-                // re-emitted past the cap is deliberately not rescanned.
                 let mut cleaned = String::with_capacity(delta.len());
                 for ch in delta.chars() {
                     if !angle_buf.is_empty() {
@@ -666,7 +612,6 @@ async fn llm_chat_streaming(
                             first_sentence_logged = true;
                         }
                         if sentence_tx.send(sentence).await.is_err() {
-                            // Consumer gone — abandon stream.
                             return Ok(full_reply);
                         }
                     }
@@ -683,14 +628,11 @@ async fn llm_chat_streaming(
         }
     }
 
-    // A `<...` still pending at end-of-stream was content after all (or
-    // truncated markup); speak it rather than lose it.
     if !angle_buf.is_empty() {
         sentence_buf.push_str(&angle_buf);
         full_reply.push_str(&angle_buf);
         angle_buf.clear();
     }
-    // Flush trailing partial sentence (final chunk had no terminator).
     let tail = sentence_buf.trim().to_string();
     if !tail.is_empty() && wake.pipeline_still_active() {
         let _ = sentence_tx.send(tail).await;
@@ -698,8 +640,6 @@ async fn llm_chat_streaming(
     Ok(full_reply.trim().to_string())
 }
 
-/// Return the byte offset *after* the first sentence terminator, or None.
-///
 /// Policy: `。 ！ ？ 、 … \n` terminate unconditionally (`、` is safe —
 /// never mid-numeric, and VOICEVOX renders a clean prosodic pause there).
 /// ASCII `. ! ?` terminate *only when followed by whitespace*: without an
@@ -799,8 +739,6 @@ mod tests {
             Some(Instant::now() + Duration::from_millis(50));
         assert!(backends.in_tts_quiet_window());
 
-        // Lapsed deadline is intentionally left set; service.rs never
-        // clears it because a stale past Instant is a no-op.
         *backends.tts_quiet_until.lock().unwrap() =
             Some(Instant::now() - Duration::from_millis(1));
         assert!(!backends.in_tts_quiet_window());
@@ -811,8 +749,6 @@ mod tests {
 
     #[test]
     fn in_tts_quiet_window_boundary_exactly_now_is_not_active() {
-        // Pins the strict `t > Instant::now()` comparison so a refactor
-        // to >= doesn't silently widen the echo-suppression window.
         let backends = Backends::new(
             crate::config::AsrConfig::default(),
             crate::config::LlmConfig::default(),
@@ -825,24 +761,17 @@ mod tests {
         assert!(!backends.in_tts_quiet_window());
     }
 
-    // llm_chat_streaming tests mock ollama's ndjson stream with a
-    // hand-rolled TCP server to exercise the parsing path (chunk
-    // re-assembly, ndjson splitting, sentence drain) on the real reqwest
-    // stack, where streaming bugs hide.
-
     use crate::config::{AsrConfig, LlmConfig, ResultSinkConfig, TtsConfig, WakeConfig};
     use crate::state::WakeMachine;
     use std::sync::Arc as StdArc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    /// One-shot HTTP server returning a fixed ndjson body.
     async fn spawn_mock_llm(body: Vec<u8>) -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
-            // Drain just enough of the request that the client's POST completes.
             let mut buf = [0u8; 4096];
             let _ = sock.read(&mut buf).await;
             let header = format!(
@@ -857,7 +786,6 @@ mod tests {
         addr
     }
 
-    /// Minimal `Backends` whose llm.url points at `addr`.
     fn backends_with_llm_addr(addr: std::net::SocketAddr) -> StdArc<Backends> {
         let asr = AsrConfig::default();
         let mut llm = LlmConfig::default();
@@ -868,7 +796,6 @@ mod tests {
         StdArc::new(Backends::new(asr, llm, tts, result_sink).unwrap())
     }
 
-    /// Always-listening `WakeMachine` so `pipeline_still_active()` stays true.
     fn loose_wake() -> StdArc<WakeMachine> {
         let mut cfg = WakeConfig::default();
         cfg.required = false;
@@ -877,8 +804,6 @@ mod tests {
 
     #[tokio::test]
     async fn llm_chat_streaming_drains_japanese_sentences_in_order() {
-        // The middle delta crosses a sentence boundary to exercise
-        // accumulation across deltas.
         let body = concat!(
             r#"{"message":{"content":"こんにちは"}}"#, "\n",
             r#"{"message":{"content":"。今日は"}}"#, "\n",
@@ -939,7 +864,6 @@ mod tests {
         while let Some(s) = rx.recv().await {
             sentences.push(s);
         }
-        // `、` splits; ASCII `,` and `.` inside numerics must not.
         assert_eq!(
             sentences,
             vec!["値段は1,000円で、", "サイズは1.5メートルです。"]
@@ -1005,7 +929,6 @@ mod tests {
 
     #[tokio::test]
     async fn llm_chat_streaming_drops_angle_span_but_keeps_unclosed_tail() {
-        // The <...> span straddles two deltas and must still be dropped.
         let body = concat!(
             r#"{"message":{"content":"<|th"}}"#, "\n",
             r#"{"message":{"content":"ink|>今日は晴れ。3<5 だよ。"}}"#, "\n",

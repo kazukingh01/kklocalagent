@@ -1,8 +1,3 @@
-//! livekit-wakeword runtime — drop-in replacement for the openwakeword
-//! Python shim (same wire contract: audio-io `/mic` WS in, orchestrator
-//! `/events` POST out, `/health` for compose's `service_healthy` gate).
-//! Pipeline: ws_client → detector → event_sink, one Tokio task per stage.
-
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -26,10 +21,6 @@ pub struct Detection {
     pub ts: f64,
 }
 
-/// One PCM frame from audio-io's `/mic?ts=1` WS. The 8-byte header is the
-/// wall-clock time of the frame's *last* sample (epoch ns), letting the
-/// detector compute true end-to-end lag (arrival time would hide
-/// audio-io/broadcast/network delay).
 #[derive(Debug, Clone)]
 pub struct MicFrame {
     pub end_epoch_ns: u64,
@@ -52,8 +43,6 @@ async fn main() -> Result<()> {
     let model_loaded = Arc::new(AtomicBool::new(false));
     let ws_connected = Arc::new(AtomicBool::new(false));
 
-    // 32 frames ≈ 640 ms back-pressure tolerance before audio-io's
-    // broadcast channel (~1.28 s upstream) starts dropping.
     let (pcm_tx, pcm_rx) = mpsc::channel::<MicFrame>(32);
     let (det_tx, det_rx) = mpsc::channel::<Detection>(8);
 

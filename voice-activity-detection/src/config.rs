@@ -3,9 +3,6 @@ use std::path::Path;
 use clap::ValueEnum;
 use serde::Deserialize;
 
-/// Where SpeechStarted/SpeechEnded events go: `DryRun` logs JSON only,
-/// `AsrDirect` POSTs utterance WAVs to whisper.cpp `/inference`,
-/// `Orchestrator` POSTs the envelope (needs `log_audio_in_event = true`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 #[clap(rename_all = "kebab-case")]
@@ -57,11 +54,7 @@ pub struct DetectorConfig {
     pub sample_rate: u32,
     /// Must match audio-io wire format; webrtc-vad accepts 10/20/30 ms only.
     pub frame_ms: u32,
-    /// Consecutive voiced frames before SpeechStarted; any silent frame
-    /// resets the run, so single-frame blips can't trigger spurious utterances.
     pub start_frames: u32,
-    /// Consecutive silent frames before SpeechEnded; covers natural
-    /// breath pauses mid-utterance.
     pub hang_frames: u32,
     pub max_utterance_frames: u32,
     /// RNNoise (nnnoiseless) pre-stage before VAD classification. Reduces
@@ -81,8 +74,6 @@ pub struct SinkConfig {
     pub mode: SinkMode,
     pub orchestrator_url: String,
     pub asr_url: String,
-    /// asr-direct POST timeout (ms). `large-v3-turbo` on a 30 s utterance
-    /// can approach the default 30 s ceiling.
     pub asr_timeout_ms: u64,
     /// Max in-flight asr-direct POSTs; excess utterances are dropped with
     /// a warning so backpressure is observable instead of presenting as
@@ -90,8 +81,6 @@ pub struct SinkConfig {
     pub asr_max_inflight: u32,
     pub orchestrator_timeout_ms: u64,
     pub orchestrator_max_inflight: u32,
-    /// Include base64 utterance audio in SpeechEnded logs and in the
-    /// orchestrator envelope — required there or the orchestrator can't run ASR.
     pub log_audio_in_event: bool,
 }
 
@@ -110,9 +99,9 @@ impl Default for DetectorConfig {
             aggressiveness: 2,
             sample_rate: 16000,
             frame_ms: 20,
-            start_frames: 3,          // ~60 ms of speech
-            hang_frames: 20,          // ~400 ms of silence
-            max_utterance_frames: 1500, // 30 s
+            start_frames: 3,
+            hang_frames: 20,
+            max_utterance_frames: 1500,
             denoise: false,
             min_utterance_rms_dbfs: 0.0,
         }

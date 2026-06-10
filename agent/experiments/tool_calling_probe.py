@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""Gemma 4 + Ollama の tool-calling サポートを 3 ケースで確認する最小プローブ
-(issue #19)。agent コンテナや langchain を経由せず Ollama /api/chat を直接叩く。
-"""
-
 from __future__ import annotations
 
 import json
@@ -65,7 +61,6 @@ def chat(user_text: str) -> dict:
 
 
 def summarize(resp: dict) -> tuple[list[str], str]:
-    """Return (tool_call_names, assistant_text)."""
     msg = resp.get("message") or {}
     tool_calls = msg.get("tool_calls") or []
     names = []

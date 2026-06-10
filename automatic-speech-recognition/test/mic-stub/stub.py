@@ -1,13 +1,3 @@
-"""
-Mimics audio-io's `/mic` WS endpoint (audio-io is Windows-native, outside
-compose) by replaying wav files as 20 ms PCM frames. Wire format must match
-audio-io: s16le, 16 kHz, mono, 640 bytes/frame. Replays LOOP_COUNT times
-(0 = infinite) with silence gaps so the VAD's hang_frames can fire
-SpeechEnded, then idles with silence forever — stops new transcriptions
-without provoking VAD reconnect-spam. SAMPLE_PATHS (comma-separated) plays
-several wavs per loop; SAMPLE_PATH stays for back-compat.
-"""
-
 import asyncio
 import os
 import sys
@@ -21,12 +11,12 @@ PORT = int(os.environ.get("PORT", "7010"))
 SAMPLE_PATH = os.environ.get("SAMPLE_PATH", "/samples/jfk.wav")
 SAMPLE_PATHS_RAW = os.environ.get("SAMPLE_PATHS", "")
 LOOP_DELAY_MS = int(os.environ.get("LOOP_DELAY_MS", "2000"))
-LOOP_COUNT = int(os.environ.get("LOOP_COUNT", "1"))  # 0 = infinite
+LOOP_COUNT = int(os.environ.get("LOOP_COUNT", "1"))
 INTER_SAMPLE_SILENCE_MS = int(os.environ.get("INTER_SAMPLE_SILENCE_MS", str(LOOP_DELAY_MS)))
 
 SAMPLE_RATE = 16000
 FRAME_MS = 20
-BYTES_PER_FRAME = SAMPLE_RATE // 1000 * FRAME_MS * 2  # 640
+BYTES_PER_FRAME = SAMPLE_RATE // 1000 * FRAME_MS * 2
 
 
 def resolve_sample_paths() -> List[str]:
@@ -73,8 +63,6 @@ async def stream(ws, pcms: List[bytes]) -> None:
             if idx < len(pcms) - 1:
                 await stream_silence(ws, inter_sample_silence_frames, frame_period)
         loops_done += 1
-        # Trailing silence lets the VAD's hang_frames fire SpeechEnded for
-        # the loop's last utterance.
         await stream_silence(ws, loop_delay_frames, frame_period)
 
     print(

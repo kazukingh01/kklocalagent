@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# `uv run` materialises the .venv from uv.lock on demand — no manual
-# activate needed. GPU recommended; CPU is hours+.
 
 set -euo pipefail
 

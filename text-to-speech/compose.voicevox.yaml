@@ -1,5 +1,3 @@
-# audio-io はコンテナ外で別途起動済み前提。接続先は WINDOWS_HOST で差し替える。
-
 services:
   voicevox:
     build:
@@ -22,16 +20,11 @@ services:
       VOICEVOX_SPEED_SCALE: "${VOICEVOX_SPEED_SCALE:-1.0}"
       SPK_URL: ws://${WINDOWS_HOST:-host.docker.internal}:7010/spk
       AUDIO_IO_BASE: http://${WINDOWS_HOST:-host.docker.internal}:7010
-      # Post-prebuffer cadence (ms). Default 500 = realtime (matches
-      # 25-frame batch length). Lower to overrate the wire and
-      # compensate for measured environment drift; e.g. WS_PACING_MS=450
-      # sends ~11 % faster than realtime, useful when audio-io's cpal
-      # hardware clock outpaces this container's wall-clock.
+      # < 500 overrates the wire to compensate for clock drift — e.g. on
+      # WSL2 hosts audio-io's cpal hardware clock outpaces this
+      # container's wall-clock by ~10 %, and 450 keeps the ring topped up.
       WS_PACING_MS: "${WS_PACING_MS:-500}"
     extra_hosts:
-      # 素の Linux docker (Docker Desktop / WSL2 以外) は
-      # host.docker.internal を解決しない。host-gateway で docker bridge
-      # gateway = host に向ける。
       - "host.docker.internal:host-gateway"
     ports:
       - "7070:7070"

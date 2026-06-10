@@ -1,12 +1,6 @@
 .venv/
-
-# Setup downloads (VoxCPM2 weights, ACAV100M ~16 GB, RIRs, backgrounds);
-# re-fetched via `livekit-wakeword setup --config <yaml>`.
 data/
-
-# Per-run, GB-scale artefacts; published models go out via GitHub releases.
 output/
-
 nohup.out
 __pycache__/
 *.pyc

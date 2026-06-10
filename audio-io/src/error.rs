@@ -13,7 +13,6 @@ pub enum AudioError {
 }
 
 impl AudioError {
-    /// Recover a typed device error wrapped anywhere in the `anyhow` cause chain.
     pub fn from_chain(e: anyhow::Error) -> Self {
         for cause in e.chain() {
             if let Some(a) = cause.downcast_ref::<AudioError>() {

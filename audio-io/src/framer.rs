@@ -25,12 +25,9 @@ fn make_resampler(input_rate: u32, output_rate: u32, chunk_size: usize) -> Resul
 }
 
 fn resample_chunk_for(rate: u32) -> usize {
-    // ~10ms of input; rubato requires a fixed chunk per call.
     (rate as usize).div_ceil(100).max(160)
 }
 
-/// Native-format interleaved mic samples → s16le mono frames at a fixed
-/// target rate; emits zero or more complete frames per push.
 pub struct CaptureFramer {
     native_channels: usize,
     target_samples_per_frame: usize,
@@ -109,8 +106,6 @@ impl CaptureFramer {
     }
 }
 
-/// s16le mono bytes at `source_rate` → interleaved f32 at the native output
-/// rate × channel count.
 pub struct PlaybackFramer {
     native_channels: usize,
     resampler: Option<SincFixedIn<f32>>,
@@ -136,8 +131,6 @@ impl PlaybackFramer {
         })
     }
 
-    /// Call on barge-in: residual audio already consumed from the wire but not
-    /// yet pushed into the ring must not leak after the flush flag clears.
     pub fn flush(&mut self) {
         self.mono_buf.clear();
         self.resampled_buf.clear();
@@ -146,9 +139,6 @@ impl PlaybackFramer {
         }
     }
 
-    /// Odd-length input is rejected upstream to avoid silent stream desync.
-    /// Mono is duplicated across all native channels, so on 5.1+ output every
-    /// surround channel plays at full level — audible but not broken.
     pub fn push_s16le(&mut self, bytes: &[u8]) -> Vec<f32> {
         for pair in bytes.chunks_exact(2) {
             let v = i16::from_le_bytes([pair[0], pair[1]]);
@@ -204,7 +194,6 @@ mod tests {
         let mut f = CaptureFramer::new(48000, 1, 16000, 320).unwrap();
         let input = vec![0.0f32; 48000];
         let frames = f.push_f32(&input);
-        // ~50 frames expected; slack allows for resampler warmup.
         assert!(frames.len() >= 45, "got {} frames", frames.len());
         for fr in &frames {
             assert_eq!(fr.len(), 640);
@@ -230,7 +219,7 @@ mod tests {
     #[test]
     fn playback_flush_clears_residual() {
         let mut p = PlaybackFramer::new(16000, 48000, 1).unwrap();
-        let partial = vec![0x10u8; 32]; // well under the resample chunk, so it sits in mono_buf
+        let partial = vec![0x10u8; 32];
         let out = p.push_s16le(&partial);
         assert!(
             out.len() < 100,
@@ -249,7 +238,6 @@ mod tests {
         let total: Vec<f32> = vec![0.0; 48000];
         let mut frames_total = 0;
         for chunk in total.chunks(777) {
-            // 777 is deliberately not a multiple of the internal chunk size.
             frames_total += f.push_f32(chunk).len();
         }
         assert!(

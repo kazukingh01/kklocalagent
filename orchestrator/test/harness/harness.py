@@ -1,11 +1,3 @@
-"""Test harness for the orchestrator: hosts mock backends (ASR / LLM /
-TTS / sink) and drives the orchestrator's /events from the same process.
-
-One process (not separate driver+mock containers) because the barge-in
-tests hold /speak open via asyncio.Event so /stop can release it — that
-coordination must stay local.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -39,8 +31,6 @@ log = logging.getLogger("harness")
 
 
 class Mocks:
-    """Counters + per-call payload capture for each downstream endpoint."""
-
     def __init__(self) -> None:
         self.asr_calls: list[dict[str, Any]] = []
         self.llm_calls: list[dict[str, Any]] = []
@@ -94,7 +84,6 @@ class Mocks:
         self.speak_in_progress.clear()
 
     async def asr_handler(self, request: web.Request) -> web.Response:
-        # whisper.cpp speaks multipart.
         reader = await request.multipart()
         size = 0
         had_response_format = False
@@ -128,9 +117,6 @@ class Mocks:
                 pass
         if self.llm_status != 200:
             return web.json_response({"error": "mock"}, status=self.llm_status)
-        # Mirror ollama's ndjson contract: one line per delta plus a final
-        # `{done: true}` line. The whole `llm_content` goes in one delta;
-        # real ollama emits one line per token — the parser handles either.
         if body.get("stream"):
             response = web.StreamResponse(status=200)
             response.content_type = "application/x-ndjson"
@@ -154,7 +140,6 @@ class Mocks:
             await response.write(final.encode())
             await response.write_eof()
             return response
-        # Non-streaming path: no current caller exercises it.
         return web.json_response(
             {
                 "model": body.get("model"),
@@ -206,8 +191,6 @@ def vad_speech_started(frame: int = 0) -> dict[str, Any]:
 
 
 def vad_speech_ended(audio: bytes | None = b"") -> dict[str, Any]:
-    """SpeechEnded as VAD emits it; audio=None omits audio_base64
-    (exercises the has_utterance_audio() pre-gate skip)."""
     env = {
         "name": "SpeechEnded",
         "ts": time.time(),
@@ -233,7 +216,6 @@ def wake_word_detected(model: str = "alexa", score: float = 0.95) -> dict[str, A
 
 
 def unknown_event() -> dict[str, Any]:
-    """Event name the orchestrator hasn't learned about (forward-compat)."""
     return {
         "name": "SomeFutureEvent",
         "ts": time.time(),
@@ -244,7 +226,6 @@ def unknown_event() -> dict[str, Any]:
 async def post_event(
     session: aiohttp.ClientSession, orch_url: str, env: dict[str, Any]
 ) -> int:
-    """POST /events on the orchestrator; returns the status code."""
     async with session.post(
         f"{orch_url}/events", json=env, timeout=aiohttp.ClientTimeout(total=5)
     ) as r:
@@ -278,7 +259,6 @@ Test = Callable[[aiohttp.ClientSession, str, Mocks], Awaitable[None]]
 async def strict_drop_se_without_wake(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
-    """SpeechEnded with no preceding wake must be dropped entirely."""
     mocks.reset()
     await post_event(session, orch, vad_speech_ended())
     await asyncio.sleep(SETTLE_SEC)
@@ -291,9 +271,6 @@ async def strict_drop_se_without_wake(
 async def strict_system_prompt_prepended(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
-    """ORCH_LLM_SYSTEM_PROMPT must arrive as {role:"system"} *before* the
-    user turn — catches the regression where the system message lands after
-    `user` (some clients do this and the LLM ignores it)."""
     mocks.reset()
     await post_event(session, orch, wake_word_detected())
     await post_event(session, orch, vad_speech_ended())
@@ -317,8 +294,6 @@ async def strict_system_prompt_prepended(
 async def strict_happy_path(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
-    """wake → SE → full pipeline; payload equality across stages proves the
-    orchestrator chained ASR→LLM→TTS rather than firing in parallel."""
     mocks.reset()
     await post_event(session, orch, wake_word_detected())
     await post_event(session, orch, vad_speech_ended())
@@ -346,9 +321,6 @@ async def strict_happy_path(
 async def strict_se_during_turn_dropped(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
-    """A second SpeechEnded arriving WHILE a turn is mid-pipeline must be
-    dropped regardless of arm state. speak_blocks holds /speak open so the
-    Processing phase is observable deterministically."""
     mocks.reset()
     mocks.speak_blocks = True
 
@@ -359,8 +331,6 @@ async def strict_se_during_turn_dropped(
     except asyncio.TimeoutError:
         raise AssertionError("TTS /speak never entered the blocking phase")
 
-    # Orchestrator is now in Processing; the gate must return InTurn for
-    # this SE (drop without affecting the running turn).
     await post_event(session, orch, vad_speech_ended())
 
     mocks.speak_release.set()
@@ -374,13 +344,10 @@ async def strict_se_during_turn_dropped(
 async def strict_followup_within_window_dispatches(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
-    """SpeechEnded within `turn_followup_window_ms` of a turn ending must
-    dispatch *without* a fresh wake. (Replaces the v0.x "single-use arm"
-    scenario, which expected the second SE to be dropped.)"""
     mocks.reset()
     await post_event(session, orch, wake_word_detected())
     await post_event(session, orch, vad_speech_ended())
-    await asyncio.sleep(SETTLE_SEC)  # turn drains → ArmedAfterTurn
+    await asyncio.sleep(SETTLE_SEC)
     await post_event(session, orch, vad_speech_ended())
     await asyncio.sleep(SETTLE_SEC)
     expect(len(mocks.asr_calls), 2, "ASR (follow-up dispatched)")
@@ -391,12 +358,10 @@ async def strict_followup_within_window_dispatches(
 async def strict_followup_window_expires(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
-    """After `turn_followup_window_ms` with no SpeechEnded, state returns
-    to Idle and the next SE is dropped."""
     mocks.reset()
     await post_event(session, orch, wake_word_detected())
     await post_event(session, orch, vad_speech_ended())
-    await asyncio.sleep(SETTLE_SEC)  # turn drains → ArmedAfterTurn
+    await asyncio.sleep(SETTLE_SEC)
     await asyncio.sleep(TURN_FOLLOWUP_WINDOW_MS / 1000.0 + 0.5)
     await post_event(session, orch, vad_speech_ended())
     await asyncio.sleep(SETTLE_SEC)
@@ -407,14 +372,10 @@ async def strict_followup_window_expires(
 async def strict_wake_during_followup_resets_to_armed_after_wake(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
-    """Wake during the follow-up window → ArmedAfterWake (timer resets to
-    wake_window_ms). Spec: "B 中の WWD は A に遷移". Which window was used
-    isn't directly observable; we assert the sink forward + dispatch."""
     mocks.reset()
     await post_event(session, orch, wake_word_detected())
     await post_event(session, orch, vad_speech_ended())
-    await asyncio.sleep(SETTLE_SEC)  # ArmedAfterTurn
-    # Second wake during ArmedAfterTurn → ArmedAfterWake.
+    await asyncio.sleep(SETTLE_SEC)
     await post_event(session, orch, wake_word_detected())
     await post_event(session, orch, vad_speech_ended())
     await asyncio.sleep(SETTLE_SEC)
@@ -426,7 +387,6 @@ async def strict_wake_during_followup_resets_to_armed_after_wake(
 async def strict_wake_window_expires(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
-    """A stale wake (older than the post-wake window) must not dispatch."""
     mocks.reset()
     await post_event(session, orch, wake_word_detected())
     await asyncio.sleep(WAKE_WINDOW_MS / 1000.0 + 0.5)
@@ -439,7 +399,6 @@ async def strict_wake_window_expires(
 async def strict_wake_always_to_sink(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
-    """Every WakeWordDetected forwards to result_sink, turn or no turn."""
     mocks.reset()
     for _ in range(3):
         await post_event(session, orch, wake_word_detected())
@@ -453,10 +412,9 @@ async def strict_wake_always_to_sink(
 async def strict_barge_in_during_asr_aborts(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
-    """Wake while ASR is in flight must abort the rest of the turn (no
-    LLM/TTS/TurnCompleted). asr_calls still counts 1: the mock appends at
-    request entry, before its release-event await — the orchestrator drops
-    the connection on abort, but the append has already fired."""
+    """asr_calls still counts 1 on abort: the mock appends at request
+    entry, before its release-event await — the orchestrator drops the
+    connection on abort, but the append has already fired."""
     mocks.reset()
     mocks.asr_blocks = True
 
@@ -467,11 +425,8 @@ async def strict_barge_in_during_asr_aborts(
     except asyncio.TimeoutError:
         raise AssertionError("ASR /inference never entered the blocking phase")
 
-    # Orchestrator is blocked inside ASR. Barge-in flips Processing → Armed
-    # and POSTs tts /stop (no-op because no /speak yet).
     await post_event(session, orch, wake_word_detected())
 
-    # Release ASR so run_turn can reach its post-ASR check.
     mocks.asr_release.set()
     await asyncio.sleep(SETTLE_SEC)
 
@@ -485,10 +440,9 @@ async def strict_barge_in_during_asr_aborts(
 async def strict_barge_in_during_llm_aborts(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
-    """ASR variant with the wake mid-LLM: asr_calls=1 and llm_calls=1, but
-    the task abort cancels the streaming /api/chat response (closing the
-    connection so ollama would stop generating) before any sentence
-    reaches the TTS consumer."""
+    """llm_calls still counts 1 on abort: the task abort cancels the
+    streaming /api/chat response (closing the connection so ollama would
+    stop generating) before any sentence reaches the TTS consumer."""
     mocks.reset()
     mocks.llm_blocks = True
 
@@ -514,7 +468,6 @@ async def strict_barge_in_during_llm_aborts(
 async def strict_barge_in_cancels_tts(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
-    """Wake during /speak must POST tts /stop and re-arm."""
     mocks.reset()
     mocks.speak_blocks = True
 
@@ -537,8 +490,6 @@ async def strict_barge_in_cancels_tts(
 async def strict_unknown_event_is_acked(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
-    """Unknown event names must be acked with 200 and trigger nothing —
-    forward-compat guard for upstream rollouts that lead the orchestrator."""
     mocks.reset()
     status = await post_event(session, orch, unknown_event())
     expect(status, 200, "POST /events status (unknown event)")
@@ -551,7 +502,6 @@ async def strict_unknown_event_is_acked(
 async def strict_speech_started_alone(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
-    """SpeechStarted is informational — no backend calls, stays healthy."""
     mocks.reset()
     await post_event(session, orch, vad_speech_started(frame=42))
     await asyncio.sleep(SETTLE_SEC)
@@ -572,7 +522,6 @@ async def strict_se_without_audio_preserves_arm(
     await asyncio.sleep(SETTLE_SEC)
     expect(len(mocks.asr_calls), 0, "ASR (audio missing)")
 
-    # Arm should still be live.
     await post_event(session, orch, vad_speech_ended())
     await asyncio.sleep(SETTLE_SEC)
     expect(len(mocks.asr_calls), 1, "ASR after recovery")
@@ -581,7 +530,6 @@ async def strict_se_without_audio_preserves_arm(
 async def strict_asr_500_blocks_pipeline(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
-    """ASR 500 → short-circuit: no LLM, no TTS, no TurnCompleted."""
     mocks.reset()
     mocks.asr_status = 500
     await post_event(session, orch, wake_word_detected())
@@ -597,8 +545,6 @@ async def strict_asr_500_blocks_pipeline(
 async def strict_asr_empty_text_skips_llm(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
-    """ASR 200 with empty `text` (silence misclassified as speech) skips
-    LLM/TTS."""
     mocks.reset()
     mocks.asr_text = ""
     await post_event(session, orch, wake_word_detected())
@@ -612,7 +558,6 @@ async def strict_asr_empty_text_skips_llm(
 async def strict_llm_500_blocks_tts(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
-    """LLM 500 → no TTS, no TurnCompleted (no half-turn artifacts)."""
     mocks.reset()
     mocks.llm_status = 500
     await post_event(session, orch, wake_word_detected())
@@ -628,8 +573,6 @@ async def strict_llm_500_blocks_tts(
 async def strict_llm_empty_reply_skips_tts(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
-    """LLM 200 with empty `content`: TurnCompleted is still forwarded but
-    TTS is skipped — the streamer would 400 on empty text."""
     mocks.reset()
     mocks.llm_content = ""
     await post_event(session, orch, wake_word_detected())
@@ -645,8 +588,6 @@ async def strict_llm_empty_reply_skips_tts(
 async def strict_tts_500_does_not_block_turn(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
-    """TTS failure is best-effort: TurnCompleted is forwarded *before* the
-    speak attempt, so the activity log stays intact."""
     mocks.reset()
     mocks.tts_speak_status = 500
     await post_event(session, orch, wake_word_detected())
@@ -660,7 +601,6 @@ async def strict_tts_500_does_not_block_turn(
 async def strict_sink_500_does_not_break_pipeline(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
-    """result_sink is an observer — its failure must not block the turn."""
     mocks.reset()
     mocks.sink_status = 500
     await post_event(session, orch, wake_word_detected())
@@ -674,7 +614,6 @@ async def strict_sink_500_does_not_break_pipeline(
 async def loose_se_alone_dispatches(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
-    """Wake gate disabled: every SpeechEnded dispatches directly."""
     mocks.reset()
     await post_event(session, orch, vad_speech_ended())
     await asyncio.sleep(SETTLE_SEC)
@@ -686,7 +625,6 @@ async def loose_se_alone_dispatches(
 async def no_barge_mid_turn_wake_does_not_cancel(
     session: aiohttp.ClientSession, orch: str, mocks: Mocks
 ) -> None:
-    """barge_in=false: a wake during TTS must NOT fire /stop."""
     mocks.reset()
     mocks.speak_blocks = True
 

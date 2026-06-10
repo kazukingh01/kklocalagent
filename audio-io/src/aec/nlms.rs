@@ -1,25 +1,19 @@
-//! Pure-Rust echo canceller: bulk-delay estimator + NLMS adaptive filter +
-//! adaptive residual suppressor.
-
 use std::collections::VecDeque;
 
 use crate::pcm::{f32_to_i16, i16_to_f32};
 
 use super::{CancellerStats, EchoCanceller};
 
-/// NLMS step size. 0 < mu < 2 for stability; 0.3 converges in a few hundred ms
-/// without ringing on a 16 kHz stream.
+/// 0 < mu < 2 for stability; 0.3 converges in a few hundred ms without ringing.
 const NLMS_MU: f32 = 0.3;
-/// Per-tap regularization floor; the NLMS denominator is `reg + ||far||²` with
-/// `reg = NLMS_REG_PER_TAP * num_taps`. A tiny absolute floor (the old 1e-6)
-/// is catastrophic: with a quiet far-end under a loud near-end the step
-/// `mu*e/denom` explodes, weights run to ±inf, `inf - inf = NaN` poisons the
-/// filter and every output casts to 0 (`f32::NAN as i16 == 0`) — total silence
-/// (observed in the wild). 1e-4/tap stops the blowup without throttling
-/// convergence (≈11 dB ERLE offline vs ≈7 dB at 1e-3/tap).
+/// The old absolute 1e-6 denominator floor was catastrophic: a quiet far-end
+/// under a loud near-end made the step `mu*e/denom` explode, weights ran to
+/// ±inf, `inf - inf = NaN` poisoned the filter and every output cast to 0
+/// (`f32::NAN as i16 == 0`) — total silence, observed in the wild. 1e-4/tap
+/// stops the blowup without throttling convergence (≈11 dB ERLE offline vs
+/// ≈7 dB at 1e-3/tap).
 const NLMS_REG_PER_TAP: f32 = 1e-4;
-/// Leakage: weights decay by `(1 - NLMS_LEAK)` each sample, bleeding off the
-/// slow drift an un-regularized NLMS accumulates.
+/// Bleeds off the slow weight drift an un-regularized NLMS accumulates.
 const NLMS_LEAK: f32 = 1e-5;
 
 // Residual echo suppressor: the linear NLMS alone reaches only ~10-15 dB ERLE
@@ -27,12 +21,9 @@ const NLMS_LEAK: f32 = 1e-5;
 // removes the rest; its strength is *measured* from the signal (`erl`) instead
 // of a hand-tuned per-room/speaker/volume knob.
 //
-/// Over-subtraction on the measured residual-echo ratio. >1 digs past the
-/// estimate so echo-only output is firmly inaudible; trades echo depth against
-/// how much a double-talk talker is dented.
+/// >1 digs past the measured estimate so echo-only output is firmly inaudible;
+/// trades echo depth against how much a double-talk talker is dented.
 const NLP_OVERSUB: f64 = 2.0;
-/// Residual-echo ratio (residual energy / echo-estimate energy) before
-/// anything has been measured.
 const NLP_ERL_INIT: f32 = 0.1;
 /// ERL tracker (minimum-statistics style): fast pull toward a *lower* observed
 /// ratio (echo-only stretches reveal the true floor), slow drift back up so
@@ -41,14 +32,8 @@ const NLP_ERL_TRACK_DOWN: f32 = 0.2;
 const NLP_ERL_TRACK_UP: f32 = 0.002;
 const NLP_ERL_MIN: f32 = 0.003;
 const NLP_ERL_MAX: f32 = 1.0;
-/// Lowest suppressor gain: echo-only output is strongly attenuated but never
-/// fully muted (≈ -30 dB).
 const NLP_GAIN_FLOOR: f32 = 0.03;
-/// Far-end power below which nothing is playing — no echo to suppress, gain
-/// released to unity.
 const NLP_FAR_FLOOR: f64 = 1e-6;
-/// Attack (toward more suppression) is brisk so echo is caught within a couple
-/// of 20 ms frames.
 const NLP_ATTACK: f32 = 0.6;
 /// Release is SLOW while the far-end is active, so a residual spike or a gap
 /// between far-end words can't pop the gain back up and leak echo
@@ -64,9 +49,7 @@ const NLP_RELEASE_IDLE: f32 = 0.7;
 /// Envelope decimation (16 kHz → 2 kHz): delay needs coarse timing, not fine
 /// phase, so correlating decimated |signal| envelopes is cheap and robust.
 const DELAY_DECIM: usize = 8;
-/// Largest bulk delay searched (ms).
 const DELAY_MAX_MS: u32 = 500;
-/// Correlation window (ms of recent audio compared at each lag).
 const DELAY_WINDOW_MS: u32 = 256;
 const DELAY_ESTIMATE_MS: u32 = 250;
 /// Minimum normalized correlation to trust an estimate (rejects double-talk /
@@ -78,7 +61,6 @@ const DELAY_ENV_FLOOR: f32 = 0.01;
 /// Consecutive agreeing confident estimates required before (re)locking, so a
 /// single spurious frame can't move the pre-delay.
 const DELAY_LOCK_COUNT: u32 = 3;
-/// How close (ms) successive estimates must be to count as "agreeing".
 const DELAY_AGREE_MS: u32 = 16;
 /// Once locked, re-lock only on a move larger than this; small drift is left
 /// for the filter head-room, so the expensive filter reset stays rare.
@@ -94,9 +76,6 @@ fn push_capped(q: &mut VecDeque<f32>, v: f32, cap: usize) {
     q.push_back(v);
 }
 
-/// Envelope cross-correlation bulk-delay estimator: keeps decimated `|·|`
-/// envelopes and periodically reports the lag (full-rate samples) at which
-/// `near` best matches a delayed `far`, only when confident.
 struct DelayEstimator {
     far_env: VecDeque<f32>,
     near_env: VecDeque<f32>,
@@ -108,8 +87,8 @@ struct DelayEstimator {
     acc_n: usize,
     interval: usize,
     since: usize,
-    agree: usize,  // estimates within this many samples count as agreeing
-    relock: usize, // re-lock threshold (full-rate samples)
+    agree: usize,
+    relock: usize,
     // Only a delay confirmed DELAY_LOCK_COUNT times in a row is applied, then
     // held until a stable estimate differs by more than `relock` — resetting
     // the filter on every estimate was the bug that thrashed convergence.
@@ -143,7 +122,6 @@ impl DelayEstimator {
         }
     }
 
-    /// Returns a delay (full-rate samples) only when it (re)locks — rarely.
     fn push(&mut self, far: f32, near: f32) -> Option<usize> {
         self.far_acc += far.abs();
         self.near_acc += near.abs();
@@ -171,14 +149,13 @@ impl DelayEstimator {
         let near: Vec<f32> = self.near_env.iter().copied().collect();
         let far: Vec<f32> = self.far_env.iter().copied().collect();
         let nlen = near.len();
-        let n0 = nlen - self.window; // start of the most-recent `window` of near
+        let n0 = nlen - self.window;
         let mut near_e = 0.0f32;
-        let mut far_recent = 0.0f32; // mean |far| over the freshest window (gate)
+        let mut far_recent = 0.0f32;
         for j in 0..self.window {
             near_e += near[n0 + j] * near[n0 + j];
             far_recent += far[n0 + j];
         }
-        // Gate: don't estimate unless the far-end is actually playing.
         if near_e <= 1e-9 || far_recent / self.window as f32 <= DELAY_ENV_FLOOR {
             return None;
         }
@@ -244,32 +221,22 @@ pub struct Aec {
     /// Filter input history, newest at the front, paired index-for-index
     /// with `weights`.
     far_hist: VecDeque<f32>,
-    /// Running sum of squares of `far_hist`, maintained incrementally for the
-    /// NLMS normalization denominator.
+    /// Incrementally maintained `||far_hist||²`, the NLMS denominator.
     energy: f32,
     num_taps: usize,
-    /// `NLMS_REG_PER_TAP * num_taps`, precomputed for the per-sample hot loop.
     reg: f32,
-    /// Smoothed residual-suppressor gain (1.0 = pass-through), updated once per
-    /// frame.
     nlp_g: f32,
     /// Measured residual-echo ratio (residual energy / echo-estimate energy
     /// during echo-only stretches); drives the suppressor strength.
     erl: f32,
     sample_rate: u32,
     estimator: DelayEstimator,
-    /// Pre-delay line on the reference: absorbs the bulk transport delay so the
-    /// filter only models the reverb tail.
     predelay: VecDeque<f32>,
     predelay_len: usize,
-    /// Head-room (samples) ahead of the estimated echo so estimation error and
-    /// jitter still land within the taps.
     head_margin: usize,
 }
 
 impl Aec {
-    /// `filter_length_ms` is the reverb tail only; the bulk transport delay is
-    /// measured and removed by the pre-delay.
     pub fn new(sample_rate: u32, filter_length_ms: u32) -> Self {
         let num_taps = ((sample_rate as usize * filter_length_ms as usize) / 1000).max(1);
         Self {
@@ -323,7 +290,6 @@ impl Aec {
     }
 
     fn push_far(&mut self, x: f32) {
-        // Keep `energy` in sync incrementally instead of re-summing the window.
         if let Some(old) = self.far_hist.pop_back() {
             self.energy -= old * old;
         }
@@ -335,12 +301,11 @@ impl Aec {
         }
     }
 
-    /// near/far must be the same length (one 20 ms frame each).
     pub fn process_frame(&mut self, near: &[i16], far: &[i16]) -> Vec<i16> {
         let mut resid = Vec::with_capacity(near.len());
-        let mut sum_xx = 0.0f64; // far energy
-        let mut sum_yy = 0.0f64; // echo-estimate energy
-        let mut sum_ee = 0.0f64; // residual energy
+        let mut sum_xx = 0.0f64;
+        let mut sum_yy = 0.0f64;
+        let mut sum_ee = 0.0f64;
         let mut new_delay: Option<usize> = None;
         for (i, &d) in near.iter().enumerate() {
             let x_raw = i16_to_f32(far.get(i).copied().unwrap_or(0));
@@ -352,7 +317,6 @@ impl Aec {
             let x = self.predelay_sample(x_raw);
             self.push_far(x);
 
-            // Estimated echo = w · far_hist.
             let y: f32 = self
                 .weights
                 .iter()
@@ -453,10 +417,9 @@ impl Aec {
         (self.predelay_len as u32 * 1000) / self.sample_rate.max(1)
     }
 
-    /// `(weights L2, peak-tap index, peak-tap |value|)`. The peak tap is the
-    /// dominant echo delay in samples; a peak pinned at the last tap (or a
-    /// near-zero L2 that never grows) means the true echo sits at/after the
-    /// window edge and the filter can't reach it.
+    /// The peak tap is the dominant echo delay in samples; a peak pinned at the
+    /// last tap (or a near-zero L2 that never grows) means the true echo sits
+    /// at/after the window edge and the filter can't reach it.
     pub fn weight_stats(&self) -> (f32, usize, f32) {
         let mut l2 = 0.0f32;
         let mut peak_idx = 0usize;
@@ -502,23 +465,21 @@ mod tests {
         (sum / samples.len() as f64).sqrt()
     }
 
-    // Deterministic pseudo-random far-end (LCG) so the test needs no rng dep.
     fn lcg(seed: &mut u64) -> i16 {
         *seed = seed
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        ((*seed >> 48) as i16) / 4 // bounded amplitude
+        ((*seed >> 48) as i16) / 4
     }
 
     #[test]
     fn delay_estimator_finds_bulk_delay() {
         let rate = 16000;
-        let true_delay = 1600; // 100 ms
+        let true_delay = 1600;
         let mut est = DelayEstimator::new(rate);
         let mut seed = 0xabcd_1234u64;
         let mut line: VecDeque<f32> = VecDeque::from(vec![0.0; true_delay]);
         let mut found: Option<usize> = None;
-        // ~2 s of audio, well past the estimator warm-up.
         for _ in 0..rate * 2 {
             let far = lcg(&mut seed) as f32 / 32768.0;
             line.push_back(far);
@@ -606,8 +567,6 @@ mod tests {
 
     #[test]
     fn aec_cancels_short_delay_echo() {
-        // ~1 ms echo: the bulk-delay estimator reports ~0 (below the head
-        // margin), so the compact filter must model it directly from tap 0.
         let rate = 16000;
         let delay = 16;
         let mut aec = Aec::new(rate, 60);
@@ -638,8 +597,6 @@ mod tests {
 
     #[test]
     fn aec_preserves_uncorrelated_near_voice() {
-        // Double-talk: after the ERL learns the floor on echo-only audio, a
-        // mixed-in near tone must not be gated away as residual echo.
         let rate = 16000;
         let delay = 40;
         let mut aec = Aec::new(rate, 80);
@@ -650,7 +607,6 @@ mod tests {
         let mut last_voice_only_rms = 0.0;
         let mut last_resid_rms = 0.0;
 
-        // Phase 1: echo only — the ERL tracker learns the floor.
         for _ in 0..200 {
             let far: Vec<i16> = (0..frame_len).map(|_| lcg(&mut seed)).collect();
             let mut near = Vec::with_capacity(frame_len);
@@ -661,7 +617,6 @@ mod tests {
             }
             aec.process_frame(&near, &far);
         }
-        // Phase 2: double-talk burst — near voice mixed into the echo.
         for _ in 0..20 {
             let far: Vec<i16> = (0..frame_len).map(|_| lcg(&mut seed)).collect();
             let mut near = Vec::with_capacity(frame_len);
@@ -669,7 +624,7 @@ mod tests {
             for &f in &far {
                 echo_delay_line.push_back(f);
                 let delayed = echo_delay_line.pop_front().unwrap_or(0);
-                let voice = (3000.0 * (t * 0.05).sin()) as i16; // ~127 Hz tone
+                let voice = (3000.0 * (t * 0.05).sin()) as i16;
                 t += 1.0;
                 voice_only.push(voice);
                 near.push((delayed as f32 * 0.5) as i16 + voice);
@@ -699,7 +654,6 @@ mod tests {
         let mut near_acc: Vec<i16> = Vec::new();
 
         for _ in 0..200 {
-            // Constant 30 ≈ -60 dBFS: the pathological denominator regime.
             let far = vec![30i16; frame_len];
             let near: Vec<i16> = (0..frame_len)
                 .map(|_| {
