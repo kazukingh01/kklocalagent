@@ -451,17 +451,18 @@ services:
       # policy in agent/app.py — override in .env only if you need
       # different guidance (e.g. domain-specific tool etiquette).
       AGENT_TOOL_SYSTEM_SUFFIX: "${AGENT_TOOL_SYSTEM_SUFFIX:-}"
-      # Tool-use few-shot. gemma4 12B often answers in text instead of calling
-      # a tool (or fabricates success); showing it real example turns —
-      # Human -> AI(tool_calls) -> Tool(result) -> AI(reply) — teaches the
-      # exact tool-call shape and lifts reliability. Injected as a fixed prefix
-      # after the system prompt, before live history (cache-stable, not
-      # persisted). Default on here; set off in .env to A/B the impact. The
-      # builtin examples (agent/app.py) cover timer/stop/search; override the
-      # whole set with a JSON file via AGENT_TOOL_FEWSHOT_FILE (path inside the
-      # container, e.g. under the mounted /workspace/share). Ignored when
-      # AGENT_TOOLS_ENABLED=false.
-      AGENT_TOOL_FEWSHOT: "${AGENT_TOOL_FEWSHOT:-on}"
+      # Tool-use few-shot: example turns — Human -> AI(tool_calls) ->
+      # Tool(result) -> AI(reply) — injected before the latest user message.
+      # Default OFF: the fake-history examples are read by gemma4 12B as
+      # conversation *facts*, not procedure — on a similar live question it
+      # copies the example's final reply verbatim (observed: 「昨日はX月X日
+      # だよ。」 leaked from the placeholder example) INSTEAD of calling the
+      # tool. Tool-call shape is already enforced natively (peg-gemma4
+      # grammar), so set this on only to A/B; the builtin examples live in
+      # agent/app.py, or override the set with a JSON file via
+      # AGENT_TOOL_FEWSHOT_FILE (path inside the container, e.g. under the
+      # mounted /workspace/share). Ignored when AGENT_TOOLS_ENABLED=false.
+      AGENT_TOOL_FEWSHOT: "${AGENT_TOOL_FEWSHOT:-off}"
       AGENT_TOOL_FEWSHOT_FILE: "${AGENT_TOOL_FEWSHOT_FILE:-}"
       # run_shell tool — CSV of allowed command *names* (argv[0] match,
       # no prefix/regex). Empty list = run_shell is effectively disabled

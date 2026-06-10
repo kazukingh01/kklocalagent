@@ -208,32 +208,16 @@ def _build_run_shell_description() -> str:
     """
     if _SHELL_ALLOWLIST:
         listed = ", ".join(sorted(_SHELL_ALLOWLIST))
-        avail = f"Only these command names are allowed: **{listed}**"
+        avail = f"Allowed commands: {listed} — nothing else."
     else:
-        avail = (
-            "No commands are currently allowed "
-            "(AGENT_SHELL_ALLOWLIST is empty)"
-        )
-    cwd_hint = (
-        f"Current working directory is `{_FILE_ROOT}` "
-        "(same as the read_file root). Relative paths target files "
-        "inside that directory (e.g. `ls`, `cat memo.txt`). "
-        "Pass an absolute path to look elsewhere (e.g. `ls /etc`)."
-        if _FILE_ROOT
-        else "Current working directory is the agent container's "
-        "`/app`. Pass absolute paths to reach files outside it "
-        "(e.g. `ls /etc`)."
-    )
+        avail = "No commands are currently allowed (the allowlist is empty)."
+    cwd = f"`{_FILE_ROOT}` (the shared directory)" if _FILE_ROOT else "`/app`"
     return (
-        "Run one Linux shell command and return its stdout.\n\n"
-        f"{avail}. Anything else returns a [denied] error.\n"
-        "Pipes (`|`), redirects (`>`), and command chaining "
-        "(`;`, `&&`) are structurally impossible "
-        "(`shell=True` is not used).\n\n"
-        f"{cwd_hint}\n\n"
-        "`command` takes the executable name and its arguments "
-        "separated by spaces (e.g. `\"date\"`, `\"ls\"`). Each call "
-        "is capped at 5 seconds and stdout is truncated past 3KB."
+        "Run one Linux shell command and return its output. "
+        "Use it for the current date/time (`date`) or to list files (`ls`).\n"
+        f"{avail} No pipes, redirects, or `;`/`&&` chaining.\n"
+        f"`command` = executable + arguments (e.g. \"date\", \"ls news\"). "
+        f"Working directory: {cwd}."
     )
 
 
@@ -309,17 +293,12 @@ async def _web_search_impl(query: str) -> str:
 
 @tool
 async def web_search(query: str) -> str:
-    """Search the web and return up to 5 result summaries.
+    """Search the web and return up to 5 results (title / snippet / URL).
 
-    Call this for current news, product info, weather, or anything
-    you can't answer from your own knowledge. `query` is a natural-
-    language search string (e.g. `"weather in Tokyo today"`,
-    `"Rust async runtime comparison"`).
-
-    Results come back as `N. title / snippet / URL` per entry, up to
-    5 entries, with the whole payload capped at ~1500 characters.
-    Fetching full page bodies or following links is out of scope —
-    distil the snippets into a short natural-language answer.
+    Call this for news, weather, prices — anything current you can't
+    know yourself. `query` is a natural-language search string (e.g.
+    "東京 今日の天気"). You can't fetch full pages; answer from the
+    snippets in your own words.
     """
     return await _safe_invoke("web_search", _web_search_impl(query))
 
@@ -652,48 +631,26 @@ def _build_play_audio_description() -> str:
     user に伝えるよう誘導する。"""
     if not _AUDIO_IO_SPK_URL:
         return (
-            "Play one or more WAV audio files via the speaker.\n\n"
-            "**CURRENTLY UNAVAILABLE** — the AGENT_AUDIO_IO_SPK_URL env "
-            "is not set, so this feature is disabled in this environment. "
-            "Do NOT call this tool; instead, tell the user in one sentence "
-            "that audio playback is not configured here so they know the "
-            "limit is on the setup, not on their request."
+            "Play WAV audio file(s) on the speaker.\n"
+            "**UNAVAILABLE** — audio output is not configured here. Do NOT "
+            "call this; tell the user audio playback isn't set up."
         )
     path_hint = (
-        f"`paths` is a list of WAV file paths, each inside the share root "
-        f"`{_FILE_ROOT}`. Give them relative to that root (e.g. "
-        f"`share/foo.wav`) or as an absolute path within it (e.g. "
-        f"`/workspace/share/foo.wav`). An entry may also be a glob like "
-        f"`*.wav`, `news/2026*.wav`, or `**/*.wav`, which expands (sorted by "
-        f"name) to every matching .wav under the root — useful when you don't "
-        f"know exact filenames. Paths/globs outside the root (including via "
-        f"`..` or symlinks) are rejected."
+        f"`paths`: WAV paths under `{_FILE_ROOT}` — relative to that root or "
+        f"absolute inside it. An entry may be a glob (`*.wav`, "
+        f"`news/2026*.wav`) matching every .wav under the root."
         if _FILE_ROOT
-        else "`paths` is a list of WAV file paths (AGENT_FILE_ROOT is unset, "
-        "so playback is effectively disabled)."
+        else "`paths`: WAV file paths (AGENT_FILE_ROOT is unset, so playback "
+        "is effectively disabled)."
     )
     return (
-        "Play one or more WAV audio files via the speaker.\n\n"
-        f"{path_hint} Pass several paths to play them back-to-back, "
-        "gapless, in the given order within a single call. Each file must "
-        "be uncompressed 16-bit PCM (s16le). Sample rate and channel count "
-        f"are auto-converted to {_AUDIO_IO_WIRE_RATE}Hz / "
-        f"{_AUDIO_IO_WIRE_CHANNELS} channel(s) (audio-io's wire format) if "
-        "they differ, so 44.1kHz stereo and 48kHz mono and similar are all "
-        "accepted. Compressed WAVs and >2-channel surround formats are "
-        "rejected. All paths are validated before playback starts, so if "
-        "any file is missing nothing plays; the error message lists similar "
-        "filenames in the same directory — pick one and retry rather than "
-        "asking the user.\n\n"
-        "Call this when the user asks to play specific audio file(s) — "
-        "for example a pre-rendered news summary or notification produced "
-        "by another agent. Playback runs in the BACKGROUND: this returns "
-        "immediately (you stay free to keep talking and handle other turns) "
-        "while the audio keeps playing, and it stops at the end of the file(s), "
-        "when stop_audio is called, or on wake-word barge-in. Files play "
-        "gapless, streamed one at a time, so there is no length limit — for a "
-        "big set, tell the user it may run a while and that they can say "
-        "stop to end it."
+        "Play WAV audio file(s) on the speaker. Call when the user asks to "
+        "play an audio file.\n"
+        f"{path_hint} Multiple paths play back-to-back in order. Sample rate "
+        "and channels are auto-converted; only uncompressed 16-bit PCM WAV.\n"
+        "Plays in the background — this returns immediately, and a missing "
+        "file means nothing plays (the error suggests similar filenames; "
+        "retry with one). Stop with stop_audio."
     )
 
 
@@ -734,22 +691,15 @@ def _build_stop_audio_description() -> str:
     """stop_audio の description を起動時 env に応じて動的生成する。"""
     if not _AUDIO_IO_STOP_URL:
         return (
-            "Stop audio file playback on the speaker.\n\n"
-            "**CURRENTLY UNAVAILABLE** — the AGENT_AUDIO_IO_SPK_URL env "
-            "is not set, so audio playback (and thus stopping it) is "
-            "disabled in this environment. Do NOT call this tool; tell the "
-            "user in one sentence that audio is not configured here."
+            "Stop audio file playback.\n"
+            "**UNAVAILABLE** — audio output is not configured here. Do NOT "
+            "call this; tell the user audio isn't set up."
         )
     return (
-        "Stop audio file playback immediately.\n\n"
-        "Flushes the audio-io playback track that play_audio_file uses, "
-        "cutting off whatever WAV is currently playing on the speaker. "
-        "Your own spoken replies (text-to-speech) play on a different "
-        "track and are NOT affected by this. Takes no arguments. Safe to "
-        "call even when nothing is playing — it is a harmless no-op in "
-        "that case.\n\n"
-        "Call this when the user asks to stop or silence the audio that is "
-        "playing — for example 「音声止めて」「再生やめて」「stop the audio」."
+        "Stop the audio file that is playing (started by play_audio_file). "
+        "Call when the user says e.g. 「音声止めて」「再生やめて」.\n"
+        "No arguments. Your own spoken voice is unaffected; harmless no-op "
+        "if nothing is playing."
     )
 
 
@@ -922,16 +872,11 @@ def _build_system_health_description() -> str:
     """system_health の description を起動時 env (probe 対象) に応じて生成する。"""
     names = "、".join(t["name"] for t in _health_targets())
     return (
-        "Run a self-diagnostic of the voice-assistant system's own backend "
-        "services. Probes each service's health endpoint concurrently and "
-        "returns a short Japanese summary of which are alive and which are "
-        "not responding. Takes no arguments and is read-only (safe to call "
-        "anytime).\n\n"
-        f"Services checked: {names}.\n\n"
-        "Call this when the user asks to run a system check — for example "
-        "「システムチェックして」「システムチェック」. When it returns, read the "
-        "summary back to the user as your spoken reply; do not invent or "
-        "rename services it did not mention."
+        "Self-diagnose the assistant's own backend services "
+        f"({names}) and return a short Japanese summary. "
+        "Call when the user asks for a system check (e.g. 「システムチェック"
+        "して」). No arguments, read-only. Speak the summary back as-is; "
+        "don't invent services it didn't mention."
     )
 
 
@@ -1239,26 +1184,19 @@ def _build_start_timer_description() -> str:
     """start_timer の description を起動時 env (_TIMER_SPK_URL の有無) で生成。"""
     if not _TIMER_SPK_URL:
         return (
-            "Start a countdown timer.\n\n"
-            "**CURRENTLY UNAVAILABLE** — AGENT_AUDIO_IO_SPK_URL is not set, so "
-            "there is no audio output to sound the alarm and timers are "
-            "disabled here. Do NOT call this tool; tell the user in one "
-            "sentence that timers aren't configured in this environment."
+            "Start a countdown timer.\n"
+            "**UNAVAILABLE** — no audio output for the alarm in this "
+            "environment. Do NOT call this; tell the user timers aren't "
+            "set up."
         )
     return (
-        "Start a countdown timer that sounds an alarm when it finishes.\n\n"
-        "`seconds` is the total duration in seconds — YOU convert the user's "
-        "spoken duration to an integer number of seconds (e.g. 「3分」→180, "
-        "「1分30秒」→90, 「1時間」→3600, 「30秒」→30). `label` is an optional "
-        "short name to tell multiple timers apart (e.g. 「パスタ」「洗濯」); "
-        "omit it if the user didn't give one.\n\n"
-        "Runs in the BACKGROUND: returns immediately and you stay free for "
-        "other turns. When it finishes, an alarm plays on the speaker on its "
-        "own audio track (it mixes over any TTS or file playback). Confirm the "
-        "duration you set back to the user so they know you heard it right.\n\n"
-        "Call this when the user asks to set or start a timer/alarm for a "
-        "duration — for example 「3分タイマーかけて」「10分後に教えて」"
-        "「パスタ茹でるから8分タイマーセットして」."
+        "Start a countdown timer; an alarm sounds on the speaker when it "
+        "ends. Call when the user asks for a timer/alarm (e.g. 「3分タイマー"
+        "かけて」「10分後に教えて」).\n"
+        "`seconds`: duration in seconds — convert the spoken duration "
+        "yourself (「3分」→180, 「1時間」→3600). `label`: optional short name "
+        "(e.g. 「パスタ」). Returns immediately; confirm the duration back "
+        "to the user."
     )
 
 
@@ -1271,41 +1209,32 @@ async def start_timer(seconds: int, label: str = "") -> str:
 
 @tool
 async def check_timers() -> str:
-    """List the countdown timers currently running and how long each has left.
+    """List the running timers and the time left on each.
 
-    Takes no arguments. Call this when the user asks about running timers —
-    for example 「タイマーあと何分?」「タイマー残りどれくらい?」「今タイマー
-    動いてる?」. Read the result back to the user as your spoken reply.
+    Call when the user asks about timers (e.g. 「タイマーあと何分?」「今タイ
+    マー動いてる?」). No arguments. Speak the result back to the user.
     """
     return await _safe_invoke("check_timers", _check_timers_impl())
 
 
 @tool
 async def cancel_timer(which: str = "") -> str:
-    """Cancel a running countdown timer so its alarm won't sound.
+    """Cancel a running timer so its alarm won't sound.
 
-    `which` selects the timer: a label substring (e.g. 「パスタ」), a timer
-    number, or 「全部」 / "all" to cancel every timer. Omit it to cancel the
-    only running timer when exactly one is active; if it's ambiguous the
-    result lists the timers so you can ask the user which one.
-
-    Call this when the user asks to stop or cancel a timer — for example
-    「タイマー止めて」「パスタタイマー消して」「タイマー全部キャンセル」.
+    Call when the user asks to stop/cancel a timer (e.g. 「タイマー止めて」
+    「タイマー全部キャンセル」). `which`: a label substring, a timer number,
+    or 「全部」 for all; omit it when only one timer is running.
     """
     return await _safe_invoke("cancel_timer", _cancel_timer_impl(which))
 
 
 @tool
 async def read_file(path: str) -> str:
-    """Read a file and return its contents verbatim.
+    """Read a text file and return its contents.
 
-    `path` is interpreted relative to `AGENT_FILE_ROOT` (the shared
-    directory), e.g. `"memo.txt"`, `"docs/recipe.md"`. Absolute paths
-    and paths containing `..` are rejected.
-
-    Use this when the user asks to read a memo or a specific file —
-    fetch the contents here, then summarise or read it back to them.
-    Files larger than 50 KB are truncated at the tail.
+    Call when the user asks to read a memo or file — then summarise or
+    read it aloud. `path` is relative to the shared directory (e.g.
+    "memo.txt", "docs/recipe.md"); paths outside it are rejected.
     """
     return await _safe_invoke("read_file", _read_file_impl(path))
 
@@ -1363,12 +1292,10 @@ async def _reset_memory_impl() -> str:
 
 @tool
 async def reset_memory() -> str:
-    """Clear the conversation memory / context and start fresh.
+    """Clear the conversation memory and start fresh.
 
-    Takes no arguments. Call this when the user asks to forget the
-    conversation or start over — for example 「記憶をリセットして」「履歴を
-    消して」「忘れて」「最初から」「新しい会話にして」. Afterwards you no
-    longer remember anything said earlier in this conversation.
+    Call when the user asks to forget the conversation or start over
+    (e.g. 「記憶リセットして」「履歴消して」「最初から」). No arguments.
     """
     return await _safe_invoke("reset_memory", _reset_memory_impl())
 

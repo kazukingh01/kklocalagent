@@ -261,7 +261,10 @@ TOOL_SYSTEM_SUFFIX = os.environ.get("AGENT_TOOL_SYSTEM_SUFFIX") or (
 # injected as a fixed prefix AFTER the system message and BEFORE the live
 # history (so the prompt-cache prefix stays stable), and are NOT persisted to
 # the checkpoint. Controlled by:
-#   AGENT_TOOL_FEWSHOT       on/off (default off in code; compose sets on)
+#   AGENT_TOOL_FEWSHOT       on/off (default off — in code AND compose; the
+#                            fake-history examples were observed to be read as
+#                            conversation facts and answer-copied instead of
+#                            triggering the tool call)
 #   AGENT_TOOL_FEWSHOT_FILE  optional JSON path overriding the builtin examples
 # A turn is {"role": user|assistant|tool, "content": str,
 #            "tool_calls": [{"name","args"}]?, "name": str?}. tool_call ids are
