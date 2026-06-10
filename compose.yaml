@@ -432,12 +432,13 @@ services:
       # the full writeup. 0 = off (sends think=false EXPLICITLY — omitting it
       # lets a thinking-capable backend default thinking ON); 1 = native ollama
       # `think=true` (works on tags like gemma4:e4b; an imported GGUF without
-      # native think returns HTTP 400); 2 = prompt-token: prepend
-      # AGENT_THINK_TOKEN (<|think|>) to the system prompt + think=false — for
-      # GGUFs such as hf.co/unsloth/gemma-4-12b-it-GGUF that reject native
-      # think. Modes 1 & 2 add latency and can suppress tool calls; use 0.
+      # native think returns HTTP 400 — the whole turn fails); 2 = prompt-token:
+      # prepend AGENT_THINK_TOKEN (<|think|>) to the system prompt + think=false
+      # — for GGUFs such as hf.co/unsloth/gemma-4-12b-it-GGUF that reject
+      # native think. Default 0: modes 1 & 2 add latency, suppress tool calls
+      # on gemma4 12B, and mode 1 breaks on imported GGUFs.
       # Back-compat: true/on → 1, off/false → 0. Read once at agent startup.
-      AGENT_REASONING: "${AGENT_REASONING:-1}"
+      AGENT_REASONING: "${AGENT_REASONING:-0}"
       # Token that switches gemma4 into thinking when placed at the start of
       # the system prompt (mode 2 only). Override only if your model spells
       # the think-control token differently.

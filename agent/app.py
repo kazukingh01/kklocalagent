@@ -136,9 +136,10 @@ LOG_LLM_RAW = os.environ.get("AGENT_LOG_LLM_RAW", "true").lower() in ("1", "true
 # CAVEAT (modes 1 & 2): thinking adds latency and has been observed to
 # suppress tool calls on gemma4 12B (the model reasons + replies with text
 # instead of calling e.g. stop_audio). Use 0 if tool-calling regresses.
-# Back-compat: on/true/yes → 1, off/false/no → 0. Default 1.
+# Back-compat: on/true/yes → 1, off/false/no → 0. Default 0 (code AND
+# compose) — mode 1 also hard-fails (HTTP 400) on imported HF GGUFs.
 def _reasoning_mode() -> int:
-    v = os.environ.get("AGENT_REASONING", "1").strip().lower()
+    v = os.environ.get("AGENT_REASONING", "0").strip().lower()
     if v in ("0", "off", "false", "no", "none"):
         return 0
     if v == "2":
@@ -198,6 +199,15 @@ ACTION_TOOLS = frozenset(TOOL_FAIL_PHRASES)
 # entire tool-use prompt.
 TOOL_SYSTEM_SUFFIX = os.environ.get("AGENT_TOOL_SYSTEM_SUFFIX") or (
     " You have tools available — use them naturally when they help."
+    # --- Action requests MUST go through the tool. Lives here (not in
+    # AGENT_SYSTEM_PROMPT) so every tools-enabled deployment gets it and a
+    # tools-off deployment never mentions tools it doesn't have.
+    " For any action request (resetting memory, timers, playing/stopping"
+    " audio, telling the time, web search, file operations, etc.), you must"
+    " call the corresponding tool to actually perform it. Never report"
+    " completion or acknowledgement — saying things like 'Done' or 'I'll do"
+    " that now' — without calling the tool. Only report the result after you"
+    " have received the tool's output."
     " Tool results are private to you; the user can't see or hear them,"
     " so don't refer to them with deictic words like 'this', 'these',"
     " or 'as written there' — instead, restate the relevant content in"

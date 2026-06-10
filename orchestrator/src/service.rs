@@ -370,11 +370,16 @@ async fn events(
                     });
                 }
             }
-            // Audible wake-ack feedback for the accepted-and-not-barge-in
-            // cases (BargeIn speaks its own ack after the TTS /stop above).
-            // No-op when tts.wake_ack_text is empty. Spawned so the events
-            // handler still returns 200 immediately.
-            if !matches!(wake_result, WakeResult::BargeIn) {
+            // Audible wake-ack feedback for the idle accepted cases only.
+            // BargeIn speaks its own ack after the TTS /stop above. ArmedBusy
+            // is deliberately SILENT: barge_in=false means "let the current
+            // reply finish", but the ack goes through /speak whose Speak mode
+            // aborts the in-flight streamer tasks — the ack itself would
+            // half-interrupt the very reply that mode promises to finish (and
+            // the turn ends in ArmedAfterWake anyway, so the feedback adds
+            // little). No-op when tts.wake_ack_text is empty. Spawned so the
+            // events handler still returns 200 immediately.
+            if matches!(wake_result, WakeResult::Armed | WakeResult::Bypass) {
                 let backends_for_ack = state.backends.clone();
                 tokio::spawn(async move {
                     tts_wake_ack(&backends_for_ack).await;

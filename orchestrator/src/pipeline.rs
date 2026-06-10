@@ -24,7 +24,7 @@ use reqwest::multipart;
 use serde::Serialize;
 use serde_json::json;
 use tokio::sync::{mpsc, Semaphore};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{AsrConfig, LlmConfig, ResultSinkConfig, TtsConfig};
 use crate::state::WakeMachine;
@@ -666,12 +666,16 @@ async fn llm_chat_streaming(
     // before any sentence break.
     let mut first_chunk_logged = false;
     let mut first_sentence_logged = false;
-    // Whether we're currently inside a `<...>` span. Persists across deltas /
-    // chunks / ndjson lines because such a span (e.g. gemma4's <|think|>
-    // reasoning markup when the agent runs AGENT_REASONING=2) can straddle
-    // them. Everything between `<` and the next `>` is dropped before it ever
-    // reaches the sentence buffer, so it is never synthesized / spoken.
-    let mut in_angle = false;
+    // Pending `<...` span (including the `<`), buffered until its `>` arrives.
+    // A span that CLOSES within ANGLE_SPAN_MAX_CHARS is markup (e.g. gemma4's
+    // <|think|> reasoning when the agent runs AGENT_REASONING=2) and is
+    // dropped before it reaches the sentence buffer / TTS. One that grows past
+    // the cap without a `>` is NOT markup (a lone `<` in maths or an
+    // emoticon) — it is flushed back out as literal text, so an unmatched `<`
+    // can never mute the rest of the stream. Persists across deltas / chunks /
+    // ndjson lines because a span can straddle them; empty = not in a span.
+    const ANGLE_SPAN_MAX_CHARS: usize = 256;
+    let mut angle_buf = String::new();
 
     'outer: loop {
         let chunk = resp
@@ -723,16 +727,29 @@ async fn llm_chat_streaming(
                 .unwrap_or("");
             if !delta.is_empty() {
                 // Drop <...>-enclosed spans (thinking markup / stray tags)
-                // before they hit TTS. Stateful via `in_angle` so a span that
-                // crosses delta boundaries is still fully removed.
+                // before they hit TTS — but only once the pair is confirmed:
+                // the span is held in `angle_buf` and discarded when its `>`
+                // arrives within ANGLE_SPAN_MAX_CHARS. Past the cap it is
+                // re-emitted verbatim (an unmatched `<` is content, not
+                // markup; any further `<` inside the re-emitted text is
+                // deliberately not rescanned).
                 let mut cleaned = String::with_capacity(delta.len());
                 for ch in delta.chars() {
-                    if in_angle {
+                    if !angle_buf.is_empty() {
+                        angle_buf.push(ch);
                         if ch == '>' {
-                            in_angle = false;
+                            debug!(
+                                target: "orch::pipeline",
+                                span = %angle_buf,
+                                "dropped <...> span before TTS"
+                            );
+                            angle_buf.clear();
+                        } else if angle_buf.chars().count() > ANGLE_SPAN_MAX_CHARS {
+                            cleaned.push_str(&angle_buf);
+                            angle_buf.clear();
                         }
                     } else if ch == '<' {
-                        in_angle = true;
+                        angle_buf.push(ch);
                     } else {
                         cleaned.push(ch);
                     }
@@ -784,6 +801,13 @@ async fn llm_chat_streaming(
         }
     }
 
+    // A `<...` still pending at end-of-stream never got its `>` — it was
+    // content after all (or truncated markup); speak it rather than lose it.
+    if !angle_buf.is_empty() {
+        sentence_buf.push_str(&angle_buf);
+        full_reply.push_str(&angle_buf);
+        angle_buf.clear();
+    }
     // Flush trailing partial sentence (final chunk had no terminator).
     let tail = sentence_buf.trim().to_string();
     if !tail.is_empty() && wake.pipeline_still_active() {
@@ -1169,5 +1193,51 @@ mod tests {
         }
         assert_eq!(sentences, vec!["続きの一文"]);
         assert_eq!(reply, "続きの一文");
+    }
+
+    #[tokio::test]
+    async fn llm_chat_streaming_drops_angle_span_but_keeps_unclosed_tail() {
+        // A <...> span that closes within the cap is markup → dropped, even
+        // when it straddles two deltas. A `<` that never gets its `>` is
+        // content → flushed verbatim at end-of-stream, not swallowed.
+        let body = concat!(
+            r#"{"message":{"content":"<|th"}}"#, "\n",
+            r#"{"message":{"content":"ink|>今日は晴れ。3<5 だよ。"}}"#, "\n",
+            r#"{"done":true}"#, "\n",
+        ).as_bytes().to_vec();
+        let addr = spawn_mock_llm(body).await;
+        let backends = backends_with_llm_addr(addr);
+        let wake = loose_wake();
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        let reply = llm_chat_streaming(&backends, &wake, "test", tx).await.unwrap();
+        let mut sentences = vec![];
+        while let Some(s) = rx.recv().await {
+            sentences.push(s);
+        }
+        assert_eq!(sentences, vec!["今日は晴れ。", "3<5 だよ。"]);
+        assert_eq!(reply, "今日は晴れ。3<5 だよ。");
+    }
+
+    #[tokio::test]
+    async fn llm_chat_streaming_reemits_overlong_angle_span_verbatim() {
+        // A `<` followed by more than ANGLE_SPAN_MAX_CHARS without a `>` is
+        // not markup; the buffered text must be re-emitted, not dropped.
+        let text = format!("注意{}{}終わり。", "<", "あ".repeat(300));
+        let body = format!(
+            "{}\n{}\n",
+            serde_json::json!({"message": {"content": text}}),
+            r#"{"done":true}"#,
+        ).into_bytes();
+        let addr = spawn_mock_llm(body).await;
+        let backends = backends_with_llm_addr(addr);
+        let wake = loose_wake();
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        let reply = llm_chat_streaming(&backends, &wake, "test", tx).await.unwrap();
+        let mut sentences = vec![];
+        while let Some(s) = rx.recv().await {
+            sentences.push(s);
+        }
+        assert_eq!(reply, text);
+        assert_eq!(sentences.concat(), text);
     }
 }
