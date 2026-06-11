@@ -99,11 +99,15 @@ TOOL_FAIL_PHRASES: dict[str, str] = {
     "cancel_timer": "ごめん、タイマーを止められなかった。",
 }
 ACTION_TOOLS = frozenset(TOOL_FAIL_PHRASES)
-# Observed failure: the model announces an action (「調べてみるね。ちょっと
-# 待って」) and ends the turn with ZERO tool_calls — tools_condition then
-# routes straight to END and nothing ever runs. When the FIRST reply of a
-# turn has no tool calls but announces intent (or is empty), re-invoke once
-# with an ephemeral nudge; the nudge is never persisted to history.
+# Observed failure: the model announces an action and ends the turn with
+# ZERO tool_calls — tools_condition then routes straight to END and nothing
+# ever runs. Seen both as the FIRST reply of a turn (「調べてみるね。ちょっと
+# 待って」) and MID-LOOP after a tool result (ls → 「流すね。ちょっと待って
+# ね。」→ END, the play never happened). When any reply has no tool calls
+# but announces intent (or is empty), re-invoke once with an ephemeral
+# nudge; the nudge is never persisted to history. At most one retry per
+# turn, and none after an action tool already succeeded (a forced retry
+# could repeat the side effect).
 TOOL_RETRY_ENABLED = os.environ.get("AGENT_TOOL_RETRY", "true").lower() in ("1", "true", "yes")
 TOOL_RETRY_NUDGE = (
     "You announced an action but ended your turn without calling any tool."
@@ -115,7 +119,8 @@ TOOL_RETRY_NUDGE = (
 _INTENT_RE = re.compile(
     r"てみる(?!と)|ておく(?!と)|ちょっと待って|少々お待ち|待ってて"
     r"|(?:調べ|確認|検索)する(?:ね|よ|から)"
-    r"|\bI'?ll (?:check|look|search|try|do)\b"
+    r"|(?:流す|再生する|かける|セットする)(?:ね|よ)"
+    r"|\bI'?ll (?:check|look|search|try|do|play)\b"
     r"|\blet me (?:check|look|see|search)\b",
     re.IGNORECASE,
 )
@@ -126,6 +131,25 @@ def _announces_intent_only(response: AIMessage) -> bool:
         response.content if isinstance(response.content, str) else str(response.content)
     ).strip()
     return not content or bool(_INTENT_RE.search(content))
+
+
+def _retry_eligible(messages: list) -> bool:
+    """Walk the current turn (back to the last HumanMessage). Not eligible
+    if a no-tool AI reply already exists (= the one retry was spent — a
+    content-only AIMessage can't otherwise appear mid-turn) or an action
+    tool already succeeded."""
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            return True
+        if isinstance(m, AIMessage) and not (m.tool_calls or []):
+            return False
+        if (
+            isinstance(m, ToolMessage)
+            and m.name in ACTION_TOOLS
+            and not str(m.content).startswith(("[error]", "[denied]"))
+        ):
+            return False
+    return False
 
 
 # `or` (not a get() default): compose.yaml passes the env with an empty
@@ -639,12 +663,12 @@ def build_react_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
         if (
             TOOL_RETRY_ENABLED
             and not (response.tool_calls or [])
-            and isinstance(state["messages"][-1], HumanMessage)
             and _announces_intent_only(response)
+            and _retry_eligible(list(state["messages"]))
         ):
             log.info(
-                "tool retry: first reply of the turn has no tool_calls and "
-                "announces intent (or is empty); re-invoking once with nudge"
+                "tool retry: reply has no tool_calls and announces intent "
+                "(or is empty); re-invoking once with nudge"
             )
             retry = await _invoke(
                 messages + [response, SystemMessage(content=TOOL_RETRY_NUDGE)]
