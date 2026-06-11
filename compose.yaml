@@ -106,8 +106,10 @@ services:
       # 2 = trace: logs each streamed chunk PRE-parse as "builtin
       # parser input" — the model's verbatim output (tool_call blocks /
       # thinking tags) before ollama's parser strips them. Only fires
-      # on models with a builtin parser (gemma4-architecture GGUFs get
-      # parser=gemma4 at pull time).
+      # on models with a builtin parser; hf.co GGUF pulls never have
+      # one (pull stores the HF config verbatim, no arch detection) and
+      # take the native chat path with NO raw log at any level — see
+      # .env.example for the _debug_render_only replay alternative.
       OLLAMA_DEBUG: "${OLLAMA_DEBUG:-0}"
       HF_TOKEN: "${HF_TOKEN:-}"
     volumes:

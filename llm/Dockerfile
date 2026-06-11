@@ -1,8 +1,8 @@
 # 0.30.3 is the first stable release that supports the Gemma 4 12B
-# encoder-free multimodal architecture (gemma4:12b); 0.30.4 still
-# bundles the Gemma 4 MTP speculative decoding from the older 0.23.x
-# pin.
-ARG OLLAMA_TAG=0.30.4
+# encoder-free multimodal architecture (gemma4:12b); the library
+# gemma4:12b-* tags ship configs with `requires: 0.30.5`, so the pin
+# must be >= 0.30.5 to load them.
+ARG OLLAMA_TAG=0.30.5
 
 FROM ollama/ollama:${OLLAMA_TAG}
 
@@ -12,7 +12,7 @@ RUN apt-get update \
     && pip3 install --no-cache-dir --break-system-packages \
         "huggingface_hub[cli]>=0.25,<1.0"
 
-ENV LLM_MODEL=hf.co/unsloth/gemma-4-12b-it-GGUF:Q4_K_M
+ENV LLM_MODEL=gemma4:12b-it-q4_K_M
 
 COPY init.sh /usr/local/bin/init.sh
 RUN chmod +x /usr/local/bin/init.sh
