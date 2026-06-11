@@ -234,15 +234,7 @@ pub async fn run_turn(
         tts_finalize(&backends).await;
     }
 
-    if !backends.tts.url.is_empty() && backends.tts.tail_quiet_ms > 0 {
-        let until = Instant::now() + Duration::from_millis(backends.tts.tail_quiet_ms);
-        *backends.tts_quiet_until.lock().expect("tts_quiet poisoned") = Some(until);
-        info!(
-            target: "orch::pipeline",
-            quiet_ms = backends.tts.tail_quiet_ms,
-            "TTS drained; opening VAD quiet window"
-        );
-    }
+    open_tts_quiet_window(&backends);
 
     let reply = match reply_result {
         Ok(r) => r,
@@ -351,12 +343,31 @@ async fn tts_speak_inner(backends: &Backends, api: &str, url: &str, text: &str) 
     }
 }
 
+pub fn open_tts_quiet_window(backends: &Backends) {
+    if !backends.tts.url.is_empty() && backends.tts.tail_quiet_ms > 0 {
+        let until = Instant::now() + Duration::from_millis(backends.tts.tail_quiet_ms);
+        *backends.tts_quiet_until.lock().expect("tts_quiet poisoned") = Some(until);
+        info!(
+            target: "orch::pipeline",
+            quiet_ms = backends.tts.tail_quiet_ms,
+            "TTS drained; opening VAD quiet window"
+        );
+    }
+}
+
 pub async fn tts_wake_ack(backends: &Backends) {
     let text = backends.tts.wake_ack_text.trim();
     if text.is_empty() || backends.tts.url.is_empty() {
         return;
     }
     tts_speak_inner(backends, "wake-ack", &backends.tts.url, text).await;
+    // Same tail protection as a normal turn: the fixed post-wake SE dropout
+    // misses the ack's echo when synthesis/playback runs late, so wait for
+    // the speaker to actually drain, then gate VAD for tail_quiet from there.
+    // A user SS eaten by this window is harmless — SE alone dispatches from
+    // ArmedAfterWake and carries the utterance audio.
+    tts_finalize(backends).await;
+    open_tts_quiet_window(backends);
 }
 
 pub async fn tts_finalize(backends: &Backends) {
@@ -744,6 +755,47 @@ mod tests {
         assert!(!backends.in_tts_quiet_window());
 
         *backends.tts_quiet_until.lock().unwrap() = None;
+        assert!(!backends.in_tts_quiet_window());
+    }
+
+    #[test]
+    fn open_tts_quiet_window_sets_deadline_only_when_tts_configured() {
+        let mut tts = crate::config::TtsConfig::default();
+        tts.url = "http://tts/speak".into();
+        tts.tail_quiet_ms = 400;
+        let backends = Backends::new(
+            crate::config::AsrConfig::default(),
+            crate::config::LlmConfig::default(),
+            tts,
+            crate::config::ResultSinkConfig::default(),
+        )
+        .unwrap();
+        open_tts_quiet_window(&backends);
+        assert!(backends.in_tts_quiet_window());
+
+        // url empty → no window
+        let backends = Backends::new(
+            crate::config::AsrConfig::default(),
+            crate::config::LlmConfig::default(),
+            crate::config::TtsConfig::default(),
+            crate::config::ResultSinkConfig::default(),
+        )
+        .unwrap();
+        open_tts_quiet_window(&backends);
+        assert!(!backends.in_tts_quiet_window());
+
+        // tail_quiet_ms = 0 → no window
+        let mut tts = crate::config::TtsConfig::default();
+        tts.url = "http://tts/speak".into();
+        tts.tail_quiet_ms = 0;
+        let backends = Backends::new(
+            crate::config::AsrConfig::default(),
+            crate::config::LlmConfig::default(),
+            tts,
+            crate::config::ResultSinkConfig::default(),
+        )
+        .unwrap();
+        open_tts_quiet_window(&backends);
         assert!(!backends.in_tts_quiet_window());
     }
 

@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import time
 import uuid
@@ -98,6 +99,35 @@ TOOL_FAIL_PHRASES: dict[str, str] = {
     "cancel_timer": "ごめん、タイマーを止められなかった。",
 }
 ACTION_TOOLS = frozenset(TOOL_FAIL_PHRASES)
+# Observed failure: the model announces an action (「調べてみるね。ちょっと
+# 待って」) and ends the turn with ZERO tool_calls — tools_condition then
+# routes straight to END and nothing ever runs. When the FIRST reply of a
+# turn has no tool calls but announces intent (or is empty), re-invoke once
+# with an ephemeral nudge; the nudge is never persisted to history.
+TOOL_RETRY_ENABLED = os.environ.get("AGENT_TOOL_RETRY", "true").lower() in ("1", "true", "yes")
+TOOL_RETRY_NUDGE = (
+    "You announced an action but ended your turn without calling any tool."
+    " Emit the tool call(s) that actually perform it NOW, with no extra"
+    " text. Only if no tool fits the request, give your final answer"
+    " directly instead — never end on a bare announcement."
+)
+# (?!と) keeps suggestions to the user (「試してみるといいよ」) from matching.
+_INTENT_RE = re.compile(
+    r"てみる(?!と)|ておく(?!と)|ちょっと待って|少々お待ち|待ってて"
+    r"|(?:調べ|確認|検索)する(?:ね|よ|から)"
+    r"|\bI'?ll (?:check|look|search|try|do)\b"
+    r"|\blet me (?:check|look|see|search)\b",
+    re.IGNORECASE,
+)
+
+
+def _announces_intent_only(response: AIMessage) -> bool:
+    content = (
+        response.content if isinstance(response.content, str) else str(response.content)
+    ).strip()
+    return not content or bool(_INTENT_RE.search(content))
+
+
 # `or` (not a get() default): compose.yaml passes the env with an empty
 # fallback (`${VAR:-}`), so a blank .env would otherwise silently disable
 # the entire tool-use prompt.
@@ -585,23 +615,41 @@ def build_react_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
                 len(FEWSHOT_MESSAGES),
                 _fmt_msgs_for_log(history),
             )
-        response = await llm_with_tools.ainvoke(messages)
-        if LOG_LLM_RAW:
-            # NOTE: the model's *raw* text (tool-call tokens before ollama
-            # parses them) is consumed server-side and NOT returned over
-            # /api/chat — to see it, enable the LLM server's verbose log.
-            content = (
-                response.content
-                if isinstance(response.content, str)
-                else str(response.content)
-            )
+        async def _invoke(msgs: list) -> AIMessage:
+            resp = await llm_with_tools.ainvoke(msgs)
+            if LOG_LLM_RAW:
+                # NOTE: the model's *raw* text (tool-call tokens before ollama
+                # parses them) is consumed server-side and NOT returned over
+                # /api/chat — to see it, enable the LLM server's verbose log.
+                content = (
+                    resp.content
+                    if isinstance(resp.content, str)
+                    else str(resp.content)
+                )
+                log.info(
+                    "llm output: tool_calls=%s | content=%r | additional_kwargs=%r | response_metadata=%r",
+                    [(tc.get("name"), tc.get("args")) for tc in (resp.tool_calls or [])],
+                    content[:1000],
+                    dict(resp.additional_kwargs or {}),
+                    dict(getattr(resp, "response_metadata", {}) or {}),
+                )
+            return resp
+
+        response = await _invoke(messages)
+        if (
+            TOOL_RETRY_ENABLED
+            and not (response.tool_calls or [])
+            and isinstance(state["messages"][-1], HumanMessage)
+            and _announces_intent_only(response)
+        ):
             log.info(
-                "llm output: tool_calls=%s | content=%r | additional_kwargs=%r | response_metadata=%r",
-                [(tc.get("name"), tc.get("args")) for tc in (response.tool_calls or [])],
-                content[:1000],
-                dict(response.additional_kwargs or {}),
-                dict(getattr(response, "response_metadata", {}) or {}),
+                "tool retry: first reply of the turn has no tool_calls and "
+                "announces intent (or is empty); re-invoking once with nudge"
             )
+            retry = await _invoke(
+                messages + [response, SystemMessage(content=TOOL_RETRY_NUDGE)]
+            )
+            return {"messages": [response, retry]}
         return {"messages": [response]}
 
     def route_after_tools(state: MessagesState) -> str:

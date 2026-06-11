@@ -235,6 +235,7 @@ services:
       # grammar).
       AGENT_TOOL_FEWSHOT: "${AGENT_TOOL_FEWSHOT:-off}"
       AGENT_TOOL_FEWSHOT_FILE: "${AGENT_TOOL_FEWSHOT_FILE:-}"
+      AGENT_TOOL_RETRY: "${AGENT_TOOL_RETRY:-true}"
       AGENT_SHELL_ALLOWLIST: "${AGENT_SHELL_ALLOWLIST:-ls,date,pwd}"
       AGENT_FILE_ROOT: "${AGENT_FILE_ROOT:-/workspace}"
       AGENT_SHARE_DIR: "${AGENT_SHARE_DIR:-./share}"
