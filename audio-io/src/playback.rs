@@ -451,8 +451,8 @@ async fn playback_producer_task(
     // pipeline went cold during inter-turn idle. 50 ms absorbs the ~10 ms cpal
     // callback jitter without delaying real audio.
     let keep_alive_threshold = (native_rate as usize) * (native_channels as usize) * 50 / 1000;
-    let mut total_dropped: u64 = 0;
-    let mut drops_since_log: u32 = 0;
+    let mut total_blocked_ms: u64 = 0;
+    let mut blocks_since_log: u32 = 0;
     loop {
         tokio::select! {
             // `biased`: real audio strictly preferred over the keep-alive's silence.
@@ -502,33 +502,39 @@ async fn playback_producer_task(
                     PlaybackMessage::Frame(bytes) => {
                         stats.audio_seen.store(true, Ordering::Relaxed);
                         let samples = framer.push_s16le(&bytes);
-                        let mut overflow = false;
-                        let mut dropped_this_batch: usize = 0;
-                        for s in samples {
-                            if overflow {
-                                dropped_this_batch += 1;
-                                continue;
+                        // Backpressure rather than drop: push what fits, then
+                        // wait for cpal to drain and retry the rest. A full ring
+                        // now stalls this recv loop -> the mpsc fills -> the /spk
+                        // WS read blocks -> the TCP window closes, so the device
+                        // drain rate paces the whole chain and overflow can no
+                        // longer drop samples. The wait still honors
+                        // flush.producer so a mid-wait /spk/stop cuts in promptly
+                        // (the top-of-loop flush path drains and resets the
+                        // framer on the next message).
+                        let mut i = producer.push_slice(&samples);
+                        if i < samples.len() {
+                            let block_start = Instant::now();
+                            while i < samples.len() {
+                                if flush.producer.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                                i += producer.push_slice(&samples[i..]);
                             }
-                            if producer.try_push(s).is_err() {
-                                overflow = true;
-                                dropped_this_batch += 1;
-                            }
-                        }
-                        if dropped_this_batch > 0 {
-                            total_dropped =
-                                total_dropped.saturating_add(dropped_this_batch as u64);
+                            let blocked_ms = block_start.elapsed().as_millis() as u64;
+                            total_blocked_ms = total_blocked_ms.saturating_add(blocked_ms);
                             debug!(
-                                dropped_this_batch,
-                                total_dropped,
-                                "playback ring full; dropping samples (WS arriving faster than cpal consumes)"
+                                blocked_ms,
+                                total_blocked_ms,
+                                "playback ring full; backpressuring (no samples dropped, consumer slower than producer)"
                             );
-                            drops_since_log += 1;
-                            if drops_since_log >= 50 {
+                            blocks_since_log += 1;
+                            if blocks_since_log >= 50 {
                                 warn!(
-                                    total_dropped,
-                                    "playback ring buffer full; dropping samples (consumer slower than producer)"
+                                    total_blocked_ms,
+                                    "playback ring full; sustained backpressure (consumer slower than producer; check device vs sender clock)"
                                 );
-                                drops_since_log = 0;
+                                blocks_since_log = 0;
                             }
                         }
                     }
