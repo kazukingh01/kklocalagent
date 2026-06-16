@@ -20,6 +20,7 @@ from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
     HumanMessage,
+    RemoveMessage,
     SystemMessage,
     ToolMessage,
     trim_messages,
@@ -49,6 +50,18 @@ RECURSION_LIMIT = int(os.environ.get("AGENT_TOOL_RECURSION_LIMIT", "6"))
 # Kept well under OLLAMA_CONTEXT_LENGTH (default 16384) since the system
 # prompt + tool schemas + generation room are on TOP of this budget.
 MAX_HISTORY_TOKENS = int(os.environ.get("AGENT_MAX_HISTORY_TOKENS", "4096"))
+# --- Deterministic, persisted context compaction (Phase 0/1) ---------------
+# Budget history against the REAL window instead of a blind flat cap: the fixed
+# prefix (system + tool schemas + few-shot) is measured ONCE from the warmup
+# response's prompt_eval_count (FIXED_OVERHEAD_TOKENS); per-turn history is
+# estimated by _approx_tokens and self-calibrated (TOKEN_CALIB) against ollama's
+# reported prompt_eval_count so the Japanese under-count corrects itself.
+MODEL_CONTEXT_TOKENS = int(os.environ.get("AGENT_MODEL_CONTEXT_TOKENS", "16384"))
+GEN_HEADROOM_TOKENS = int(os.environ.get("AGENT_GEN_HEADROOM_TOKENS", "1024"))
+COMPACT_RECENT_TURNS = int(os.environ.get("AGENT_COMPACT_RECENT_TURNS", "2"))
+COMPACT_S1_TOOL_STUB_TOKENS = int(os.environ.get("AGENT_COMPACT_S1_TOOL_STUB_TOKENS", "256"))
+FIXED_OVERHEAD_TOKENS: int | None = None
+TOKEN_CALIB: float = 1.0
 TERMINAL_TOOLS = {"stop_audio", "reset_memory"}
 LOG_LLM_RAW = os.environ.get("AGENT_LOG_LLM_RAW", "true").lower() in ("1", "true", "yes")
 # AGENT_REASONING — 3-way thinking mode (the two mechanisms are NOT
@@ -581,18 +594,164 @@ def _approx_tokens(messages: list) -> int:
     return total
 
 
+def _history_tokens(messages: list) -> int:
+    """Calibrated history-token estimate (raw _approx_tokens × learned factor)."""
+    return int(_approx_tokens(messages) * TOKEN_CALIB)
+
+
+def _real_prompt_tokens(resp) -> int | None:
+    """ollama's actual prompt token count for a call, if the SDK surfaces it."""
+    um = getattr(resp, "usage_metadata", None)
+    if um and um.get("input_tokens"):
+        return um["input_tokens"]
+    rm = getattr(resp, "response_metadata", None) or {}
+    return rm.get("prompt_eval_count")
+
+
+def _calibrate_tokens(history_est_raw: int, real_prompt_tokens) -> None:
+    """EMA-correct TOKEN_CALIB from the gap between our raw history estimate and
+    ollama's real prompt_eval_count minus the measured fixed prefix. Self-fixes
+    the Japanese under-count without needing a tokenizer."""
+    global TOKEN_CALIB
+    if FIXED_OVERHEAD_TOKENS is None or not real_prompt_tokens or history_est_raw <= 0:
+        return
+    real_hist = real_prompt_tokens - FIXED_OVERHEAD_TOKENS
+    if real_hist <= 0:
+        return
+    ratio = max(0.5, min(3.0, real_hist / history_est_raw))
+    TOKEN_CALIB = round(0.8 * TOKEN_CALIB + 0.2 * ratio, 4)
+
+
+def _history_budget() -> int:
+    """Tokens available for conversation history this turn. Until the warmup has
+    measured the fixed prefix (system+tools+few-shot), fall back to the legacy
+    flat budget."""
+    if FIXED_OVERHEAD_TOKENS is None:
+        return MAX_HISTORY_TOKENS
+    primer = (
+        _approx_tokens([HumanMessage(content=SHARE_PRIMER)])
+        if (SHARE_PRIMER and SHARE_PRIMER_VOLATILE)
+        else 0
+    )
+    return max(512, MODEL_CONTEXT_TOKENS - FIXED_OVERHEAD_TOKENS - GEN_HEADROOM_TOKENS - primer)
+
+
 def _trim_history(messages: list) -> list:
-    """`start_on="human"` so a tool-call AIMessage and its ToolMessage result
-    are never split (an orphan ToolMessage would be an invalid prompt)."""
+    """Emergency view-time clamp — compact_node already bounds the persisted
+    state to _history_budget(); this only catches estimator slack. `start_on=
+    "human"` so a tool-call AIMessage and its ToolMessage result are never split
+    (an orphan ToolMessage would be an invalid prompt)."""
     return trim_messages(
         messages,
-        max_tokens=MAX_HISTORY_TOKENS,
-        token_counter=_approx_tokens,
+        max_tokens=_history_budget(),
+        token_counter=_history_tokens,
         strategy="last",
         include_system=False,
         start_on="human",
         allow_partial=False,
     )
+
+
+def _compact_history(msgs: list) -> list:
+    """Deterministic, persisted context compaction with lazy degradation:
+      S1  shrink oversized OLD tool results to a reference stub,
+      S2  shrink ALL remaining old tool results to a minimal stub,
+      S3  drop whole oldest human-delimited exchanges,
+    each applied only until the history fits _history_budget(). The most recent
+    COMPACT_RECENT_TURNS turns are never touched. Returns LangGraph state-update
+    messages: a same-id ToolMessage replaces content in place (never orphaning a
+    tool_call/result pair); RemoveMessage deletes a whole old exchange.
+    """
+    budget = _history_budget()
+    total = _history_tokens(msgs)
+    if total <= budget:
+        return []
+    tok = {id(m): _history_tokens([m]) for m in msgs}
+
+    # Protect the most recent K turns (turn = HumanMessage → next HumanMessage).
+    human_idxs = [i for i, m in enumerate(msgs) if isinstance(m, HumanMessage)]
+    old = [] if len(human_idxs) <= COMPACT_RECENT_TURNS else msgs[: human_idxs[-COMPACT_RECENT_TURNS]]
+
+    replace = {}       # message.id -> replacement ToolMessage (in-place)
+    removed = []       # message.id, oldest-first
+    removed_ids = set()
+
+    def _stub(m, text):
+        nonlocal total
+        mid = getattr(m, "id", None)
+        if not mid:
+            return
+        new_tok = _history_tokens(
+            [ToolMessage(content=text, tool_call_id=m.tool_call_id, name=m.name)]
+        )
+        if new_tok >= tok[id(m)]:
+            return
+        total -= tok[id(m)] - new_tok
+        tok[id(m)] = new_tok
+        replace[mid] = ToolMessage(
+            id=mid, tool_call_id=m.tool_call_id, name=m.name, content=text
+        )
+
+    # S1: oversized old tool results -> reference stub.
+    for m in old:
+        if total <= budget:
+            break
+        if (
+            isinstance(m, ToolMessage)
+            and getattr(m, "id", None) not in replace
+            and tok[id(m)] > COMPACT_S1_TOOL_STUB_TOKENS
+        ):
+            n = len(m.content) if isinstance(m.content, str) else len(str(m.content))
+            _stub(m, f"[省略: {m.name or 'tool'} 出力 約{n}字]")
+
+    # S2: every remaining old tool result -> minimal stub.
+    if total > budget:
+        for m in old:
+            if total <= budget:
+                break
+            if isinstance(m, ToolMessage) and getattr(m, "id", None) not in replace:
+                _stub(m, "[結果省略]")
+
+    # S3: drop whole oldest exchanges (Human + its AI/Tool messages).
+    if total > budget:
+        starts = [i for i, m in enumerate(old) if isinstance(m, HumanMessage)]
+        ranges = []
+        if not starts:
+            ranges = [(0, len(old))]
+        else:
+            if starts[0] > 0:
+                ranges.append((0, starts[0]))
+            for j, s in enumerate(starts):
+                e = starts[j + 1] if j + 1 < len(starts) else len(old)
+                ranges.append((s, e))
+        for s, e in ranges:
+            if total <= budget:
+                break
+            for m in old[s:e]:
+                mid = getattr(m, "id", None)
+                if not mid or mid in removed_ids:
+                    continue
+                removed.append(mid)
+                removed_ids.add(mid)
+                total -= tok[id(m)]
+
+    ops = [RemoveMessage(id=i) for i in removed]
+    ops += [r for mid, r in replace.items() if mid not in removed_ids]
+    return ops
+
+
+async def compact_node(state: MessagesState):
+    """Run before every agent/chat turn: when the persisted history exceeds the
+    budget, apply S1→S2→S3 and persist the result via the checkpointer."""
+    ops = _compact_history(list(state["messages"]))
+    if not ops:
+        return {}
+    n_rm = sum(1 for o in ops if isinstance(o, RemoveMessage))
+    log.info(
+        "compact: %d ops (%d dropped msgs, %d tool stubs); budget=%d calib=%.2f",
+        len(ops), n_rm, len(ops) - n_rm, _history_budget(), TOKEN_CALIB,
+    )
+    return {"messages": ops}
 
 
 def build_legacy_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
@@ -607,8 +766,10 @@ def build_legacy_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
         return {"messages": [response]}
 
     builder = StateGraph(MessagesState)
+    builder.add_node("compact", compact_node)
     builder.add_node("chat", chat_node)
-    builder.add_edge(START, "chat")
+    builder.add_edge(START, "compact")
+    builder.add_edge("compact", "chat")
     builder.add_edge("chat", END)
     return builder.compile(checkpointer=checkpointer)
 
@@ -673,6 +834,9 @@ def build_react_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
             return resp
 
         response = await _invoke(messages)
+        _calibrate_tokens(
+            _approx_tokens([*older, *primer, *latest]), _real_prompt_tokens(response)
+        )
         if (
             TOOL_RETRY_ENABLED
             and not (response.tool_calls or [])
@@ -715,10 +879,12 @@ def build_react_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
         return {"messages": [AIMessage(content=text)]}
 
     builder = StateGraph(MessagesState)
+    builder.add_node("compact", compact_node)
     builder.add_node("agent", agent_node)
     builder.add_node("tools", ToolNode(tools))
     builder.add_node("terminal_reply", terminal_reply)
-    builder.add_edge(START, "agent")
+    builder.add_edge(START, "compact")
+    builder.add_edge("compact", "agent")
     builder.add_conditional_edges("agent", tools_condition)
     builder.add_conditional_edges(
         "tools",
@@ -746,12 +912,22 @@ async def warm_system_prefix() -> None:
         reasoning=REASONING,
     )
     target = warm_llm.bind_tools(all_tools()) if TOOLS_ENABLED else warm_llm
+    global FIXED_OVERHEAD_TOKENS
     for attempt in range(1, 11):
         try:
-            await target.ainvoke(messages)
+            resp = await target.ainvoke(messages)
+            real = _real_prompt_tokens(resp)
+            if real:
+                # warmup prompt = fixed prefix + a tiny throwaway user turn;
+                # subtract that so FIXED_OVERHEAD ≈ system + tools + few-shot.
+                FIXED_OVERHEAD_TOKENS = max(
+                    0, real - _approx_tokens([HumanMessage(content="ウォームアップ")])
+                )
             log.info(
-                "agent: system-prefix warmup done (attempt=%d tools=%s sys_chars=%d)",
+                "agent: system-prefix warmup done (attempt=%d tools=%s sys_chars=%d "
+                "fixed_overhead=%s history_budget=%d)",
                 attempt, TOOLS_ENABLED, len(system_text),
+                FIXED_OVERHEAD_TOKENS, _history_budget(),
             )
             return
         except Exception as exc:  # noqa: BLE001
