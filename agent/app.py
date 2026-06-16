@@ -371,6 +371,11 @@ SHARE_PRIMER_ENABLED = os.environ.get("AGENT_CONTEXT_SHARE", "off").strip().lowe
 SHARE_PRIMER_DIR = os.environ.get("AGENT_CONTEXT_SHARE_DIR", "/workspace/share")
 SHARE_PRIMER_REFRESH_SEC = float(os.environ.get("AGENT_CONTEXT_SHARE_REFRESH_SEC", "300"))
 SHARE_PRIMER_MAX_DIRS = int(os.environ.get("AGENT_CONTEXT_SHARE_MAX_DIRS", "20"))
+# Context share that refreshes (REFRESH_SEC > 0) is "volatile": placed right
+# before the latest user turn so a refresh only re-prefills the primer + that
+# turn, never the cached [system｜tools｜few-shot] prefix or the history. With
+# REFRESH_SEC <= 0 it is static and folded into the system block (fully cached).
+SHARE_PRIMER_VOLATILE = SHARE_PRIMER_ENABLED and SHARE_PRIMER_REFRESH_SEC > 0
 
 
 def _build_share_primer() -> str:
@@ -618,26 +623,34 @@ def build_react_graph(llm: ChatOllama, checkpointer: AsyncSqliteSaver):
     llm_with_tools = llm.bind_tools(tools)
 
     async def agent_node(state: MessagesState):
-        history = _trim_history(list(state["messages"]))
+        msgs = _trim_history(list(state["messages"]))
+        # 6 最新会話 = the current user turn (last HumanMessage → end; keeps that
+        #   turn's in-flight tool-call/result messages attached). 5 会話履歴 = rest.
+        last_user = next(
+            (i for i in range(len(msgs) - 1, -1, -1) if isinstance(msgs[i], HumanMessage)),
+            None,
+        )
+        older, latest = (msgs, []) if last_user is None else (msgs[:last_user], msgs[last_user:])
+        # Fixed, cacheable prefix: 1 system (+ 4 context share when static — folded
+        #   in; it never changes so this is cache-identical to a slot after few-shot),
+        #   2 tool schema (bind_tools emits it via the template right after system),
+        #   3 few-shot.
+        sys_content = (
+            system_text if (SHARE_PRIMER_VOLATILE or not SHARE_PRIMER)
+            else system_text + SHARE_PRIMER
+        )
+        prefix = [SystemMessage(content=sys_content)] if sys_content else []
         if FEWSHOT_MESSAGES:
-            last_user = next(
-                (i for i in range(len(history) - 1, -1, -1)
-                 if isinstance(history[i], HumanMessage)),
-                None,
-            )
-            if last_user is None:
-                body = [*FEWSHOT_MESSAGES, *history]
-            else:
-                body = [*history[:last_user], *FEWSHOT_MESSAGES, *history[last_user:]]
-        else:
-            body = list(history)
-        sys_content = system_text + SHARE_PRIMER
-        messages = ([SystemMessage(content=sys_content)] if sys_content else []) + body
+            prefix = [*prefix, *FEWSHOT_MESSAGES]
+        # 4 context share (volatile) -> immediately before 最新会話, so a refresh
+        #   invalidates only the primer + latest turn, never the prefix or history.
+        primer = [HumanMessage(content=SHARE_PRIMER)] if (SHARE_PRIMER and SHARE_PRIMER_VOLATILE) else []
+        messages = [*prefix, *older, *primer, *latest]
         if LOG_LLM_RAW:
             log.info(
-                "llm input: [system + %d few-shot before last user] + %s",
-                len(FEWSHOT_MESSAGES),
-                _fmt_msgs_for_log(history),
+                "llm input: [system + %d few-shot] + %d history + [%d volatile-primer] + latest: %s",
+                len(FEWSHOT_MESSAGES), len(older), len(primer),
+                _fmt_msgs_for_log(latest),
             )
         async def _invoke(msgs: list) -> AIMessage:
             resp = await llm_with_tools.ainvoke(msgs)
@@ -720,7 +733,9 @@ async def warm_system_prefix() -> None:
     """The message assembly must match the real graphs token-for-token (same
     system text, few-shot position, bound tools) or the cached prefix won't
     line up with the first live turn."""
-    system_text = _compose_system_text() + SHARE_PRIMER
+    # Volatile primer is NOT part of the cached prefix (at request time it sits
+    # before the latest turn), so exclude it here or the warmup prefix won't line up.
+    system_text = _compose_system_text() + ("" if SHARE_PRIMER_VOLATILE else SHARE_PRIMER)
     messages = []
     if system_text:
         messages.append(SystemMessage(content=system_text))
@@ -957,13 +972,13 @@ async def amain() -> None:
     warmup_task = asyncio.create_task(warm_system_prefix())
     primer_task = (
         asyncio.create_task(_refresh_share_primer_loop())
-        if SHARE_PRIMER_ENABLED
+        if SHARE_PRIMER_VOLATILE
         else None
     )
     if SHARE_PRIMER_ENABLED:
         log.info(
-            "share primer enabled: dir=%s refresh=%.0fs (initial %d chars)",
-            SHARE_PRIMER_DIR, SHARE_PRIMER_REFRESH_SEC, len(SHARE_PRIMER),
+            "share primer enabled: dir=%s refresh=%.0fs volatile=%s (initial %d chars)",
+            SHARE_PRIMER_DIR, SHARE_PRIMER_REFRESH_SEC, SHARE_PRIMER_VOLATILE, len(SHARE_PRIMER),
         )
 
     try:
